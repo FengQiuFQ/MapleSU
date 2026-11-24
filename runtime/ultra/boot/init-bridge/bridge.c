@@ -106,6 +106,13 @@ static int __init msu_init_bridge_start(void)
     error = msu_init_bridge_imports_init();
     if (error) goto clear;
     if (!msu_init_bridge_checked_lookup("vmalloc")) allocator_flags = MSU_BOOT_SDK_ALLOCATOR_NOPROF;
+    if (!msu_init_bridge_checked_lookup("__vmalloc_node_range") &&
+        !msu_init_bridge_checked_lookup("__vmalloc_node_range_noprof")) {
+        /* 6.12+ inlines the nine-argument range wrapper into vmalloc(), so only
+         * the thirteen-argument entry is emitted. It carries the page counts in
+         * front of start/end and has to be observed through that layout. */
+        allocator_flags |= MSU_BOOT_SDK_ALLOCATOR_INNER | MSU_BOOT_SDK_ALLOCATOR_SEGMENTED;
+    }
     error = msu_init_bridge_native_layout(allocator_flags, 0, &layout);
     if (error) goto clear;
     /* Init's future helper exec grants no authority. Full environment and

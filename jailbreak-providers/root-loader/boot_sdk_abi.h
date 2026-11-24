@@ -83,8 +83,6 @@ static inline int msu_boot_sdk_layout_valid(const struct msu_boot_sdk_layout *p,
         msu_boot_sdk_extent(p->kp_pre, 8, p->kprobe_bytes) &&
         p->regs_pc >= 31 * 8 && p->regs_pc < 512 && !(p->regs_pc & 7) &&
         p->allocator_noprof <= (MSU_BOOT_SDK_ALLOCATOR_NOPROF | MSU_BOOT_SDK_ALLOCATOR_INNER | MSU_BOOT_SDK_ALLOCATOR_USER_SAMPLE | MSU_BOOT_SDK_ALLOCATOR_SEGMENTED) &&
-        (p->allocator_noprof & (MSU_BOOT_SDK_ALLOCATOR_INNER | MSU_BOOT_SDK_ALLOCATOR_SEGMENTED)) !=
-            (MSU_BOOT_SDK_ALLOCATOR_INNER | MSU_BOOT_SDK_ALLOCATOR_SEGMENTED) &&
         p->execmem_free <= 1 && p->environment <= 1 &&
         msu_boot_sdk_extent(p->seccomp, 4, p->task_bytes) &&
         (!p->environment || (p->seccomp && p->seccomp <= 32767));

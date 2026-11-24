@@ -964,8 +964,21 @@ static MSU_PH_NOCFI int bootstrap(void)
         error = -14; goto failed;
     }
     prot.pgprot = prot_flag ? sdk_vm.prot_set : sdk_vm.prot;
-    arena = (uptr)allocate_range(MSU_BS_PAGE_BYTES * (unsigned long)MSU_BS_ARENA_PAGES, sdk_vm.align,
-        start, end, sdk_vm.gfp, prot, 0, -1, (const void *)bootstrap);
+    if (sdk_layout.allocator_noprof & MSU_BOOT_SDK_ALLOCATOR_SEGMENTED) {
+        /* The segmented entry takes vm_begin_page/vm_nr_pages/init_page_begin/
+         * init_page_end before start/end. One arena is exactly MSU_BS_ARENA_PAGES
+         * target pages, so the allocation stays one contiguous block. */
+        typedef void *(*segmented_range_call)(unsigned long, unsigned long, uptr, uptr,
+            uptr, uptr, uptr, uptr, unsigned int, MSU_SDK_PGPROT, unsigned long, int,
+            const void *);
+        arena = (uptr)((segmented_range_call)(uptr)allocate_range)(
+            MSU_BS_PAGE_BYTES * (unsigned long)MSU_BS_ARENA_PAGES, sdk_vm.align,
+            0, MSU_BS_ARENA_PAGES, 0, MSU_BS_ARENA_PAGES, start, end, sdk_vm.gfp, prot,
+            0, -1, (const void *)bootstrap);
+    } else {
+        arena = (uptr)allocate_range(MSU_BS_PAGE_BYTES * (unsigned long)MSU_BS_ARENA_PAGES, sdk_vm.align,
+            start, end, sdk_vm.gfp, prot, 0, -1, (const void *)bootstrap);
+    }
     if (!arena) { error = -12; goto failed; }
 #endif
     metadata = (void *)(arena + MSU_BS_PAGE_BYTES);
