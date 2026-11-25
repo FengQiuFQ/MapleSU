@@ -14,6 +14,25 @@ class UltraProbeRecoveryTest {
         assertFalse(probe.verifyKernelRoot(UltraEnvironmentProbe.State.Unknown, false) { null })
     }
 
+    @Test fun aForeignSuDoesNotProveAMapleSuKernelWhenNoChannelAnswered() {
+        // 通用 su（KernelSU/Magisk 都挂在 /system/bin/su）返回 0，但 MapleSU 通道
+        // 一次都没有应答（无回执、无 owner 身份、无 ERR_MODULE_NO_BOOT）：
+        // 这个 0 是"设备有 root"，不是"Ultra 内核在跑"。
+        var commands = 0
+        assertFalse(
+            probe.verifyKernelRoot(UltraEnvironmentProbe.State.Unknown, false, kernelChannelObserved = false) {
+                commands++; 0
+            },
+        )
+        assertEquals(1, commands)
+        // 通道应答过（例如内核回 ERR_MODULE_NO_BOOT 却没有装 helper）时，同一个 0 才算内核证据。
+        assertTrue(probe.verifyKernelRoot(UltraEnvironmentProbe.State.Unknown, false, kernelChannelObserved = true) { 0 })
+        // 回执成功本身就是通道证据，与额外观察无关。
+        assertTrue(
+            probe.verifyKernelRoot(UltraEnvironmentProbe.State.Running, true, kernelChannelObserved = false) { 0 },
+        )
+    }
+
     @Test fun rootProofExpiresAndNeverSubstitutesHelperOrStandardSuReadiness() {
         val root = UltraEnvironmentProbe.Snapshot(UltraEnvironmentProbe.State.Unknown,
             observedAtElapsedMs = 100, kernelRootVerified = true)

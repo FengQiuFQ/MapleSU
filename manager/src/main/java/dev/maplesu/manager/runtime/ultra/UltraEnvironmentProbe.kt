@@ -150,6 +150,16 @@ object UltraEnvironmentProbe {
     fun isKernelRootVerified(context: Context): Boolean =
         ModeRuntime.active != WorkMode.KSU && currentSnapshot(context).kernelRootVerified
 
+    /**
+     * 内核通道是否应答过。
+     *
+     * 用户态环境（kit/守护进程）也能回出 Running/Fault 状态，但那只证明"装过一些文件"；
+     * 只有内核自己回执成功（[Snapshot.kernelRootVerified]）或内核明确回答"没有 boot 载荷"
+     * （[Snapshot.kernelChannelAbsent]）才算 MapleSU 内核在场的证据。
+     */
+    internal fun kernelChannelObserved(observation: Snapshot): Boolean =
+        observation.kernelRootVerified || observation.kernelChannelAbsent
+
     /** Reuse only fresh current-key/owner, boot and activation scoped execution evidence. */
     internal fun hasCurrentRootProof(context: Context): Boolean {
         val observation = currentSnapshot(context)
@@ -175,7 +185,12 @@ object UltraEnvironmentProbe {
     fun isSafeMode(): Boolean = ModeRuntime.active != WorkMode.KSU && current() == State.Fault
 
     /** A live Hook handover or a changed/suspended key must not inherit an old SDK fault. */
-    fun isSafeMode(context: Context): Boolean = usesUltraBackend(context) && currentSnapshot(context).state == State.Fault
+    fun isSafeMode(context: Context): Boolean {
+        if (!usesUltraBackend(context)) return false
+        val observation = currentSnapshot(context)
+        // 「Fault」也可能来自纯用户态环境（kit 未集成等）；没有内核证据就不算 MapleSU 环境。
+        return observation.state == State.Fault && kernelChannelObserved(observation)
+    }
 
     /** Failed root commands do not clear protection; a fresh SDK observation owns that state. */
     fun invalidateAvailability() = synchronized(lock) {
@@ -393,13 +408,17 @@ object UltraEnvironmentProbe {
                         if (ownerIdentity == null || (root.proof != null && !kernelRootVerified)) next = State.Unknown
                     } else next = State.Unknown
                 } else if (requestCurrent()) {
-                    kernelRootVerified = verifyKernelRoot(next, receipt.succeeded) {
+                    // 通道证据必须在跑 root 命令之前就成立，或由这次命令本身回答（root.succeeded）。
+                    // 复用本地恢复出来的密钥/接口不等于"内核在应答"。
+                    var channelObserved = sdkChannelAvailable || kernelChannelAbsent
+                    val rootUid = runCatching {
                         if (recoveredRoot != null && recoveredRoot.key == key && recoveredRoot.bootId == bootId &&
                             !Thread.currentThread().isInterrupted && !UltraIdentityRecovery.blocked(context) && requestCurrent()) {
                             0
                         } else {
                             val root = client.runRootCommand("/system/bin/id -u")
                             sdkChannelAvailable = sdkChannelAvailable || root.succeeded
+                            channelObserved = channelObserved || root.succeeded
                             kernelChannelAbsent = root.sdkError == "ERR_MODULE_NO_BOOT"
                             if (!root.succeeded) {
                                 val command = root.obj("rootCommand")
@@ -409,7 +428,8 @@ object UltraEnvironmentProbe {
                             }
                             if (root.succeeded) client.decodeText(root.string("result"))?.trim()?.toIntOrNull() else null
                         }
-                    }
+                    }.getOrNull()
+                    kernelRootVerified = verifyKernelRoot(next, receipt.succeeded, channelObserved) { rootUid }
                 }
                 sdkChannelAvailable = sdkChannelAvailable || kernelRootVerified
                 if (receipt.succeeded) "state=$stateName${receipt.string("stateReason")?.let { " reason=$it" } ?: ""}"
@@ -455,15 +475,27 @@ object UltraEnvironmentProbe {
         } finally { probeLock.unlock() }
     }
 
-    internal fun verifyKernelRoot(state: State, receiptSucceeded: Boolean, rootUid: () -> Int?): Boolean =
-        (receiptSucceeded || state == State.Unknown) &&
+    /**
+     * 内核通道是否已经"应答过"。
+     *
+     * `rootUid()` 走的是通用 `su`（`/system/bin/su`），KernelSU/Magisk 一样能回 0；
+     * 所以"某条 root 命令返回 0"本身不是 MapleSU 内核的证据。只有先观察到
+     * MapleSU 通道（回执成功、owner 身份，或内核明确回 `ERR_MODULE_NO_BOOT`），
+     * 这个 0 才算"内核 root 已验证"。
+     */
+    internal fun verifyKernelRoot(state: State, receiptSucceeded: Boolean, kernelChannelObserved: Boolean = true,
+                                  rootUid: () -> Int?): Boolean =
+        (receiptSucceeded || (state == State.Unknown && kernelChannelObserved)) &&
             (state == State.Running || state == State.Unknown || state == State.NotInstalled) &&
             runCatching(rootUid).getOrNull() == 0
 
     internal fun recoveryFingerprint(state: State, safeMode: Boolean, kernelRootVerified: Boolean = false,
                                      kernelChannelAbsent: Boolean = false): String? = when {
         state == State.Running -> "ultra:running"
-        state == State.Fault && safeMode -> "ultra:fault"
+        // 「Fault」只说明用户态环境自己报了故障（如 kit 未集成），它同样可以被第三方
+        // root 拼出来；必须叠加"内核通道应答过"才算 MapleSU 环境，否则一律按未安装处理。
+        state == State.Fault && safeMode ->
+            if (kernelRootVerified || kernelChannelAbsent) "ultra:fault" else null
         kernelRootVerified && (state == State.Unknown || state == State.NotInstalled) -> "ultra:kernel"
         state == State.Unknown && kernelChannelAbsent -> null
         state == State.Unknown -> throw IllegalStateException("ULTRA_RECOVERY_PROBE_UNKNOWN")

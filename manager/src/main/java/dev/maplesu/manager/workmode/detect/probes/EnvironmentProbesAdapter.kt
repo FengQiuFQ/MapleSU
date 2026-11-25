@@ -123,8 +123,13 @@ class EnvironmentProbesAdapter(private val context: Context) : EnvironmentProbes
         dev.maplesu.manager.runtime.ultra.UltraIdentityRecovery.recover(context.applicationContext)
         UltraEnvironmentProbe.refresh(context.applicationContext, force = false)
         val observed = UltraEnvironmentProbe.currentSnapshot(context)
-        return UltraEnvironmentProbe.recoveryFingerprint(observed.state, UltraEnvironmentProbe.isSafeMode(context),
-            observed.kernelRootVerified, observed.kernelChannelAbsent)
+        return ultraRecoveryFingerprint(
+            state = observed.state,
+            safeMode = UltraEnvironmentProbe.isSafeMode(context),
+            kernelRootVerified = observed.kernelRootVerified,
+            kernelChannelAbsent = observed.kernelChannelAbsent,
+            sdkChannelAvailable = observed.sdkChannelAvailable,
+        )
     }
 
     override fun ksuNormal(): Boolean? {
@@ -151,7 +156,11 @@ class EnvironmentProbesAdapter(private val context: Context) : EnvironmentProbes
     }
 
     private fun ultraJudges(): List<Pair<String, () -> Boolean>> = listOf(
-        "ultra:running" to { UltraEnvironmentProbe.currentSnapshot(context).state == UltraEnvironmentProbe.State.Running },
+        "ultra:running" to {
+            val observation = UltraEnvironmentProbe.currentSnapshot(context)
+            observation.state == UltraEnvironmentProbe.State.Running &&
+                UltraEnvironmentProbe.kernelChannelObserved(observation)
+        },
         "ultra:fault" to { UltraEnvironmentProbe.isSafeMode(context) },
         "ultra:kernel" to { UltraEnvironmentProbe.isKernelRootVerified(context) },
         "hook:ready" to { HookRootExecutor.production(context.applicationContext).available() },
@@ -164,6 +173,9 @@ class EnvironmentProbesAdapter(private val context: Context) : EnvironmentProbes
          * **仅用于枚举候选**：是否可用由 [SuReadinessProbeAdapter] 的真实子进程回答。
          */
         val SU_BINARY_PATHS = listOf("/system/bin/su", "/system/xbin/su", "/sbin/su")
+
+        /** `UltraEnvironmentProbe.recoveryFingerprint` 在"读不到 Ultra 环境"时抛出的消息。 */
+        private const val ULTRA_RECOVERY_PROBE_UNKNOWN = "ULTRA_RECOVERY_PROBE_UNKNOWN"
     }
 }
 
@@ -246,3 +258,34 @@ object EnvironmentCheckProduction {
         synchronized(this) { sharedRunner = null }
     }
 }
+
+/**
+ * Ultra 恢复阶段的指纹判定。
+ *
+ * `recoveryFingerprint` 在 `Unknown` 且内核通道缺席时返回 null，其余 `Unknown`
+ * 情况抛 `ULTRA_RECOVERY_PROBE_UNKNOWN`——resolver 会把它当成"探针失败"并停在
+ * UNKNOWN（这是对的：读不到不等于没有）。
+ *
+ * 但"整条 SDK 通道一次都没有应答过"（`sdkChannelAvailable == false`）不是读取失败，
+ * 而是这台机器上没有可读的 MapleSU 环境：帮助进程没装、内核也没有 MapleSU 桥。
+ * 这种情况继续抛会让装了第三方 KernelSU 的机器永久停在「环境检查未完成」
+ * （issue #11）。此时无 Ultra 指纹，判定继续走 KSU / 外来内核分支，得到诚实的
+ * 「未安装」结论。
+ */
+internal fun ultraRecoveryFingerprint(
+    state: UltraEnvironmentProbe.State,
+    safeMode: Boolean,
+    kernelRootVerified: Boolean,
+    kernelChannelAbsent: Boolean,
+    sdkChannelAvailable: Boolean,
+): String? {
+    val attempt = runCatching {
+        UltraEnvironmentProbe.recoveryFingerprint(state, safeMode, kernelRootVerified, kernelChannelAbsent)
+    }
+    val error = attempt.exceptionOrNull() ?: return attempt.getOrNull()
+    if (error.message == ULTRA_RECOVERY_PROBE_UNKNOWN && !sdkChannelAvailable) return null
+    throw error
+}
+
+/** `UltraEnvironmentProbe.recoveryFingerprint` 在"读不到 Ultra 环境"时抛出的消息。 */
+private const val ULTRA_RECOVERY_PROBE_UNKNOWN = "ULTRA_RECOVERY_PROBE_UNKNOWN"
