@@ -276,3 +276,38 @@ boot→init_boot 迁移内部恢复本产品旧 boot 修改，准备 init_boot �
 无 BTF 全范围仍有私有动态字段来源缺口；本设备走已经核对的 BTF 路径。三组 source stage、同 KMI 名称和主机测试分别证明对应入口，仍不代表 5.10–6.18 所有配置、所有 init_boot 或与 KSU 等同稳定性已验收。下一步由主线统一冻结实际选源、构建组件与原签名 5.2.1/50201 R8 Release，再按第 10 节进行镜像及同代设备验收。
 
 本节交付索引：`kmi-implementation-20261124`（开发证据未随公开快照分发：`WORKSPACE/.tmp/supervision-20261123-build-acceptance/source-repairs-current/kmi-implementation-20261124`）。SDK 已构建代的 1330 个输入与当前源逐项比较无变化；组件和 Manager 的新改动继续单独构建、核对来源，不复用旧桥的成功资格。
+
+## 13. 自编内核保留厂商模块时的 BTF 排查（2026-11-25）
+
+Issue #15 记录了一台 vivo PD2509 / MT6993 / Android 16，内核为 `6.12.58-android16-6-g0a092cc0037a-abogki521987229-4k`。替换为自编内核并保留厂商模块后，该设备的 MTK `expdb` 控制台出现：
+
+```text
+BPF: [161701] Invalid name_offset:274525858
+failed to validate module [drm_dma_helper] BTF: -2222
+init: Failed to load kernel modules
+Kernel panic - not syncing: Attempted to kill init! exitcode=0x00007f0000
+```
+
+提交者报告，在该目标上开启 `CONFIG_MODULE_ALLOW_BTF_MISMATCH=y` 后启动成功，`/proc/modules` 为 622 项、`boot_completed=1`。这是该设备的排查记录；其中 pahole 1.31 / 1.25 的差异尚不足以推导所有自编内核、所有厂商模块都会 BTF 校验失败。
+
+| 配置项 | 适用范围与检查事项 |
+|---|---|
+| `CONFIG_MODVERSIONS` | 当前 `runtime/ultra/boot/init-bridge/target_kmi.py` 的 `capture` 路径明确要求 `y`，目标与构建配置也须一致；保留此真实前置。其他自编内核按实际模块合同判断；使用符号 CRC 的模块仍需核对实际 CRC、vermagic 及 ABI，仅设置为 `y` 不代表匹配。 |
+| `CONFIG_DEBUG_INFO_BTF` | Ultra 选择 live BTF 作为运行内核布局来源时，需有可用且适配实际消费者的内核 BTF。`target_kmi.py` 另有受条件约束的无 BTF `legacy-lto-cfi` / `native-reference` 分支；第 12 节的无 BTF 来源缺口继续保留，不将此项推广为所有自编内核的通用前置。 |
+| `CONFIG_MODULE_ALLOW_BTF_MISMATCH` | 在启用模块 BTF、保留的厂商模块 split BTF 与新 vmlinux 不匹配时，按目标评估。开启后允许相关模块跳过失败的 BTF；这不修复模块 ABI、符号版本或签名问题，依赖模块 BTF 的功能也需另验。 |
+
+ACK `android16-6.12` 的 `lib/Kconfig.debug` 中，`DEBUG_INFO_BTF_MODULES` 依赖 `DEBUG_INFO_BTF && MODULES && PAHOLE_HAS_SPLIT_BTF`，`MODULE_ALLOW_BTF_MISMATCH` 再依赖 `DEBUG_INFO_BTF_MODULES`。`kernel/bpf/btf.c` 的模块通知器在模块带 BTF 且解析失败时才进入该选项的分支：关闭时返回错误，开启时警告并忽略该模块 BTF；匹配的模块仍加载 BTF。具体分支与工具能力仍以目标内核源码为准。
+
+构建时可对最终 `.config` 做有限诊断：
+
+```bash
+python3 scripts/check-ultra-kernel-config.py out/.config
+# 使用现有 target_kmi.py capture 路径时，另核该路径的 MODVERSIONS 前置：
+python3 scripts/check-ultra-kernel-config.py out/.config --target-kmi
+```
+
+脚本默认仅检查模块 BTF 对 `MODULES` / `DEBUG_INFO_BTF`、放宽 BTF 匹配对模块 BTF 的直接依赖；`--target-kmi` 额外要求该路径既有的 `MODVERSIONS=y`，不替代目标分支完整 Kconfig 或 `capture` 的其他检查。输出 `ULTRA_KERNEL_CONFIG_CHECKED`、退出 0 表示完成这些关系检查，`WARN` 是待核事项；`ULTRA_KERNEL_CONFIG_ERROR`、退出 1 表示关系错误；输入错误退出 2。三个配置全开、脚本退出 0 都不证明模块可加载或设备可启动。应保留实际 kernel / 模块 / 工具链身份，核对模块加载日志，并单独记录设备启动和功能结果。
+
+该报告设备的 `pstore` 为空，日志取自 `expdb`；确认目标确有此分区并具备读取条件后，可执行 `dd if=/dev/block/by-name/expdb of=/data/local/tmp/expdb.bin bs=1M` 再搜索 panic 前的首个加载错误。其他设备按其实际日志来源排查，不把返回 fastboot 一律归因于 BTF。
+
+源码依据：ACK commit `105b5745f1d771060aa9fb7f75821f69bb2298fd` 的 `lib/Kconfig.debug:412–427`、`kernel/bpf/btf.c:8001–8033`、`kernel/module/version.c:13–106`、`kernel/module/main.c:3247–3253`；项目路由依据：main commit `e8b8a16312e5d3c25b1cfadc30d6f51915ec815f` 的 `runtime/ultra/boot/init-bridge/target_kmi.py:550–584`；设备记录见 Issue #15。
