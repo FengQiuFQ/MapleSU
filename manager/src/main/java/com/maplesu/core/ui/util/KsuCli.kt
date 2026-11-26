@@ -1151,7 +1151,11 @@ private fun installStockTarget(
                 ?: dev.maplesu.manager.installer.KmiRule.parse(deviceKernelRelease().orEmpty())
                 ?: error("ULTRA_INIT_TARGET_KMI_REQUIRED")
             (initBootArtifact ?: requireNotNull(dev.maplesu.manager.ultrakernel.UltraKernelFlow.initBootArtifact(ksuApp, kmi)) {
-                "ULTRA_INIT_KMI_COMPONENT_MISSING:$kmi"
+                if (dev.maplesu.manager.ultrakernel.UltraKernelFlow.availableInitBootKmis(ksuApp).isEmpty()) {
+                    "ULTRA_INIT_COMPONENT_UNAVAILABLE: " + ksuApp.getString(R.string.ultra_init_components_unavailable)
+                } else {
+                    "ULTRA_INIT_KMI_COMPONENT_MISSING:$kmi"
+                }
             }).also {
                 check(it.isKmiComponent && it.componentKmi == kmi) { "ULTRA_INIT_TARGET_COMPONENT_KMI:$kmi:${it.componentKmi}" }
             }
