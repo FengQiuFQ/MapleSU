@@ -51,6 +51,7 @@ class RootCommandIdentityTest {
  private val denied = """{"schemaVersion":1,"backend":"maplesu_ultra","operation":"run_root_cmd","ok":false,"sdkError":"ERR_MODULE_OPEN_FILE","sdkErrorCode":-19934,"data":{"rootCommand":{"phase":5,"systemError":13,"rootAttempted":false}}}"""
  @Before fun reset() {
   Thread.interrupted(); NativeBridge.calls = 0; NativeBridge.lastCommand = "unset"; NativeBridge.answer = denied
+  NativeBridge.deadlineCalls = 0; NativeBridge.callbackCalls = 0
   PageReadDeadline.beforeRead = null; PageReadDeadline.deadline = null
  }
  private fun noSubmission(receipt: NativeReceipt, error: String) {
@@ -138,7 +139,19 @@ class RootCommandIdentityTest {
  }
  @Test fun expiredAdmissionDoesNotSubmit() {
   PageReadDeadline.deadline = System.nanoTime() - 1
-  noSubmission(UltraRuntimeClient().runRootCommand("id"), "MAPLESU_SDK_BUSY")
+  val receipt = UltraRuntimeClient().runRootCommand("id")
+  noSubmission(receipt, "MAPLESU_SDK_DEADLINE_EXCEEDED")
+  assertEquals(-1007, receipt.sdkErrorCode); assertEquals(0, NativeBridge.deadlineCalls)
+  assertEquals(0, NativeBridge.callbackCalls)
+ }
+ @Test fun activeDeadlinePassesTheExactLimitAndInvokesTheCallbackOnce() {
+  val deadline = System.nanoTime() + 1_000_000_000L
+  PageReadDeadline.deadline = deadline
+  val receipt = UltraRuntimeClient().runRootCommand("id")
+  assertEquals(denied, receipt.raw); assertEquals(1, NativeBridge.calls)
+  assertEquals(1, NativeBridge.deadlineCalls); assertEquals(1, NativeBridge.callbackCalls)
+  assertEquals("run_root_cmd", NativeBridge.deadlineOperation)
+  assertEquals(deadline, NativeBridge.deadlineNanos)
  }
  @Test fun cancelledAdmissionDoesNotSubmit() {
   Thread.currentThread().interrupt()
@@ -155,15 +168,16 @@ import dev.maplesu.manager.runtime.ultra.bridge.NativeBridge
 import dev.maplesu.manager.runtime.PageReadDeadline
 import java.util.concurrent.CancellationException
 '''
-    methods = [block(client_text, marker) for marker in ["private fun call(", "private fun busy(",
+    methods = [block(client_text, marker) for marker in ["private fun call(", "private fun deadlineExceeded(",
         "private fun localCall(", "internal fun scoped(", "internal constructor(rootCommands:",
         "fun runRootCommand(", "private fun callWithIdentity(", "companion object {"]]
-    # busy() is an expression function; its next brace belongs to localCall().
-    methods[1] = client_text[client_text.index("private fun busy("):client_text.index("    // Compiled identity")].strip()
+    # deadlineExceeded() is an expression function; its next brace belongs to localCall().
+    methods[1] = client_text[client_text.index("private fun deadlineExceeded("):client_text.index("    // Compiled identity")].strip()
     methods[3] = client_text[client_text.index("internal fun scoped("):client_text.index("    /** Read-only readiness")].strip()
     assembled = imports + '''class UltraRuntimeClient() {
  private var rootCommands: RootScriptRunner? = null
  private var identityCurrent: () -> Boolean = { true }
+ private var legacyCredential: UltraLegacyCredential? = null
  private val loadFailure: String? = null
 ''' + "\n".join(methods) + "\n}\n"
     types = block(client_text, "internal fun interface RootScriptRunner") + "\n" + block(
@@ -175,6 +189,7 @@ import java.util.concurrent.CancellationException
         write(out, "RootCommandIdentityTest.kt", KOTLIN_TEST),
         write(out, "Fixtures.kt", '''package dev.maplesu.manager.runtime.ultra
 class UltraAuthorizationResult { companion object { fun parse(value: org.json.JSONObject?): UltraAuthorizationResult? = null } }
+class UltraLegacyCredential(val value: String)
 object UltraSdkLogging { fun redact(value: String?) = value.orEmpty() }
 '''),
         write(out, "Deadline.kt", '''package dev.maplesu.manager.runtime
@@ -183,13 +198,22 @@ object PageReadDeadline { var beforeRead: (() -> Unit)? = null; var deadline: Lo
         write(out, "StoredInputs.kt", '''package dev.maplesu.manager.compat
 object StoredInputs { fun receiptBackend(value: String) = value; fun error(value: String) = value }
 ''')]
-    declaration = re.search(r"public static native String runRootCmd\([^;]*;",
-        (ROOT / "manager/src/main/java/dev/maplesu/manager/runtime/ultra/bridge/NativeBridge.java").read_text(encoding="utf-8-sig"))
+    bridge_source = (ROOT / "manager/src/main/java/dev/maplesu/manager/runtime/ultra/bridge/NativeBridge.java").read_text(encoding="utf-8-sig")
+    declaration = re.search(r"public static native String runRootCmd\([^;]*;", bridge_source)
     assert declaration, "Production Root command JNI declaration is absent"
     bridge_method = declaration[0].replace(" native ", " ").removesuffix(";") + " { calls++; lastCommand = cmd; return answer; }"
+    deadline_declaration = re.search(r"public static native String invokeWithDeadline\([^;]*;", bridge_source)
+    legacy_declaration = re.search(r"public static native String invokeWithLegacyCredential\([^;]*;", bridge_source)
+    assert deadline_declaration and legacy_declaration, "Production callback JNI declarations are absent"
+    deadline_method = deadline_declaration[0].replace(" native ", " ").removesuffix(";") + (
+        " { deadlineCalls++; NativeBridge.deadlineNanos = deadlineNanos; deadlineOperation = operation; "
+        "callbackCalls++; try { return callback.call(); } catch (Exception error) { throw new RuntimeException(error); } }")
+    legacy_method = legacy_declaration[0].replace(" native ", " ").removesuffix(";") + (
+        " { try { return callback.call(); } catch (Exception error) { throw new RuntimeException(error); } }")
     bridge = write(out, "NativeBridge.java", "package dev.maplesu.manager.runtime.ultra.bridge;\n" +
         "public final class NativeBridge {\n public static int calls; public static String lastCommand, answer;\n " +
-        bridge_method + "\n}\n")
+        "public static int deadlineCalls, callbackCalls; public static long deadlineNanos; public static String deadlineOperation;\n" +
+        bridge_method + "\n" + deadline_method + "\n" + legacy_method + "\n}\n")
     deps = [cached_jar(*item) for item in [("org.jetbrains.kotlin", "kotlin-stdlib", "2.4.20"),
         ("org.jetbrains", "annotations", "13.0"), ("org.jetbrains.kotlinx", "kotlinx-coroutines-core-jvm", "1.11.0"),
         ("org.json", "json", "20240303"), ("junit", "junit", "4.13.2"), ("org.hamcrest", "hamcrest-core", "1.3")]]

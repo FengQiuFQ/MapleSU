@@ -21,6 +21,29 @@ class ModeBootstrapRuntimeControlFlowTest {
     private fun detected() = DetectionResult(ModeState.MODE_B_KERNEL_ONLY, DetectionGroup.B_KERNEL_ONLY,
         DetectionRules.Rule.R2_KSU_KERNEL_ONLY, "control-flow-boot", 123, emptyList(), RecoveryReadiness.NONE, null)
 
+    @Test fun aRealPipelineFailureKeepsItsOriginalDetailThroughTheBootstrapConsumer() = runBlocking {
+        val detail = "root:pipe:EACCES:13:receipt=command10,status0,effects8"
+        val pipeline = ModeBootstrapPipeline(object : ModeDetector {
+            override suspend fun detect(request: DetectionRequest): DetectionResult = throw IllegalStateException(detail)
+        })
+        val coordinator = ModeBootstrapCoordinator({ pipeline })
+        val outcome = coordinator.runPhaseTwo() as BootstrapOutcome.Failed
+        assertEquals("MODE_DETECT_FAILED", ModeRuntime.detectionFailure)
+        val getter = ModeRuntime::class.java.declaredMethods.firstOrNull { it.name == "getDetectionFailureDetail" }
+        assertNotNull("The production runtime must keep the original stage/errno/receipt for Home details", getter)
+        assertEquals(detail, getter!!.invoke(ModeRuntime))
+        ModeBootstrap::class.java.getDeclaredMethod("recordGate", BootstrapPhase::class.java, BootstrapOutcome::class.java)
+            .apply { isAccessible = true }.invoke(ModeBootstrap, BootstrapPhase.AFTER_ROOT_GRANTED, outcome)
+        assertEquals("The bootstrap consumer must preserve the pipeline detail", detail, getter.invoke(ModeRuntime))
+        assertNull(ModeRuntime.active)
+        ModeRuntime.failBootstrap("LEGACY_FAILURE")
+        assertNull("The original one-argument ABI must not attach an earlier failure's detail", getter.invoke(ModeRuntime))
+        coordinator.runPhaseTwo()
+        assertEquals(detail, getter.invoke(ModeRuntime))
+        ModeRuntime.beginDetection()
+        assertNull("A fresh observation must not inherit the preceding diagnostic", getter.invoke(ModeRuntime))
+    }
+
     @Test fun localPrecheckCancellationPropagatesWithoutCompletingOrActivatingAndReleasesRetryClaim() = runBlocking {
         var cancelled = true
         var calls = 0

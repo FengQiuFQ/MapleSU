@@ -551,6 +551,18 @@
         "userspace/ksud/src/module_install_transaction.rs",
         "userspace/ksud/src/module_removal_transaction.rs"
       ]
+    },
+    {
+      "name": "0028-native-current-info.patch",
+      "sha256": "bcec656b1abc3d18bd17c30dc60978c9d4dde49223b20f4bb614992d7e1cae4a",
+      "size": 7547,
+      "status": "implemented",
+      "summary": "Read current Normal identity and profile ioctl results without cached or default-profile success",
+      "touches": [
+        "manager/app/src/main/cpp/jni.cc",
+        "manager/app/src/main/cpp/ksu.cc",
+        "manager/app/src/main/cpp/ksu.h"
+      ]
     }
   ],
   "superseded": [

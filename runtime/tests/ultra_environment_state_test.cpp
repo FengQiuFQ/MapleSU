@@ -22,7 +22,8 @@
 #include "../ultra/bridge/native_lib_ultra.cpp"
 namespace maplesu {
 SdkCallScope::SdkCallScope(const char*) : access_(SdkCallAccess::Read) { acquired_ = access_ == SdkCallAccess::Read; }
-SdkCallScope::~SdkCallScope() { (void)previous_; (void)previous_call_; }
+SdkCallScope::~SdkCallScope() { (void)previous_call_; }
+SdkCallCompletion SdkCallScope::finalize() noexcept { return {}; }
 }
 namespace maplesu::sdk {
 KModErr test_maplesu_basics_with_cb(const char*, BasicItem, void (*)(const char*)) { return KModErr::OK; }

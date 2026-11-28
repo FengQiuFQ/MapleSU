@@ -8,6 +8,8 @@ internal class UltraAuthorizationAttempt private constructor(
     val readbackMatches: Boolean? = null,
     private val noMutation: Boolean = false,
     val preparation: Preparation? = null,
+    /** This invocation's independent UID read; never substitutes for the write receipt. */
+    val readReceipt: NativeReceipt? = null,
 ) {
     val succeeded: Boolean get() = error == null
 
@@ -31,20 +33,26 @@ internal class UltraAuthorizationAttempt private constructor(
                 "preparation=${suAuthLogCode(reason)} blocked=${blockedCode?.let(::suAuthLogCode) ?: "none"}"
     }
 
+    fun withReadReceipt(value: NativeReceipt?): UltraAuthorizationAttempt =
+        UltraAuthorizationAttempt(error, receipt, readbackMatches, noMutation, preparation, value)
+
     fun withPreparation(value: Preparation): UltraAuthorizationAttempt =
-        UltraAuthorizationAttempt(error, receipt, readbackMatches, noMutation, value)
+        UltraAuthorizationAttempt(error, receipt, readbackMatches, noMutation, value, readReceipt)
 
     fun withReadback(matches: Boolean, noMutation: Boolean = false): UltraAuthorizationAttempt =
-        UltraAuthorizationAttempt(error, receipt, matches, noMutation, preparation)
+        UltraAuthorizationAttempt(error, receipt, matches, noMutation, preparation, readReceipt)
 
     /** A failed readback adds a business failure without replacing the SDK evidence. */
     fun withFailure(error: String): UltraAuthorizationAttempt =
         if (this.error != null) this
-        else UltraAuthorizationAttempt(error, receipt, readbackMatches, noMutation, preparation)
+        else UltraAuthorizationAttempt(error, receipt, readbackMatches, noMutation, preparation, readReceipt)
 
     val diagnosticSummary: String
         get() = buildString {
             append(receipt?.authorizationDiagnosticSummary() ?: "sdkReceipt=false")
+            readReceipt?.takeUnless { it === receipt }?.let {
+                append(" readReceipt=[").append(it.authorizationDiagnosticSummary()).append(']')
+            }
             append(" business=${error?.let(::suAuthLogCode) ?: "OK"}")
             append(" decisionCommitted=$decisionCommitted decisionVerified=$decisionVerified")
             append(" pendingApply=$pendingApply commitUnknown=$commitUnknown readbackMatches=$readbackMatches")
@@ -70,14 +78,16 @@ internal fun NativeReceipt.authorizationDiagnosticSummary(): String = UltraSdkLo
     append("sdkReceipt=true ok=$ok sdk=${suAuthLogCode(sdkError)} code=$sdkErrorCode")
     val detail = authorizationResult
     append(" detail=${detail != null}")
-    if (detail == null) return@buildString
-    append(" available=${detail.operationResultAvailable} operation=${detail.operation}")
-    append(" result=${detail.resultCode} primary=${detail.primaryErrorCode} phase=${detail.primaryPhase}")
-    append(" recovery=[")
-    append(detail.recovery?.joinToString(",") { "${it.phase}:${it.errorCode}" } ?: "unknown")
-    append("] total=${detail.recoveryTotal} complete=${detail.diagnosticsComplete}")
-    append(" commit=${detail.commitState} restore=${detail.restoreState} delivery=${detail.deliveryState}")
-    val transport = detail.transport
-    append(" transport=${transport.status} errno=${transport.errno}")
-    append(" childWait=${transport.childWaitStatus} transportValid=${transport.valid}")
+    if (detail != null) {
+        append(" available=${detail.operationResultAvailable} operation=${detail.operation}")
+        append(" result=${detail.resultCode} primary=${detail.primaryErrorCode} phase=${detail.primaryPhase}")
+        append(" recovery=[")
+        append(detail.recovery?.joinToString(",") { "${it.phase}:${it.errorCode}" } ?: "unknown")
+        append("] total=${detail.recoveryTotal} complete=${detail.diagnosticsComplete}")
+        append(" commit=${detail.commitState} restore=${detail.restoreState} delivery=${detail.deliveryState}")
+        val transport = detail.transport
+        append(" transport=${transport.status} errno=${transport.errno}")
+        append(" childWait=${transport.childWaitStatus} transportValid=${transport.valid}")
+    }
+    if (data?.has("uidReadResult") == true) append(' ').append(uidReadDiagnosticSummary())
 })

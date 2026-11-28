@@ -3,7 +3,9 @@ package com.maplesu.core.data.model
 import android.content.pm.PackageInfo
 import android.os.Parcelable
 import kotlinx.parcelize.Parcelize
+import kotlinx.parcelize.IgnoredOnParcel
 import com.maplesu.core.Natives
+import dev.maplesu.manager.runtime.authorization.ManagerAuthorizations
 
 const val WEBVIEW_ZYGOTE_UID = 1053
 const val WEBVIEW_ZYGOTE_PROFILE_KEY = "webview_zygote"
@@ -28,6 +30,10 @@ data class AppInfo(
     val authorizationStale: Boolean = false,
     val authorizationPending: Boolean = false,
 ) : Parcelable {
+    /** This read belongs to the producing page; copy/parcel/cache never carry its proof. */
+    @IgnoredOnParcel
+    internal var currentDeliveryRead: ManagerAuthorizations.CurrentDeliveryRead? = null
+
     val packageName: String
         get() = packageInfo.packageName
 

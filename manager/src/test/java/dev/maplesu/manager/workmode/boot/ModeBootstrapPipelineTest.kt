@@ -209,4 +209,49 @@ class ModeBootstrapPipelineTest {
         assertEquals(listOf("setup", "pair", "detect"), calls)
         assertNull("Pending identity alone must never activate a backend", runtime.mode)
     }
+
+    @Test
+    fun currentUltraOwnerDoesNotBlockTheExistingLiveRootDetection() = runBlocking {
+        val ownerOnly = TestFixtures.detection(ModeState.MODE_A_INSTALLED_UNBOUND).copy(
+            rule = dev.maplesu.manager.workmode.detect.DetectionRules.Rule.R6_A_ULTRA_OWNER_ONLY,
+        )
+        val runtime = FakeRuntime()
+        val detector = FakeDetector(TestFixtures.detection(ModeState.MODE_A_ACTIVE))
+        val outcome = ModeBootstrapPipeline(detector, runtime, environmentOverride = { ownerOnly })
+            .run(ModeBootstrapCoordinator.AFTER_ROOT_GRANTED_REQUEST)
+        assertEquals(ModeBootstrapCoordinator.AFTER_ROOT_GRANTED_REQUEST, detector.received)
+        assertTrue(outcome is BootstrapOutcome.Activated)
+        assertEquals(WorkMode.LITE, runtime.mode)
+    }
+
+    @Test
+    fun failedRootDetectionPreservesTheCurrentUltraOwnerWithoutActivatingIt() = runBlocking {
+        val ownerOnly = TestFixtures.detection(ModeState.MODE_A_INSTALLED_UNBOUND).copy(
+            rule = dev.maplesu.manager.workmode.detect.DetectionRules.Rule.R6_A_ULTRA_OWNER_ONLY,
+        )
+        val runtime = FakeRuntime()
+        val detector = FakeDetector(error = IllegalStateException("root:pipe:EACCES:13"))
+        val outcome = ModeBootstrapPipeline(detector, runtime, environmentOverride = { ownerOnly })
+            .run(ModeBootstrapCoordinator.AFTER_ROOT_GRANTED_REQUEST)
+        assertTrue(outcome is BootstrapOutcome.Failed)
+        assertEquals("MODE_DETECT_FAILED", (outcome as BootstrapOutcome.Failed).code)
+        assertEquals("root:pipe:EACCES:13", outcome.detail)
+        assertEquals(ownerOnly, runtime.detection)
+        assertNull(runtime.mode)
+    }
+
+    @Test
+    fun anUnconfirmedHealthReadCannotReplaceTheCurrentUltraOwnerWithAbsence() = runBlocking {
+        val ownerOnly = TestFixtures.detection(ModeState.MODE_A_INSTALLED_UNBOUND).copy(
+            rule = dev.maplesu.manager.workmode.detect.DetectionRules.Rule.R6_A_ULTRA_OWNER_ONLY,
+        )
+        val runtime = FakeRuntime()
+        val detector = FakeDetector(TestFixtures.detection(ModeState.NOT_INSTALLED))
+        val outcome = ModeBootstrapPipeline(detector, runtime, environmentOverride = { ownerOnly })
+            .run(ModeBootstrapCoordinator.AFTER_ROOT_GRANTED_REQUEST)
+        assertEquals(ModeBootstrapCoordinator.AFTER_ROOT_GRANTED_REQUEST, detector.received)
+        assertTrue(outcome is BootstrapOutcome.Unresolved)
+        assertEquals(ModeState.MODE_A_INSTALLED_UNBOUND, runtime.detection?.state)
+        assertNull(runtime.mode)
+    }
 }

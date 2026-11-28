@@ -3,6 +3,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -32,6 +33,7 @@ class ReleaseApkTest(unittest.TestCase):
         self.write('third_party/kernelsu/ksu-payload.json', json.dumps(dict(identity=dict(
             packageName='dev.maplesu.manager', managerGenAsset='assets/ksu_manager_gen2', expectedHash=PIN))).encode())
         self.write('manager/src/main/assets/ksu_manager_gen2', b'2')
+        self.write('manager/build.gradle.kts', b'android { defaultConfig { ndk { abiFilters += "arm64-v8a" } } }')
         archive = self.write('sdk/lib/libkernel_module_kit_static.a', b'ordinary archive fixture')
         helper = self.write('sdk/helper/autorun_bootstrap', b'ordinary source helper fixture')
         backend = self.write('sdk/backend/libmaplesu_policy_boot.so', b'ordinary backend fixture')
@@ -51,6 +53,7 @@ class ReleaseApkTest(unittest.TestCase):
         bridge_bytes += b'\n'.join(self.payload_bytes.values())
         self.save(self.native / 'libmaplesu_ultra_bridge.so', bridge_bytes)
         self.save(self.native / 'libmaplesu_policy_boot.so', backend.read_bytes())
+        self.setup_normal_jni()
         self.save(self.base / 'generated/jailbreakAssets/maplesu-jailbreak-artifacts.json', b'{"ordinaryFixture":true}')
         self.save(self.bundle / 'manifest.json', b'{"schemaVersion":1}')
         inputs = []
@@ -109,10 +112,54 @@ class ReleaseApkTest(unittest.TestCase):
             for name, data in self.entries.items():
                 package.writestr(name, data)
 
-    @staticmethod
-    def android_tool(argv, **kwargs):
+    def setup_normal_jni(self):
+        self.normal_source = self.root / 'third_party/kernelsu/applied/manager/app/src/main/cpp'
+        self.normal_cmake = self.root / 'manager/.cxx/RelWithDebInfo/fixture/arm64-v8a'
+        suffix = '.exe' if os.name == 'nt' else ''
+        self.normal_ninja = self.write('native-tools/ninja' + suffix, b'ordinary ninja tool fixture')
+        compiler = self.root / ('native-tools/clang++' + suffix)
+        libraries = {}
+        compile_rows = []
+        self.save(self.normal_source / 'CMakeLists.txt', b'ordinary current Normal CMake fixture')
+        self.save(self.normal_cmake / 'build.ninja', b'ordinary source-object-link graph fixture')
+        self.write('manager/src/main/jniLibs/arm64-v8a/libmaplesu_ksu.so', b'ordinary retained Normal JNI')
+        for target, names in {'maplesu_ksu': ('jni.cc', 'ksu.cc'), 'adbroot': ('adbroot.cc',)}.items():
+            for name in names:
+                source = self.save(self.normal_source / name, ('ordinary current source: ' + name).encode())
+                obj = 'CMakeFiles/' + target + '.dir/' + name + '.o'
+                self.save(self.normal_cmake / obj, ('ordinary current object: ' + name).encode())
+                compile_rows.append(dict(directory=self.normal_cmake.as_posix(), file=source.as_posix(),
+                    command=str(compiler) + ' --target=aarch64-none-linux-android31 -o ' + obj + ' -c ' + source.as_posix()))
+            body = ('ordinary current compiled JNI: ' + target).encode()
+            destination = self.save(self.base / ('intermediates/cxx/RelWithDebInfo/fixture/obj/arm64-v8a/lib' + target + '.so'), body)
+            libraries[target] = dict(artifactName=target, output=destination.as_posix(), abi='arm64-v8a')
+            self.save(self.base / ('intermediates/merged_native_libs/release/mergeReleaseNativeLibs/out/lib/arm64-v8a/lib' + target + '.so'), body)
+            self.save(self.native / ('lib' + target + '.so'), body)
+        self.save(self.normal_cmake / 'compile_commands.json', json.dumps(compile_rows).encode())
+        self.save(self.normal_cmake / 'android_gradle_build.json', json.dumps(dict(
+            buildFiles=[(self.normal_source / 'CMakeLists.txt').as_posix()], libraries=libraries,
+            buildTargetsCommandComponents=[self.normal_ninja.as_posix(), '-C', self.normal_cmake.as_posix()],
+            toolchains=dict(toolchain=dict(cppCompilerExecutable=compiler.as_posix())))).encode())
+
+    def android_tool(self, argv, **kwargs):
         if 'badging' in argv:
             output = b"package: name='dev.maplesu.manager' versionCode='50201' versionName='5.2.1'\n"
+        elif Path(argv[0]) == self.normal_ninja:
+            if 'deps' in argv:
+                name = Path(argv[-1]).name.removesuffix('.o')
+                output = (argv[-1] + ': #deps 1, deps mtime 1 (VALID)\n    ' +
+                          (self.normal_source / name).as_posix() + '\n').encode()
+            elif 'query' in argv:
+                names = ('jni.cc', 'ksu.cc') if 'libmaplesu_ksu.so' in argv[-1] else ('adbroot.cc',)
+                target = 'maplesu_ksu' if 'libmaplesu_ksu.so' in argv[-1] else 'adbroot'
+                output = ('link:\n' + '\n'.join('    CMakeFiles/' + target + '.dir/' + name + '.o' for name in names)).encode()
+            else:
+                output = b'ninja: no work to do.\n'
+        elif Path(argv[0]).name in ('llvm-nm', 'llvm-nm.exe'):
+            prefix = 'Java_dev_maplesu_manager_ksu_KsuNatives_'
+            output = (prefix + 'getVersion T 1 1\n').encode()
+            if Path(argv[-1]) != self.root / 'manager/src/main/jniLibs/arm64-v8a/libmaplesu_ksu.so':
+                output += (prefix + 'getCurrentInfo T 2 1\n').encode()
         else:
             output = ('Verifies\nNumber of signers: 1\nV2 Signer: certificate SHA-256 digest: ' + PIN + '\n').encode()
         return subprocess.CompletedProcess(argv, 0, output, b'')
@@ -131,6 +178,10 @@ class ReleaseApkTest(unittest.TestCase):
         self.assertFalse(receipt['deviceAcceptance'])
         self.assertEqual(receipt['deviceOperations'], 0)
         return code, receipt
+
+    def android_call_count(self):
+        return sum(Path(call.args[0][0]).name in ('aapt2', 'aapt2.exe', 'apksigner', 'apksigner.bat')
+                   for call in self.tools.call_args_list)
 
     def rejected(self, message):
         code, receipt = self.execute()
@@ -335,10 +386,108 @@ class ReleaseApkTest(unittest.TestCase):
         code, receipt = self.execute()
         self.assertEqual(code, 0)
         self.assertTrue(receipt['passed'])
-        self.assertEqual(len(receipt['nativeBindings']), 2)
+        self.assertEqual(len(receipt['nativeBindings']), 4)
         self.assertEqual(len(receipt['bridgeInputBindings']), 10)
         self.assertEqual(len(receipt['embeddedPayloads']), 4)
-        self.assertEqual(self.tools.call_count, 2)
+        self.assertEqual(self.android_call_count(), 2)
+        self.assertEqual(len(receipt['normalSourceObjectBindings']['translationUnits']), 3)
+
+    def test_filtered_dependency_abis_are_recorded_without_requiring_them_in_apk(self):
+        other = self.native.parent / 'x86/libandroidx.graphics.path.so'
+        self.save(other, b'ordinary filtered dependency native')
+        code, receipt = self.execute()
+        self.assertEqual(code, 0)
+        self.assertEqual(receipt['nativePackagingFilter']['abis'], ['arm64-v8a'])
+        self.assertEqual(receipt['nativePackagingFilter']['excludedOutputs'], [dict(
+            entry='lib/x86/libandroidx.graphics.path.so', source=M.record(other))])
+
+    def test_packaging_filter_requires_the_current_gradle_contract(self):
+        self.write('manager/build.gradle.kts', b'ndk { abiFilters += "x86_64" }')
+        self.rejected('MANAGER_PACKAGING_ABI_FILTER')
+
+    def test_packaged_normal_bytes_without_current_agp_build_are_rejected(self):
+        (self.normal_cmake / 'android_gradle_build.json').unlink()
+        self.rejected('NORMAL_AGP_COMPILED_OUTPUT_BINDING')
+
+    def test_normal_compile_must_include_ksu_current_source(self):
+        path = self.normal_cmake / 'compile_commands.json'
+        rows = M.load(path)
+        self.save(path, json.dumps([row for row in rows if Path(row['file']).name != 'ksu.cc']).encode())
+        self.rejected('NORMAL_COMPILE_TU_SET')
+
+    def test_normal_link_must_consume_the_compiled_object(self):
+        path = self.normal_cmake / 'compile_commands.json'
+        rows = M.load(path)
+        rows[0]['command'] = rows[0]['command'].replace('maplesu_ksu.dir/jni.cc.o', 'other.dir/jni.cc.o')
+        self.save(self.normal_cmake / 'CMakeFiles/other.dir/jni.cc.o', b'ordinary different object')
+        self.save(path, json.dumps(rows).encode())
+        self.rejected('NORMAL_LINK_OBJECT_INPUTS')
+
+    def test_normal_merged_library_must_match_the_source_built_output(self):
+        path = self.base / 'intermediates/merged_native_libs/release/mergeReleaseNativeLibs/out/lib/arm64-v8a/libmaplesu_ksu.so'
+        self.save(path, b'ordinary previous merged JNI')
+        self.rejected('NORMAL_JNI_PACKAGING_DRIFT')
+
+    def test_normal_stale_object_dependencies_are_rejected(self):
+        def stale(argv, **kwargs):
+            value = self.android_tool(argv, **kwargs)
+            if 'deps' in argv:
+                value.stdout = value.stdout.replace(b'(VALID)', b'(STALE)')
+            return value
+        self.tools.side_effect = stale
+        self.rejected('NORMAL_OBJECT_DEPENDENCIES')
+
+    def test_normal_pending_compile_work_is_rejected(self):
+        def pending(argv, **kwargs):
+            value = self.android_tool(argv, **kwargs)
+            if Path(argv[0]) == self.normal_ninja and '-n' in argv:
+                value.stdout = b'[1/2] Building current ksu.cc.o\n'
+            return value
+        self.tools.side_effect = pending
+        self.rejected('NORMAL_COMPILE_OUTPUT_STALE')
+
+    def test_normal_packaged_jni_requires_current_identity_read(self):
+        def previous(argv, **kwargs):
+            value = self.android_tool(argv, **kwargs)
+            if Path(argv[0]).name.startswith('llvm-nm'):
+                value.stdout = b'\n'.join(line for line in value.stdout.splitlines() if b'getCurrentInfo' not in line)
+            return value
+        self.tools.side_effect = previous
+        self.rejected('NORMAL_JNI_INTERFACE')
+
+    def test_normal_sources_changed_during_verification_are_rejected(self):
+        changed = False
+        def change_after_dependency_read(argv, **kwargs):
+            nonlocal changed
+            value = self.android_tool(argv, **kwargs)
+            if 'query' in argv and not changed:
+                changed = True
+                self.save(self.normal_source / 'jni.cc', b'ordinary changed current source')
+            return value
+        self.tools.side_effect = change_after_dependency_read
+        self.rejected('NORMAL_BUILD_INPUT_CHANGED')
+
+    def test_normal_source_change_before_final_publication_is_rejected(self):
+        original_record = M.record
+        class_file = self.base / 'intermediates/built_in_kotlinc/release/compileReleaseKotlin/classes/com/maplesu/core/ui/webui/ModuleWebUIActivity.class'
+        def record_then_change(path):
+            result = original_record(path)
+            if Path(path) == class_file:
+                self.save(self.normal_source / 'ksu.cc', b'ordinary source changed after Normal verification')
+            return result
+        with patch.object(M, 'record', side_effect=record_then_change):
+            self.rejected('NORMAL_BUILD_INPUT_CHANGED')
+
+    def test_packaging_filter_change_before_final_publication_is_rejected(self):
+        original_record = M.record
+        class_file = self.base / 'intermediates/built_in_kotlinc/release/compileReleaseKotlin/classes/com/maplesu/core/ui/webui/ModuleWebUIActivity.class'
+        def record_then_change(path):
+            result = original_record(path)
+            if Path(path) == class_file:
+                self.write('manager/build.gradle.kts', b'ordinary filter source changed after selection')
+            return result
+        with patch.object(M, 'record', side_effect=record_then_change):
+            self.rejected('MANAGER_PACKAGING_ABI_SOURCE_CHANGED')
 
     def test_exact_target_without_btf_uses_only_its_recorded_inputs(self):
         self.execution['bridgeInputs'] = [row for row in self.execution['bridgeInputs'] if row['name'] != 'btf']
@@ -373,6 +522,12 @@ class ReleaseApkTest(unittest.TestCase):
         self.execution['exitCode'] = 1
         self.save(self.execution_path, json.dumps(self.execution).encode())
         self.rejected('RELEASE_BUILD_NOT_SUCCESSFUL')
+        self.tools.assert_not_called()
+
+    def test_separate_sdk_gate_revalidation_requires_a_current_full_release_build(self):
+        self.release['sourceBuild']['gateRevalidation'] = dict(path='independent-development-gate.json')
+        self.refresh_release()
+        self.rejected('SDK_GATE_REVALIDATION_REQUIRES_CURRENT_FULL_RELEASE_BUILD')
         self.tools.assert_not_called()
 
     def test_sdk_manifest_drift_stops_before_tools(self):
@@ -431,7 +586,7 @@ class ReleaseApkTest(unittest.TestCase):
             return completed
         self.tools.side_effect = old_version
         self.rejected('APK_PACKAGE_IDENTITY_MISMATCH')
-        self.assertEqual(self.tools.call_count, 1)
+        self.assertEqual(self.android_call_count(), 1)
 
     def test_duplicate_input_cannot_cover_a_missing_binding(self):
         self.execution['bridgeInputs'][-1] = self.execution['bridgeInputs'][0]
@@ -546,7 +701,7 @@ class ReleaseApkTest(unittest.TestCase):
 
                 self.tools.side_effect = drift_after_tool
                 receipt = self.rejected('APK_INPUT_CHANGED: ' + phase + '.after')
-                self.assertEqual(self.tools.call_count, 1 if phase == 'badging' else 2)
+                self.assertEqual(self.android_call_count(), 1 if phase == 'badging' else 2)
                 self.assertEqual(receipt['commands'][-1]['name'], phase)
                 self.assertEqual(receipt['commands'][-1]['exitCode'], 0)
 
@@ -566,7 +721,7 @@ class ReleaseApkTest(unittest.TestCase):
         with patch.object(M.zipfile.ZipFile, 'read', new=read_then_append):
             self.rejected('APK_INPUT_CHANGED: zip.after')
         self.assertTrue(changed)
-        self.assertEqual(self.tools.call_count, 2)
+        self.assertEqual(self.android_call_count(), 2)
 
     def test_apk_drift_before_final_success_is_rejected(self):
         original_record = M.record
@@ -586,7 +741,7 @@ class ReleaseApkTest(unittest.TestCase):
             receipt = self.rejected('APK_INPUT_CHANGED: complete')
         self.assertTrue(changed)
         self.assertTrue(receipt['nonLocalReturnMarkerAbsent'])
-        self.assertEqual(self.tools.call_count, 2)
+        self.assertEqual(self.android_call_count(), 2)
 
     def test_apk_drift_during_final_manifest_checks_is_rejected(self):
         manifest = self.bundle / 'BUNDLE-SOURCES.json'
@@ -606,7 +761,7 @@ class ReleaseApkTest(unittest.TestCase):
         with patch.object(M, 'record', side_effect=record_then_change):
             self.rejected('APK_INPUT_CHANGED: complete')
         self.assertEqual(checked_manifest, 2)
-        self.assertEqual(self.tools.call_count, 2)
+        self.assertEqual(self.android_call_count(), 2)
 
     def test_failed_tool_remains_first_error_when_apk_also_drifts(self):
         for phase in ('badging', 'signature'):
@@ -629,7 +784,7 @@ class ReleaseApkTest(unittest.TestCase):
                 self.assertEqual(command['name'], phase)
                 self.assertEqual(command['exitCode'], 4)
                 self.assertEqual(Path(command['log']['path']).read_bytes(), b'ordinary tool failure with input drift')
-                self.assertEqual(self.tools.call_count, 1 if phase == 'badging' else 2)
+                self.assertEqual(self.android_call_count(), 1 if phase == 'badging' else 2)
 
 
     def test_execution_json_change_after_parse_is_rejected(self):
@@ -674,7 +829,7 @@ class ReleaseApkTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertFalse(receipt['passed'])
         self.assertIn('RELEASE_EXECUTION_INPUT_CHANGED', receipt['failure'])
-        self.assertEqual(self.tools.call_count, 2)
+        self.assertEqual(self.android_call_count(), 2)
 
     def test_stable_execution_binds_the_parsed_bytes(self):
         body = self.execution_path.read_bytes()
@@ -683,7 +838,7 @@ class ReleaseApkTest(unittest.TestCase):
         self.assertTrue(receipt['passed'])
         self.assertEqual(receipt['execution']['sha256'], M.digest(body))
         self.assertEqual(receipt['execution']['size'], len(body))
-        self.assertEqual(self.tools.call_count, 2)
+        self.assertEqual(self.android_call_count(), 2)
 
 
     def test_sdk_manifest_changed_after_identity_check_is_rejected(self):
@@ -735,7 +890,7 @@ class ReleaseApkTest(unittest.TestCase):
                     with patch.object(M.json, 'loads', side_effect=parse_then_change):
                         self.rejected(expected)
                     self.assertTrue(changed)
-                    self.assertEqual(self.tools.call_count, tool_calls)
+                    self.assertEqual(self.android_call_count(), tool_calls)
                 finally:
                     self.save(target, body)
 
@@ -758,7 +913,7 @@ class ReleaseApkTest(unittest.TestCase):
         with patch.object(M, 'record', side_effect=record_then_change):
             self.rejected('INIT_BOOT_BRIDGE_SOURCES_INPUT_CHANGED')
         self.assertTrue(changed)
-        self.assertEqual(self.tools.call_count, 2)
+        self.assertEqual(self.android_call_count(), 2)
 
     def test_bundle_sources_changed_between_zip_bytes_and_record_is_rejected(self):
         target = self.bundle / 'BUNDLE-SOURCES.json'
@@ -777,7 +932,7 @@ class ReleaseApkTest(unittest.TestCase):
         with patch.object(M, 'record', side_effect=record_changed_source):
             self.rejected('INIT_BOOT_BRIDGE_SOURCES_INPUT_CHANGED')
         self.assertTrue(changed)
-        self.assertEqual(self.tools.call_count, 2)
+        self.assertEqual(self.android_call_count(), 2)
 
     def test_manifests_changed_before_final_promotion_are_rejected(self):
         targets = ((self.sdk / 'SDK-RELEASE.json', 'SDK_RELEASE_INPUT_CHANGED'),
@@ -803,7 +958,7 @@ class ReleaseApkTest(unittest.TestCase):
                     with patch.object(M, 'record', side_effect=record_then_change):
                         self.rejected(expected)
                     self.assertTrue(changed)
-                    self.assertEqual(self.tools.call_count, 2)
+                    self.assertEqual(self.android_call_count(), 2)
                 finally:
                     self.save(target, body)
 
@@ -819,7 +974,7 @@ class ReleaseApkTest(unittest.TestCase):
         source = next(row['source'] for row in receipt['initBootBridgeAssets']
                       if row['entry'] == 'assets/ultra-init-bridge/BUNDLE-SOURCES.json')
         self.assertEqual(source, bundled)
-        self.assertEqual(self.tools.call_count, 2)
+        self.assertEqual(self.android_call_count(), 2)
 
     def test_sdk_identity_and_bridge_failure_remain_before_json_parse(self):
         target = self.sdk / 'SDK-RELEASE.json'

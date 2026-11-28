@@ -87,7 +87,8 @@ class RootExecutionResponsivenessTest {
             val at = System.nanoTime()
             val result = runBlocking(PageReadDeadline.context(100)) { router.execute("expired") }
             val elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - at)
-            assertEquals("ROOT_EXECUTION_BUSY", result.detail)
+            assertEquals("ROOT_EXECUTION_DEADLINE_EXCEEDED", result.detail)
+            assertEquals(-1007, result.code)
             assertTrue("Inherited deadline overrun: ${elapsed}ms", elapsed < 750)
             assertEquals(1, calls.get())
         } finally { release.countDown(); worker.shutdownNow(); worker.awaitTermination(3, TimeUnit.SECONDS) }

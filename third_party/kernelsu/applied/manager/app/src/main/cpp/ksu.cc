@@ -57,8 +57,6 @@ static inline int64_t monotonic_now_ms() {
     return static_cast<int64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
 }
 
-static struct ksu_get_info_cmd g_version {};
-
 /*
  * 主动向内核申请驱动 fd（与 ksud 用的是同一个入口）。
  * 🔴 注意：本函数**默认关闭**（KSU_ENABLE_INSTALL_DRIVER_FD = 0），原因见下方长注释。
@@ -192,8 +190,6 @@ static inline void ensure_driver_fd() {
     // 本进程没有 fd（启动那一刻内核还没认出管理器）—— 主动申请一次
     fd = install_driver_fd();
     if (fd >= 0) {
-        // 拿到 fd 说明现在能通了，把之前可能缓存的"不是管理器"结论作废
-        g_version = {};
         __android_log_print(ANDROID_LOG_INFO, "7kkernel-ksu",
                             "late install driver fd ok: %d", fd);
     } else {
@@ -212,21 +208,31 @@ static int ksuctl(unsigned long op, Args &&... args) {
     return ioctl(fd, op, std::forward<Args>(args)...);
 }
 
-struct ksu_get_info_cmd get_info() {
-    /*
-     * 两边都别缓存"坏结论"：
-     *   · version == 0        → 上一次根本没读成功，必须重试
-     *   · MANAGER 标志为 0    → 可能是【隐身开着】或【appid 刚被作废还没重扫】，
-     *     这两种都会自己恢复，缓存住就等于界面一直"未安装"。
-     * 正常情况下（已认出、没隐身）才复用缓存，避免每次都 ioctl。
-     */
-    if (!g_version.version || !(g_version.flags & KSU_GET_INFO_FLAG_MANAGER)) {
-        if (ksuctl(KSU_IOCTL_GET_INFO, &g_version) < 0) {
-            ksuctl(KSU_IOCTL_GET_INFO_LEGACY, &g_version);
-            g_version.uapi_version = 0;
-        }
+int get_current_info(struct ksu_get_info_cmd &info) {
+    info = {};
+    if (ksuctl(KSU_IOCTL_GET_INFO, &info) == 0) {
+        return 0;
     }
-    return g_version;
+    // Only an unsupported ioctl selects the older ABI. Permission/transport
+    // failures are current failures, and partial copy-out bytes grant nothing.
+    int error = errno ? errno : EIO;
+    if (error == ENOTTY) {
+        info = {};
+        if (ksuctl(KSU_IOCTL_GET_INFO_LEGACY, &info) == 0) {
+            info.uapi_version = 0;
+            return 0;
+        }
+        error = errno ? errno : EIO;
+    }
+    info = {};
+    errno = error;
+    return -error;
+}
+
+struct ksu_get_info_cmd get_info() {
+    struct ksu_get_info_cmd info {};
+    get_current_info(info);
+    return info;
 }
 
 uint32_t get_kernel_uapi_version() {
@@ -469,8 +475,5 @@ bool stealth_set(bool enabled) {
             return false;
         }
     }
-    /* get_info() 的结果被缓存在 g_version 里,切换隐身状态后必须让它
-     * 重新从内核读取 flags,否则 Natives.isManager 不会立刻变化。 */
-    g_version = {};
     return true;
 }

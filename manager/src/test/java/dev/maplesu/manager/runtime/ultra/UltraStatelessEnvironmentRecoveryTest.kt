@@ -193,9 +193,19 @@ class UltraStatelessEnvironmentRecoveryTest {
         }
     }
 
-    @Test fun failedHistoricalUpgradeVerificationDoesNotBlockFreshRecovery() {
-        assertNull(UltraEnvironmentAutoSetup.resumedInstallResult(UltraEnvironmentUpgrade.Result.FAILED, false))
-        assertNull(UltraEnvironmentAutoSetup.resumedInstallResult(UltraEnvironmentUpgrade.Result.REFUSED, false))
+    @Test fun failedPriorBootUpgradeContinuationNeverFallsThroughToAnotherInstall() {
+        for (resumed in listOf(UltraEnvironmentUpgrade.Result.FAILED, UltraEnvironmentUpgrade.Result.REFUSED)) {
+            val startup = Startup()
+            repeat(3) {
+                val result = UltraEnvironmentAutoSetup.resumedInstallResult(resumed, false) ?: startup.setup()
+                assertEquals("SDK_UPGRADE_PENDING", result.reason)
+                assertFalse(result.attempted)
+                assertFalse(result.installed)
+            }
+            assertEquals(0, startup.installs)
+            assertTrue(startup.calls.isEmpty())
+        }
+        assertNull(UltraEnvironmentAutoSetup.resumedInstallResult(null, false))
         assertEquals("SDK_UPGRADE_PENDING", UltraEnvironmentAutoSetup.resumedInstallResult(null, true)?.reason)
         assertEquals("SDK_UPGRADE_PENDING", UltraEnvironmentAutoSetup.resumedInstallResult(
             UltraEnvironmentUpgrade.Result.FAILED, true)?.reason)

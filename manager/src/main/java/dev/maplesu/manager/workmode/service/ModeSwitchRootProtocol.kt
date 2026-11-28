@@ -140,6 +140,11 @@ internal class ModeSwitchRootPin(
         }
     }
 
+    /** Observations do not start a daemon; an established or failed transaction keeps its owner. */
+    @Synchronized
+    fun observe(script: String, read: (String) -> RootExecResult): RootExecResult =
+        if (pinned || failure != null) execute(script) else read(script)
+
     @Synchronized
     fun execute(script: String): RootExecResult {
         val ready = ensureReady()

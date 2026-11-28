@@ -24,12 +24,28 @@ class UltraBootAuthorizationRestoreTest {
     }
 
     @Test fun unstructuredTransientErrorsNeverReplayAMutation() {
-        for (error in listOf("MAPLESU_SDK_BUSY", "ERR_MODULE_SU_LIST_NOT_FOUND")) {
+        for (error in listOf("MAPLESU_SDK_BUSY", "ERR_MODULE_SU_LIST_NOT_FOUND", "MAPLESU_SDK_DEADLINE_EXCEEDED")) {
             var calls = 0
             val state = UltraBootAuthorizationRestore { error("no receipt proves pre-commit") }
             assertEquals(error, state.ensure("boot", "owner") { calls++; error })
             assertEquals(1, calls)
         }
+    }
+
+    @Test fun expiredMaintenanceReturnsItsReceiptWithoutWaitingOrRepeating() {
+        val receipt = NativeReceipt.parse("""{"backend":"maplesu_ultra","operation":"refresh_authorizations","ok":false,"sdkError":"MAPLESU_SDK_DEADLINE_EXCEEDED","sdkErrorCode":-1007,"reason":"Current request expired before submission."}""")!!
+        val attempt = UltraAuthorizationRestoreResult.refresh(UltraAuthorizationAttempt.from(receipt))
+            .withStatus("MAPLESU_SDK_DEADLINE_EXCEEDED")
+        val state = UltraBootAuthorizationRestore { fail("An expired maintenance pass must return before backoff") }
+        var calls = 0
+        var published: UltraAuthorizationRestoreResult? = null
+        assertEquals("MAPLESU_SDK_DEADLINE_EXCEEDED", state.maintainAttempt({ false }, {
+            calls++; attempt
+        }, { published = it }))
+        assertEquals(1, calls)
+        assertSame(attempt, published)
+        assertSame(receipt, published!!.refresh!!.receipt)
+        assertFalse(attempt.retryableBeforeCommit)
     }
 
 

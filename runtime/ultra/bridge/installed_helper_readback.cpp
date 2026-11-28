@@ -1,4 +1,5 @@
 #include "installed_helper_readback.h"
+#include "sdk_call_scope.h"
 #include "manager_owner_identity.h"
 #include "../../maplesu-sdk/sdk/include/maplesu_request_private.h"
 #include "../../maplesu-sdk/sdk/include/maplesu_root_private.h"
@@ -12,16 +13,20 @@
 #include <cstring>
 #include <fcntl.h>
 #include <initializer_list>
+#include <linux/futex.h>
+#include <new>
 #include <poll.h>
 #include <pthread.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <type_traits>
 #include <unistd.h>
 
 extern "C" __attribute__((visibility("hidden"))) void maplesu_request_fork_prepare() noexcept;
-extern "C" __attribute__((visibility("hidden"))) void maplesu_hook_fork_prepare() noexcept;
+extern "C" __attribute__((visibility("hidden"))) bool maplesu_hook_try_fork_prepare() noexcept;
 extern "C" __attribute__((visibility("hidden"))) void maplesu_hook_fork_complete() noexcept;
 extern "C" __attribute__((visibility("hidden"))) bool maplesu_btf_try_fork_prepare() noexcept;
 extern "C" __attribute__((visibility("hidden"))) void maplesu_btf_fork_complete() noexcept;
@@ -35,14 +40,17 @@ using Clock = std::chrono::steady_clock;
 uint64_t elapsed_us(Clock::time_point start) {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start).count());
 }
+int expired_error(const timespec& deadline);
 struct LayoutForkGuard {
     bool acquired = false;
-    LayoutForkGuard() {
+    int error = 0;
+    explicit LayoutForkGuard(const timespec& deadline) {
         // Hook installation can resolve BTF while holding publication. Acquire
         // publication before the nonblocking cache admission, never after it.
-        maplesu_hook_fork_prepare();
+        if ((error = expired_error(deadline))) return;
+        if (!maplesu_hook_try_fork_prepare()) { error = errno ? errno : EAGAIN; return; }
         acquired = maplesu_btf_try_fork_prepare();
-        if (!acquired) maplesu_hook_fork_complete();
+        if (!acquired) { error = EAGAIN; maplesu_hook_fork_complete(); }
     }
     ~LayoutForkGuard() {
         if (acquired) {
@@ -73,6 +81,32 @@ struct Buffer {
     uint8_t bytes[kInstalledHelperReadbackChunkBytes];
     ~Buffer() { wipe(bytes, sizeof(bytes)); }
 };
+// Root credentials may revoke writes to an inherited app-labelled descriptor.
+// Keep the existing byte frames in this fork's bounded anonymous shared ring;
+// the pipe only reports EOF. Counters wrap modulo 2^32 with at most one ring of
+// outstanding bytes, so large helpers retain the original streaming contract.
+struct SharedRing {
+    std::atomic<uint32_t> written{0}, consumed{0}, readable{0}, writable{0};
+    std::atomic<uint32_t> producer_closed{0}, cancelled{0};
+    uint8_t bytes[kInstalledHelperReadbackChunkBytes]{};
+};
+static_assert(std::atomic<uint32_t>::is_always_lock_free);
+static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t));
+struct SharedMapping {
+    SharedRing* value = nullptr;
+    bool child_reaped = false;
+    SharedMapping() {
+        void* memory = mmap(nullptr, sizeof(SharedRing), PROT_READ | PROT_WRITE,
+            MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if (memory != MAP_FAILED) value = new (memory) SharedRing{};
+    }
+    ~SharedMapping() {
+        if (!value) return;
+        if (child_reaped) wipe(value, sizeof(*value));
+        munmap(value, sizeof(*value));
+    }
+};
+struct Stream { SharedRing& shared; int fd; };
 struct Fd {
     int value = -1;
     ~Fd() { if (value >= 0) close(value); }
@@ -197,46 +231,107 @@ int arm_watchdog(const timespec& deadline) {
     expiration.it_value = deadline;
     return timer_settime(timer, TIMER_ABSTIME, &expiration, nullptr) ? errno : 0;
 }
-int write_exact(int fd, const void* value, size_t bytes, const timespec& deadline) {
+int notify(std::atomic<uint32_t>& event) {
+    event.fetch_add(1, std::memory_order_release);
+    return syscall(SYS_futex, reinterpret_cast<uint32_t*>(&event), FUTEX_WAKE,
+        1, nullptr, nullptr, 0) < 0 ? errno : 0;
+}
+int await(std::atomic<uint32_t>& event, uint32_t observed, const timespec& deadline, bool observe_eof = false) {
+    if (const int error = expired_error(deadline)) return error;
+    timespec limit = deadline;
+    if (observe_eof) {
+        timespec next{};
+        if (clock_gettime(CLOCK_MONOTONIC, &next)) return errno;
+        // An abrupt child exit cannot publish a shared wake. Bound only this
+        // wait so the same stream's existing pipe EOF is observed promptly.
+        next.tv_nsec += 1000000;
+        if (next.tv_nsec >= 1000000000) { ++next.tv_sec; next.tv_nsec -= 1000000000; }
+        if (next.tv_sec < limit.tv_sec || (next.tv_sec == limit.tv_sec && next.tv_nsec < limit.tv_nsec)) limit = next;
+    }
+    if (syscall(SYS_futex, reinterpret_cast<uint32_t*>(&event), FUTEX_WAIT_BITSET,
+        observed, &limit, nullptr, FUTEX_BITSET_MATCH_ANY) >= 0) return 0;
+    if (errno == ETIMEDOUT && observe_eof) return expired_error(deadline);
+    return errno == EINTR || errno == EAGAIN ? 0 : errno;
+}
+int cancel_stream(SharedRing& ring) {
+    ring.cancelled.store(1, std::memory_order_release);
+    const int first = notify(ring.writable);
+    const int second = notify(ring.readable);
+    return first ? first : second;
+}
+int write_exact(Stream& output, const void* value, size_t bytes, const timespec& deadline) {
     auto* data = static_cast<const uint8_t*>(value);
+    auto& ring = output.shared;
     while (bytes) {
         if (const int error = expired_error(deadline)) return error;
-        const ssize_t count = write(fd, data, bytes);
-        if (count < 0 && errno == EINTR) continue;
-        if (count <= 0) return count ? errno : EIO;
+        const auto event = ring.writable.load(std::memory_order_acquire);
+        if (ring.cancelled.load(std::memory_order_acquire)) return ECANCELED;
+        const auto written = ring.written.load(std::memory_order_relaxed);
+        const auto consumed = ring.consumed.load(std::memory_order_acquire);
+        const uint32_t used = written - consumed;
+        if (used > sizeof(ring.bytes)) return EPROTO;
+        if (used == sizeof(ring.bytes)) {
+            if (const int error = await(ring.writable, event, deadline)) return error;
+            continue;
+        }
+        const size_t index = written % sizeof(ring.bytes);
+        const size_t count = std::min({bytes, sizeof(ring.bytes) - used, sizeof(ring.bytes) - index});
+        std::memcpy(ring.bytes + index, data, count);
+        ring.written.store(written + static_cast<uint32_t>(count), std::memory_order_release);
+        if (const int error = notify(ring.readable)) return error;
         data += count;
-        bytes -= static_cast<size_t>(count);
+        bytes -= count;
     }
     return 0;
 }
-int write_frame(int fd, uint32_t kind, const void* data, uint32_t bytes, const timespec& deadline) {
+int write_frame(Stream& output, uint32_t kind, const void* data, uint32_t bytes, const timespec& deadline) {
     const Frame header{kMagic, kVersion, kind, bytes};
-    const int error = write_exact(fd, &header, sizeof(header), deadline);
-    return error ? error : write_exact(fd, data, bytes, deadline);
+    const int error = write_exact(output, &header, sizeof(header), deadline);
+    return error ? error : write_exact(output, data, bytes, deadline);
 }
-bool progress(Result& out, const char* phase, int output, const timespec& deadline) {
+bool progress(Result& out, const char* phase, Stream& output, const timespec& deadline) {
     std::strncpy(out.root_phase, phase, sizeof(out.root_phase) - 1);
     const int error = write_frame(output, kProgress, &out, sizeof(out), deadline);
     if (error) out.child_io_error = error;
     return !error;
 }
-int read_exact(int fd, void* value, size_t bytes, const timespec& deadline) {
+int read_exact(Stream& input, void* value, size_t bytes, const timespec& deadline) {
     auto* data = static_cast<uint8_t*>(value);
+    auto& ring = input.shared;
     while (bytes) {
-        const int budget = budget_ms(deadline);
-        if (budget <= 0) return budget ? -budget : ETIMEDOUT;
-        pollfd watch{fd, POLLIN, 0};
-        const int ready = poll(&watch, 1, budget);
-        if (ready < 0 && errno == EINTR) continue;
-        if (ready < 0) return errno;
-        if (!ready) return ETIMEDOUT;
-        if (watch.revents & POLLNVAL) return EBADF;
-        const ssize_t count = read(fd, data, bytes);
-        if (count < 0 && errno == EINTR) continue;
-        if (count < 0) return errno;
-        if (!count) return EPIPE;
+        if (const int error = expired_error(deadline)) return error;
+        const auto event = ring.readable.load(std::memory_order_acquire);
+        const auto consumed = ring.consumed.load(std::memory_order_relaxed);
+        const auto written = ring.written.load(std::memory_order_acquire);
+        const uint32_t available = written - consumed;
+        if (available > sizeof(ring.bytes)) return EPROTO;
+        if (!available) {
+            if (ring.producer_closed.load(std::memory_order_acquire)) {
+                if (ring.written.load(std::memory_order_acquire) != consumed) continue;
+                return EPIPE;
+            }
+            if (ring.cancelled.load(std::memory_order_acquire)) return ECANCELED;
+            pollfd watch{input.fd, POLLIN, 0};
+            const int ready = poll(&watch, 1, 0);
+            if (ready < 0 && errno == EINTR) continue;
+            if (ready < 0) return errno;
+            if (watch.revents & POLLNVAL) return EBADF;
+            if (watch.revents & POLLHUP) {
+                if (ring.written.load(std::memory_order_acquire) != consumed) continue;
+                return EPIPE;
+            }
+            if (watch.revents & POLLIN) return EPROTO;
+            if (const int error = await(ring.readable, event, deadline, true)) return error;
+            continue;
+        }
+        const size_t index = consumed % sizeof(ring.bytes);
+        const size_t count = std::min({bytes, static_cast<size_t>(available), sizeof(ring.bytes) - index});
+        std::memcpy(data, ring.bytes + index, count);
+        wipe(ring.bytes + index, count);
+        ring.consumed.store(consumed + static_cast<uint32_t>(count), std::memory_order_release);
+        if (const int error = notify(ring.writable)) return error;
         data += count;
-        bytes -= static_cast<size_t>(count);
+        bytes -= count;
     }
     return 0;
 }
@@ -314,7 +409,7 @@ bool valid_snapshot_path(const Result& out, const char* requested) {
         !out.root_verified && !out.read_attempted;
     return out.owner_bound && valid_path(out.helper_path) && deployment_ok(out.deployment);
 }
-void authenticate(Result& out, const char* path, int output, const timespec& deadline) {
+void authenticate(Result& out, const char* path, Stream& output, const timespec& deadline) {
     if (path) std::memcpy(out.helper_path, path, sizeof(out.helper_path));
     if (!progress(out, "auth-mode", output, deadline)) return;
     out.mode_error = static_cast<int64_t>(maplesu_request_set_auth_mode(
@@ -391,7 +486,7 @@ bool same_file(const struct stat& a, const struct stat& b) {
         a.st_mtim.tv_sec == b.st_mtim.tv_sec && a.st_mtim.tv_nsec == b.st_mtim.tv_nsec &&
         a.st_ctim.tv_sec == b.st_ctim.tv_sec && a.st_ctim.tv_nsec == b.st_ctim.tv_nsec;
 }
-int produce(int output, const char* path, Result& out, const timespec& deadline) {
+int produce(Stream& output, const char* path, Result& out, const timespec& deadline) {
     out.read_attempted = true;
     Fd source{open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)};
     if (source.value < 0) return errno;
@@ -437,20 +532,21 @@ int produce(int output, const char* path, Result& out, const timespec& deadline)
     return source.finish();
 }
 [[noreturn]] void child_run(int input, int output, const char* path,
-    uint64_t offset, const timespec& deadline) {
+    uint64_t offset, const timespec& deadline, SharedRing& shared) {
+    Stream stream{shared, output};
     Result out;
     out.owner_mode = true;
     out.namespace_requested = out.owner_mode && path == nullptr;
     if (path) std::memcpy(out.helper_path, path, sizeof(out.helper_path));
     out.normalized_offset = offset;
     out.child_pid = static_cast<uint32_t>(getpid());
-    (void)progress(out, "worker-start", output, deadline);
+    (void)progress(out, "worker-start", stream, deadline);
     out.watchdog_error = arm_watchdog(deadline);
     out.watchdog_armed = !out.watchdog_error;
     if (close(input)) out.child_io_error = errno;
     if (signal(SIGPIPE, SIG_IGN) == SIG_ERR && !out.child_io_error) out.child_io_error = errno;
     const auto authentication_started = Clock::now();
-    if (out.watchdog_armed && !out.child_io_error) try { authenticate(out, path, output, deadline); }
+    if (out.watchdog_armed && !out.child_io_error) try { authenticate(out, path, stream, deadline); }
     catch (...) {
         out.child_exception = true;
         if (out.deployment.attempted && !out.root.attempted) {
@@ -469,23 +565,25 @@ int produce(int output, const char* path, Result& out, const timespec& deadline)
     }
     out.authentication_us = elapsed_us(authentication_started);
     out.root_checkpoint_received = true;
-    int delivered = write_frame(output, kRoot, &out, sizeof(out), deadline);
+    int delivered = write_frame(stream, kRoot, &out, sizeof(out), deadline);
     if (!delivered && out.root_verified) {
         const auto source_started = Clock::now();
-        try { out.producer_error = produce(output, out.helper_path, out, deadline); }
+        try { out.producer_error = produce(stream, out.helper_path, out, deadline); }
         catch (...) { out.child_exception = true; out.producer_error = EIO; }
         out.source_us = elapsed_us(source_started);
     }
     const End end{out.actual_size, out.normalized_offset, out.source_bytes, out.stream_bytes,
         out.producer_error, uint8_t(out.read_attempted), uint8_t(out.metadata_stable),
         uint8_t(out.path_stable), uint8_t(out.source_eof)};
-    if (!delivered) delivered = write_frame(output, kEnd, &end, sizeof(end), deadline);
+    if (!delivered) delivered = write_frame(stream, kEnd, &end, sizeof(end), deadline);
     if (delivered && !out.child_io_error) out.child_io_error = delivered;
     close_owner(out);
     out.receipt_complete = true;
-    const int final_error = write_frame(output, kFinal, &out, sizeof(out), deadline);
+    const int final_error = write_frame(stream, kFinal, &out, sizeof(out), deadline);
+    shared.producer_closed.store(1, std::memory_order_release);
+    const int notify_error = notify(shared.readable);
     if (close(output) && !delivered) delivered = errno;
-    _exit(!delivered && !final_error && !out.child_io_error ? 0 : 1);
+    _exit(!delivered && !final_error && !notify_error && !out.child_io_error ? 0 : 1);
 }
 bool end_matches(const End& end, const Result& value) {
     return value.actual_size == end.actual_size && value.normalized_offset == end.offset &&
@@ -494,7 +592,7 @@ bool end_matches(const End& end, const Result& value) {
         value.metadata_stable == bool(end.metadata_stable) && value.path_stable == bool(end.path_stable) &&
         value.source_eof == bool(end.source_eof);
 }
-int receive(int input, pid_t child, bool owner, const char* path, uint64_t offset, Result& out,
+int receive(Stream& input, pid_t child, bool owner, const char* path, uint64_t offset, Result& out,
     InstalledHelperChunkConsumer consume, void* context, const timespec& deadline) {
     bool root_seen = false, header_seen = false, end_seen = false;
     Header header;
@@ -603,6 +701,12 @@ int finish_wait(pid_t child, Result& out, const timespec& deadline, uint64_t lea
 
 InstalledHelperReadbackResult read_installed_helper(const char* path,
     InstalledHelperChunkConsumer consume, void* context, uint32_t timeout_ms) {
+    return read_installed_helper(path, consume, context, timeout_ms, 0);
+}
+
+InstalledHelperReadbackResult read_installed_helper(const char* path,
+    InstalledHelperChunkConsumer consume, void* context, uint32_t timeout_ms,
+    int64_t session_deadline_nanos) {
     Result out;
     out.owner_mode = true;
     out.namespace_requested = out.owner_mode && path == nullptr;
@@ -611,19 +715,35 @@ InstalledHelperReadbackResult read_installed_helper(const char* path,
     timespec deadline{};
     if ((path && !valid_path(path)) || !consume ||
         !timeout_ms || timeout_ms > 5000) out.system_error = EINVAL;
-    else if (const auto admission = manager_worker_admission(); is_failed(admission))
-        out.channel_error = out.sdk_error = static_cast<int64_t>(admission);
     else if (clock_gettime(CLOCK_MONOTONIC, &deadline)) out.system_error = errno;
     else {
         const timespec began = deadline;
         deadline.tv_sec += timeout_ms / 1000;
         deadline.tv_nsec += (timeout_ms % 1000) * 1000000;
         if (deadline.tv_nsec >= 1000000000) { ++deadline.tv_sec; deadline.tv_nsec -= 1000000000; }
+        if (session_deadline_nanos > 0 && session_deadline_nanos <
+            int64_t(deadline.tv_sec) * INT64_C(1000000000) + deadline.tv_nsec) {
+            deadline.tv_sec = static_cast<time_t>(session_deadline_nanos / INT64_C(1000000000));
+            deadline.tv_nsec = static_cast<long>(session_deadline_nanos % INT64_C(1000000000));
+        }
+        SdkDeadlineScope sdk_deadline(int64_t(deadline.tv_sec) * INT64_C(1000000000) + deadline.tv_nsec);
+        const int64_t operation_deadline = sdk_call_deadline_nanos();
+        deadline.tv_sec = static_cast<time_t>(operation_deadline / INT64_C(1000000000));
+        deadline.tv_nsec = static_cast<long>(operation_deadline % INT64_C(1000000000));
         uint64_t lease = 0;
-        if (admit(out, deadline, lease)) {
+        if (const int expired = expired_error(deadline)) {
+            out.admission_error = expired;
+            out.timed_out = expired == ETIMEDOUT;
+        } else if (const auto admission = manager_worker_admission(); is_failed(admission))
+            out.channel_error = out.sdk_error = static_cast<int64_t>(admission);
+        else if (const int expired = expired_error(deadline)) {
+            out.admission_error = expired;
+            out.timed_out = expired == ETIMEDOUT;
+        } else if (admit(out, deadline, lease)) {
             const auto admission_us = elapsed_us(start);
+            SharedMapping channel;
             int fds[2];
-            if (pipe2(fds, O_CLOEXEC)) {
+            if (!channel.value || pipe2(fds, O_CLOEXEC)) {
                 out.transport_error = errno;
                 reader_slot.compare_exchange_strong(lease, 0, std::memory_order_acq_rel);
             } else {
@@ -631,35 +751,46 @@ InstalledHelperReadbackResult read_installed_helper(const char* path,
                 int fork_error = 0;
                 const auto fork_started = Clock::now();
                 {
-                    LayoutForkGuard layout;
-                    if (!layout.acquired) out.admission_error = EAGAIN;
+                    LayoutForkGuard layout(deadline);
+                    if (!layout.acquired) {
+                        out.admission_error = layout.error;
+                        out.timed_out = layout.error == ETIMEDOUT;
+                    }
                     else if (const int expired = expired_error(deadline)) {
                         out.admission_error = expired;
                         out.timed_out = expired == ETIMEDOUT;
                     }
                     else {
                         maplesu_request_fork_prepare();
-                        child = fork();
-                        if (child < 0) fork_error = errno;
+                        if (const int expired = expired_error(deadline)) {
+                            out.admission_error = expired;
+                            out.timed_out = expired == ETIMEDOUT;
+                        } else {
+                            child = fork();
+                            if (child < 0) fork_error = errno;
+                        }
                     }
                 }
                 const auto fork_us = elapsed_us(fork_started);
                 out.admission_us = admission_us;
                 out.fork_us = fork_us;
-                if (!child) child_run(fds[0], fds[1], path, out.normalized_offset, deadline);
+                if (!child) child_run(fds[0], fds[1], path, out.normalized_offset, deadline, *channel.value);
                 if (child < 0) {
                     if (!out.admission_error) out.transport_error = fork_error;
                     close(fds[0]); close(fds[1]);
                     reader_slot.compare_exchange_strong(lease, 0, std::memory_order_acq_rel);
                 } else {
+                    Stream input{*channel.value, fds[0]};
                     const int prior_cleanup_error = out.cleanup_error;
                     int error = close(fds[1]) ? errno : 0;
                     const auto receive_started = Clock::now();
-                    const int received = receive(fds[0], child, out.owner_mode, path, out.normalized_offset,
+                    const int received = receive(input, child, out.owner_mode, path, out.normalized_offset,
                         out, consume, context, deadline);
                     if (!error) error = received;
                     if (!received) {
-                        const int eof_error = read_eof(fds[0], deadline);
+                        int eof_error = read_eof(fds[0], deadline);
+                        if (!eof_error && channel.value->written.load(std::memory_order_acquire) !=
+                            channel.value->consumed.load(std::memory_order_acquire)) eof_error = EPROTO;
                         out.stream_eof = !eof_error;
                         if (!error) error = eof_error;
                     }
@@ -669,12 +800,15 @@ InstalledHelperReadbackResult read_installed_helper(const char* path,
                     out.transport_error = error;
                     out.timed_out = error == ETIMEDOUT;
                     if (error) {
+                        const int cancel_error = cancel_stream(*channel.value);
+                        if (cancel_error && !out.cleanup_error) out.cleanup_error = cancel_error;
                         out.termination_requested = true;
                         if (kill(child, SIGKILL) && errno != ESRCH) out.termination_error = errno;
                     }
                     out.receive_us = elapsed_us(receive_started);
                     const auto wait_started = Clock::now();
                     const int deadline_error = finish_wait(child, out, deadline, lease, began);
+                    channel.child_reaped = out.child_status_valid || out.wait_error == ECHILD;
                     out.wait_us = elapsed_us(wait_started);
                     out.admission_us = admission_us;
                     out.fork_us = fork_us;

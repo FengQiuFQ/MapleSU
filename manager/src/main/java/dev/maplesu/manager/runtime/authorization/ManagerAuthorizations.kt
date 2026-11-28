@@ -6,9 +6,14 @@ import dev.maplesu.manager.runtime.HookRootExecutor
 import dev.maplesu.manager.runtime.SuDelivery
 import dev.maplesu.manager.runtime.SuPathWiring
 import dev.maplesu.manager.runtime.SuPublication
+import dev.maplesu.manager.runtime.PageReadDeadline
+import dev.maplesu.manager.runtime.State
+import dev.maplesu.manager.runtime.stateFor
 import dev.maplesu.manager.runtime.ultra.UltraAuthorization
 import dev.maplesu.manager.runtime.ultra.UltraEnvironmentProbe
+import dev.maplesu.manager.runtime.ultra.UltraRuntimeClient
 import dev.maplesu.manager.runtime.ultra.UltraSdkSession
+import dev.maplesu.manager.runtime.ultra.UltraSuChannel
 
 /** App-private management API. Request adapters must capture the caller UID before consulting policy. */
 internal object ManagerAuthorizations {
@@ -16,7 +21,7 @@ internal object ManagerAuthorizations {
     fun usesManagerAuthority(context: Context): Boolean =
         dev.maplesu.manager.workmode.ModeRuntime.active != dev.maplesu.manager.workmode.WorkMode.KSU &&
             (HookRootExecutor.production(context).available() || UltraSdkSession.current(context) != null ||
-                UltraEnvironmentProbe.currentSnapshot(context).let { it.managerOwnerIdentity != null && it.kernelRootVerified })
+                UltraEnvironmentProbe.currentSnapshot(context).managerOwnerIdentity != null)
 
     private fun usesSdkOnly(context: Context): Boolean =
         UltraEnvironmentProbe.usesUltraBackend(context) && !usesManagerAuthority(context)
@@ -106,6 +111,138 @@ internal object ManagerAuthorizations {
         return ManagerSuProfiles.read(snapshot, requireNotNull(name), identity)
     }
 
+    /** One live SDK result, bound to its caller scope and observation deadline. */
+    internal class CurrentDeliveryRead(
+        val uidProfiles: UltraRuntimeClient.SuUidProfilesSnapshot?,
+        val entryConfirmed: Boolean? = null,
+        val entryCode: String? = null,
+        val entryDetail: String = "",
+        private val current: () -> Boolean,
+    ) {
+        fun isCurrent(): Boolean = current()
+
+        fun confirms(uid: Int, packageName: String, allow: Boolean): Boolean = confirms(uid, setOf(packageName), allow)
+
+        fun confirms(uid: Int, members: Set<String>, allow: Boolean): Boolean =
+            isCurrent() && uidProfiles?.ok == true && uidProfiles.profiles.singleOrNull { it.uid == uid }
+                ?.let { it.packageName in members && it.allow == allow } == true
+
+        val code: String? get() = when {
+            uidProfiles?.ok == false -> uidProfiles.receipt.sdkError
+            !isCurrent() -> "SU_AUTH_SCOPE_CHANGED"
+            uidProfiles == null -> "PROFILE_CURRENT_DELIVERY_UNCONFIRMED"
+            else -> null
+        }
+
+        val detail: String get() = listOfNotNull(uidProfiles?.receipt?.raw,
+            "SU_AUTH_SCOPE_CHANGED".takeUnless { isCurrent() }).joinToString("\n")
+    }
+
+    /** Read once for a whole page; a cached authorization list is never an input. */
+    internal fun currentDeliveryRead(context: Context): CurrentDeliveryRead =
+        PageReadDeadline.onWorker(PageReadDeadline.limitNanos(5_000L)) {
+            val scope = UltraAuthorization.captureScope(context)
+                ?: return@onWorker CurrentDeliveryRead(null, current = { false })
+            if (!scope.current()) return@onWorker CurrentDeliveryRead(null, current = { false })
+            currentDeliveryRead(scope, scope.client.suUidProfiles())
+        }
+
+    /** Reuse the caller's same live UID read, without issuing a second SDK request. */
+    internal fun currentDeliveryRead(scope: UltraAuthorization.Scope,
+                                     read: UltraRuntimeClient.SuUidProfilesSnapshot): CurrentDeliveryRead {
+        val deadline = PageReadDeadline.limitNanos(5_000L)
+        val current = { scope.current() && deadline - System.nanoTime() > 0L }
+        if (!read.ok || !current()) return CurrentDeliveryRead(read, current = current)
+        val channel = UltraSuChannel()
+        val entry = PageReadDeadline.onWorker(deadline) { channel.rootUid() }
+        return CurrentDeliveryRead(read, entryConfirmed = entry == 0 && current(),
+            entryCode = channel.lastFailure ?: "SU_AUTH_SCOPE_CHANGED".takeUnless { current() },
+            entryDetail = channel.lastFailure.orEmpty(), current = current)
+    }
+
+    /** One fresh read keeps the stored decision separate from its mirror watermark. */
+    internal fun profileDetailed(context: Context, name: String?, uid: Int): Natives.ProfileReadResult =
+        PageReadDeadline.onWorker(PageReadDeadline.limitNanos(5_000L)) { profileDetailedCurrent(context, name, uid) }
+
+    private fun profileDetailedCurrent(context: Context, name: String?, uid: Int): Natives.ProfileReadResult {
+        val members = context.packageManager.getPackagesForUid(uid)?.toSet().orEmpty()
+        if (name.isNullOrBlank() || uid < 0 || name !in members)
+            return Natives.ProfileReadResult(null, code = "PROFILE_IDENTITY_MISMATCH")
+        if (usesSdkOnly(context)) {
+            return sdkProfileDetailed(name, uid, members, currentDeliveryRead(context))
+        }
+        val identity = AndroidApplicationIdentities(context).read(uid)
+            ?: return Natives.ProfileReadResult(null, code = "PROFILE_IDENTITY_UNAVAILABLE")
+        if (name !in identity.members)
+            return Natives.ProfileReadResult(null, code = "PROFILE_IDENTITY_MISMATCH")
+        val read = SuperuserControl.snapshotDetailed(context)
+        val snapshot = read.snapshot ?: return Natives.ProfileReadResult(null, code = read.code, detail = read.detail)
+        if (UltraSdkSession.current(context) != null || UltraEnvironmentProbe.usesUltraBackend(context))
+            return profileDetailed(snapshot, name, identity, currentDeliveryRead(context))
+        val profile = ManagerSuProfiles.read(snapshot, name, identity)
+        return profileDetailed(snapshot, name, identity,
+            currentState = stateFor(context, name, profile.allowSu))
+    }
+
+    internal fun sdkProfileDetailed(name: String, uid: Int, members: Set<String>,
+                                    current: CurrentDeliveryRead): Natives.ProfileReadResult {
+        if (name !in members) return Natives.ProfileReadResult(null, code = "PROFILE_IDENTITY_MISMATCH")
+        val read = current.uidProfiles
+        if (read?.ok != true || !current.isCurrent())
+            return Natives.ProfileReadResult(null, code = current.code, detail = current.detail)
+        val row = read.profiles.singleOrNull { it.uid == uid }
+        if (row == null) {
+            // No stored decision keeps the original editable default; absence is no delivery proof.
+            return Natives.ProfileReadResult(Natives.Profile(name, currentUid = uid))
+        }
+        if (row.packageName !in members)
+            return Natives.ProfileReadResult(null, deliveryConfirmed = false,
+                code = "PROFILE_CURRENT_DELIVERY_MISMATCH", detail = current.detail)
+        val profile = Natives.Profile(name, currentUid = uid, allowSu = row.allow)
+        val confirmed = current.confirms(uid, members, row.allow)
+        val code = current.code
+        val detail = listOf(current.detail, current.entryDetail).filter { it.isNotEmpty() }.joinToString("\n")
+        val stillCurrent = current.isCurrent()
+        return Natives.ProfileReadResult(profile, deliveryConfirmed = confirmed && stillCurrent,
+            code = code ?: if (!stillCurrent) "SU_AUTH_SCOPE_CHANGED" else current.entryCode,
+            detail = detail, entryConfirmed = current.entryConfirmed.takeIf { stillCurrent })
+    }
+
+    internal fun profileDetailed(snapshot: AuthorizationSnapshot, name: String,
+                                 identity: ApplicationIdentity, current: CurrentDeliveryRead? = null,
+                                 currentState: State? = null): Natives.ProfileReadResult {
+        if (name !in identity.members)
+            return Natives.ProfileReadResult(null, code = "PROFILE_IDENTITY_MISMATCH")
+        val profile = ManagerSuProfiles.read(snapshot, name, identity)
+        val latest = snapshot.applied.asReversed().maxByOrNull { it.rev }
+        val applied = !snapshot.pendingApply() && latest?.ok == true && latest.rev >= snapshot.rev
+        val runtimeConfirmed = current?.confirms(identity.uid, identity.members.keys, profile.allowSu) == true ||
+            currentState == State.WIRED || currentState == State.DELIVERED
+        val currentCode = current?.code
+        val currentDetail = current?.detail
+        val stillCurrent = current?.isCurrent() != false
+        val confirmed = applied && runtimeConfirmed && stillCurrent
+        val code = currentCode ?: when {
+            !stillCurrent -> "SU_AUTH_SCOPE_CHANGED"
+            !applied -> SuCodes.SU_AUTH_APPLY_PENDING
+            !runtimeConfirmed -> "PROFILE_CURRENT_DELIVERY_UNCONFIRMED"
+            else -> current?.entryCode
+        }
+        return Natives.ProfileReadResult(profile, deliveryConfirmed = confirmed,
+            code = code,
+            detail = listOfNotNull(
+                currentDetail?.takeIf { it.isNotEmpty() && code != null },
+                current?.entryDetail?.takeIf { it.isNotEmpty() },
+                "currentRuntimeProof=absent".takeIf { current == null && currentState == null },
+                "decisionRev=${snapshot.rev}",
+                latest?.let { "backend=${it.backend} appliedRev=${it.rev} appliedOk=${it.ok}" }
+                    ?: "appliedReceipt=absent",
+                latest?.detail?.takeIf { !applied && it.isNotEmpty() },
+            ).takeUnless { code == null }?.joinToString("; ").orEmpty(),
+            entryConfirmed = current?.entryConfirmed?.takeIf { current.isCurrent() }
+                ?: (currentState == State.WIRED).takeIf { currentState != null })
+    }
+
     fun saveProfile(context: Context, profile: Natives.Profile): Boolean =
         saveProfileDetailed(context, profile).succeeded
 
@@ -155,9 +292,7 @@ internal object ManagerAuthorizations {
         if (!result.succeeded) return result
         // The SDK is the exec-su transport on a boot session; never launch Direct delivery.
         if (UltraSdkSession.current(context) != null) return result
-        if (UltraEnvironmentProbe.currentSnapshot(context).let {
-                it.managerOwnerIdentity != null && it.kernelRootVerified
-            }) return result
+        if (UltraEnvironmentProbe.currentSnapshot(context).managerOwnerIdentity != null) return result
         // SuperuserControl already queued Hook publication after the decision.
         if (HookRootExecutor.production(context).available()) return result
         // Plan A: the authorization change carries the delivery with it, but the delivery

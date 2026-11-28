@@ -108,7 +108,11 @@ class UltraSdkParallelismTest {
             val expired = submit(client(), "get_su_auth_list") {
                 submissions.incrementAndGet(); raw("get_su_auth_list")
             }
-            assertEquals("MAPLESU_SDK_BUSY", expired.sdkError)
+            assertEquals("MAPLESU_SDK_DEADLINE_EXCEEDED", expired.sdkError)
+            assertEquals(-1007, expired.sdkErrorCode)
+            val raw = org.json.JSONObject(expired.raw)
+            assertEquals(expired.sdkError, raw.getString("sdkError"))
+            assertEquals(expired.sdkErrorCode, raw.getInt("sdkErrorCode"))
             assertEquals(0, submissions.get())
         } finally { deadline.remove() }
     }

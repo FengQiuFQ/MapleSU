@@ -17,20 +17,17 @@ import dev.maplesu.manager.workmode.detect.KsuKernelProbe
 object KsuKernelProbeAdapter : KsuKernelProbe {
     override fun probe(): KsuFacts {
         val snapshot = currentSnapshot()
-        check(snapshot.available) { "KSU_PROBE_UNAVAILABLE" }
+        check(snapshot.available && snapshot.status == 0 && snapshot.version > 0) {
+            "KSU_PROBE_UNAVAILABLE:${snapshot.status}"
+        }
         return KsuProbeMapping.from(snapshot)
     }
 
     /** 一次 native 只读快照；任何异常 → unavailable（unknown）。 */
     internal fun currentSnapshot(): KsuNativeSnapshot = runCatching {
         val natives = KsuBackends.natives()
-        KsuNativeSnapshot(
-            available = natives.available,
-            version = natives.version,
-            kernelUapi = natives.kernelUAPIVersion,
-            isManager = natives.isManager,
-            isLkm = natives.isLkmMode,
-        )
+        if (natives.available) KsuNativeSnapshot.fromCurrentInfo(natives.currentInfo())
+        else KsuNativeSnapshot.UNAVAILABLE
     }.getOrDefault(KsuNativeSnapshot.UNAVAILABLE)
 }
 
@@ -41,8 +38,17 @@ data class KsuNativeSnapshot(
     val kernelUapi: Int,
     val isManager: Boolean,
     val isLkm: Boolean,
+    val status: Int = 0,
 ) {
     companion object {
+        /** All fields belong to one current native GET_INFO operation. */
+        fun fromCurrentInfo(info: IntArray?): KsuNativeSnapshot {
+            if (info == null || info.size != 4) return UNAVAILABLE
+            return KsuNativeSnapshot(true, info[1], info[3],
+                info[0] == 0 && info[2] and 2 != 0,
+                info[0] == 0 && info[2] and 1 != 0, info[0])
+        }
+
         val UNAVAILABLE = KsuNativeSnapshot(
             available = false,
             version = -1,
@@ -56,18 +62,20 @@ data class KsuNativeSnapshot(
 /**
  * 快照 → [KsuFacts] 的**纯映射**：
  * - native 不可用 → 全 unknown（`KsuFacts()` 默认值，version=-1）；
- * - 可用但版本 <= 0 → `responded=false`（内核未响应 supercall）；
+ * - 当前操作失败或版本 <= 0 → unknown，不透传其它身份或能力字段；
  * - 可用且版本 > 0 → `responded=true`，uapi/isManager/isLkm 原样透传。
  */
 object KsuProbeMapping {
-    /** Match full detection: a responding foreign KSU kernel is not MapleSU_Normal. */
+    /** A hidden/unclaimed build branch or the legacy compatibility ABI is still unknown. */
     fun normalStatus(snapshot: KsuNativeSnapshot): Boolean? {
-        if (!snapshot.available) return null
-        return snapshot.version > 0 && snapshot.isManager
+        if (!snapshot.available || snapshot.status != 0 || snapshot.version <= 0) return null
+        if (snapshot.isManager) return true
+        if (snapshot.kernelUapi <= 0 || snapshot.kernelUapi == 7) return null
+        return false
     }
 
     fun from(snapshot: KsuNativeSnapshot): KsuFacts {
-        if (!snapshot.available) return KsuFacts()
+        if (!snapshot.available || snapshot.status != 0 || snapshot.version <= 0) return KsuFacts()
         return KsuFacts(
             responded = snapshot.version > 0,
             version = snapshot.version,

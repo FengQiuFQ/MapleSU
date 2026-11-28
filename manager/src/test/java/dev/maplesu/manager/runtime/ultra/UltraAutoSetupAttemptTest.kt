@@ -36,6 +36,7 @@ class UltraAutoSetupAttemptTest {
         var records = 0
         var diagnosticCrash = false
         var installs = 0
+        var refreshes = 0
         var outcome = UltraEnvironmentInstaller.Outcome(true, "OK")
         var crash = false
         var cancellation: java.util.concurrent.CancellationException? = null
@@ -58,7 +59,7 @@ class UltraAutoSetupAttemptTest {
             if (outcome.ok && outcome.verified) observed = UltraEnvironmentProbe.State.Running
             return outcome
         }
-        override fun refresh() = Unit
+        override fun refresh() { refreshes++ }
         fun run() = UltraAutoSetupAttempt.run(this)
     }
 
@@ -179,6 +180,27 @@ class UltraAutoSetupAttemptTest {
         val port = Port().apply { observed = UltraEnvironmentProbe.State.NotInstalled; guardOk = false }
         assertEquals("INSTALL_GUARD_STORE_FAILED", port.run().reason)
         assertEquals(0, port.installs)
+    }
+
+    @Test fun onlyAVerifiedSuccessfulInstallStartsAnotherProbe() {
+        for ((outcome, reason) in listOf(
+            UltraEnvironmentInstaller.Outcome(true, "OK") to "INSTALLED",
+            UltraEnvironmentInstaller.Outcome(true, "OK", verified = false) to "INSTALL_UNVERIFIED",
+            UltraEnvironmentInstaller.Outcome(false, "MAPLESU_SDK_BUSY", sdkErrorCode = -1002) to "SDK_ERROR_MAPLESU_SDK_BUSY",
+            UltraEnvironmentInstaller.Outcome(false, "HOTLOAD_REPLY_LOST", sdkErrorCode = -21002,
+                verified = false, submissionUnknown = true) to "INSTALL_RECONCILIATION_REQUIRED",
+        )) {
+            val port = Port().apply {
+                observed = UltraEnvironmentProbe.State.NotInstalled
+                this.outcome = outcome
+            }
+            val result = port.run()
+            assertEquals(reason, result.reason)
+            assertEquals(outcome.ok && outcome.verified, result.installed)
+            assertEquals(1, port.installs)
+            assertEquals("Failed, unverified and uncertain outcomes keep their original observation",
+                if (outcome.ok && outcome.verified) 1 else 0, port.refreshes)
+        }
     }
 
     @Test fun aLostInstallReplyIsReconciledBeforeAnyLaterSubmission() {

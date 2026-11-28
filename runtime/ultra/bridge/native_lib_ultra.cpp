@@ -37,6 +37,7 @@
 #include <string>
 #include <vector>
 #include <sys/wait.h>
+#include <time.h>
 
 #include "kernel_module_kit_umbrella.h"
 #include "maplesu_module_control.h"
@@ -198,13 +199,20 @@ void mark_bridge_error(cJSON* root, int code, const char* name, const std::strin
 
 void mark_call_bridge_error(cJSON* root, const KModErr* sdk_error, int code,
                            const char* name, const std::string& detail) {
-    if (!sdk_error || !is_failed(*sdk_error)) {
+    const auto* existing = cJSON_GetObjectItemCaseSensitive(root, "sdkErrorCode");
+    const bool receipt_failed = cJSON_IsNumber(existing) && existing->valuedouble != 0;
+    const bool sdk_failed = sdk_error && is_failed(*sdk_error);
+    if (!sdk_failed && !receipt_failed) {
         mark_bridge_error(root, code, name, detail);
         return;
     }
     cJSON_SetBoolValue(cJSON_GetObjectItemCaseSensitive(root, "ok"), false);
-    if (!cJSON_GetObjectItemCaseSensitive(root, "sdkErrorCode"))
-        cJSON_AddNumberToObject(root, "sdkErrorCode", static_cast<double>(to_num(*sdk_error)));
+    if (!receipt_failed && sdk_failed) {
+        cJSON_DeleteItemFromObject(root, "sdkError");
+        cJSON_DeleteItemFromObject(root, "sdkErrorCode");
+        cJSON_DeleteItemFromObject(root, "reason");
+        mark_sdk_error(root, *sdk_error, {});
+    }
     if (cJSON_GetObjectItemCaseSensitive(root, "bridgeError")) return;
     cJSON_AddStringToObject(root, "bridgeError", name);
     cJSON_AddNumberToObject(root, "bridgeErrorCode", code);
@@ -233,7 +241,11 @@ jstring finish(JNIEnv* env, cJSON* root, const char* operation, const std::strin
         mark_bridge_error(root, kBridgeAlloc, "MAPLESU_BRIDGE_ALLOC", detail);
     }
     char* text = cJSON_PrintUnformatted(root);
-    const auto* bytes = reinterpret_cast<const unsigned char*>(text == nullptr ? "{}" : text);
+    if (text == nullptr) {
+        cJSON_Delete(root);
+        return env->NewStringUTF(allocation_receipt);
+    }
+    const auto* bytes = reinterpret_cast<const unsigned char*>(text);
     const size_t size = std::strlen(reinterpret_cast<const char*>(bytes));
     auto* utf16 = size <= INT32_MAX ? static_cast<jchar*>(cJSON_malloc(size * sizeof(jchar))) : nullptr;
     jstring result;
@@ -662,14 +674,43 @@ jstring guarded(JNIEnv* env, const char* operation, Body&& body, const KModErr* 
     try {
         maplesu::SdkCallScope scope(operation);
         if (scope.acquired()) {
-            body(root);
-            if (scope.process_error()) {
-                if (!sdk_error) maplesu::ultra::retain_authorization_result_on_process_failure(root);
-                mark_call_bridge_error(root, sdk_error, kBridgeProcess, "MAPLESU_SDK_PROCESS_ERROR",
-                    "SDK subprocess setup or wait failed (errno=" + std::to_string(scope.process_error()) + ").");
+            try {
+                body(root);
+            } catch (const std::exception& error) {
+                mark_call_bridge_error(root, sdk_error, kBridgeException, "MAPLESU_BRIDGE_EXCEPTION", error.what());
+            } catch (...) {
+                mark_call_bridge_error(root, sdk_error, kBridgeException, "MAPLESU_BRIDGE_EXCEPTION", "unknown C++ exception");
             }
+            // Finalize after the body and its receipt have returned, before the
+            // single JSON publication. Root/helper effects remain body-owned.
+            const auto completion = scope.finalize();
+            if (completion.owner_generation &&
+                (!cJSON_AddStringToObject(root, "sdkScopeCleanupOwnerGeneration", std::to_string(completion.owner_generation).c_str()) ||
+                 !cJSON_AddNumberToObject(root, "sdkScopeProcessError", completion.process_error) ||
+                 !cJSON_AddNumberToObject(root, "sdkScopeCleanupError", completion.cleanup_error) ||
+                 !cJSON_AddNumberToObject(root, "sdkScopeCleanupPendingFds", completion.pending_fds) ||
+                 !cJSON_AddBoolToObject(root, "sdkScopeCleanupPending", completion.cleanup_pending) ||
+                 !cJSON_AddBoolToObject(root, "sdkScopeCleanupScheduled", completion.cleanup_scheduled) ||
+                 !cJSON_AddBoolToObject(root, "sdkScopeCleanupAdmissionReleasePending", completion.admission_release_pending))) {
+                mark_call_bridge_error(root, sdk_error, kBridgeAlloc, "MAPLESU_BRIDGE_ALLOC",
+                    "SDK scope cleanup receipt allocation failed; refresh state before retrying.");
+            }
+            if (completion.process_error) {
+                mark_call_bridge_error(root, sdk_error, kBridgeProcess, "MAPLESU_SDK_PROCESS_ERROR",
+                    "SDK subprocess setup or wait failed (errno=" + std::to_string(completion.process_error) + ").");
+            }
+            if (completion.cleanup_error || completion.cleanup_pending)
+                mark_call_bridge_error(root, sdk_error, kBridgeProcess,
+                    completion.cleanup_error ? "MAPLESU_SDK_CLEANUP_ERROR" : "MAPLESU_SDK_CLEANUP_PENDING",
+                    "SDK scope cleanup (errno=" + std::to_string(completion.cleanup_error) +
+                    ", pending_fds=" + std::to_string(completion.pending_fds) +
+                    ", admission_pending=" + (completion.admission_release_pending ? "true" : "false") + ").");
         }
-        else mark_bridge_error(root, -1005, "MAPLESU_SDK_BUSY", "SDK admission timed out; this request was not submitted.");
+        else if (scope.deadline_exceeded()) mark_bridge_error(root, -1007, "MAPLESU_SDK_DEADLINE_EXCEEDED",
+            "The observation deadline elapsed before submission.");
+        else if (scope.process_error()) mark_bridge_error(root, kBridgeProcess, "MAPLESU_SDK_PROCESS_ERROR",
+            "SDK admission failed before submission (errno=" + std::to_string(scope.process_error()) + ").");
+        else mark_bridge_error(root, -1005, "MAPLESU_SDK_BUSY", "SDK admission is busy; this request was not submitted.");
     } catch (const std::exception& error) {
         if (root != nullptr) mark_call_bridge_error(root, sdk_error, kBridgeException, "MAPLESU_BRIDGE_EXCEPTION", error.what());
     } catch (...) {
@@ -748,6 +789,138 @@ jstring guarded_authenticated(JNIEnv* env, const char* operation, Body&& body) {
     }, &sdk_error);
 }
 
+cJSON* write_uid_read_result(cJSON* root, const maplesu::su_auth::ReadResultV1& result) {
+    cJSON* data = cJSON_GetObjectItemCaseSensitive(root, "data");
+    if (!data) data = cJSON_AddObjectToObject(root, "data");
+    if (!data) return nullptr;
+    cJSON* detail = cJSON_AddObjectToObject(data, "uidReadResult");
+    const bool available = (result.flags & maplesu::su_auth::kReadResultAvailable) != 0;
+    if (!detail || !cJSON_AddNumberToObject(detail, "schemaVersion", 1) ||
+        !cJSON_AddBoolToObject(detail, "operationResultAvailable", available) ||
+        !cJSON_AddStringToObject(detail, "resultCode", std::to_string(result.resultCode).c_str()) ||
+        !cJSON_AddNumberToObject(detail, "primaryPhase", result.primaryPhase) ||
+        !cJSON_AddNumberToObject(detail, "primaryErrno", result.primaryErrno) ||
+        !cJSON_AddNumberToObject(detail, "authMode", result.authMode) ||
+        !cJSON_AddNumberToObject(detail, "recordCount", result.recordCount)) return nullptr;
+    cJSON* transport = cJSON_AddObjectToObject(detail, "transport");
+    if (!transport || !cJSON_AddNumberToObject(transport, "status", result.transportStatus) ||
+        !cJSON_AddNumberToObject(transport, "errno", result.transportErrno) ||
+        !cJSON_AddNumberToObject(transport, "childWaitStatus", result.childWaitStatus) ||
+        !cJSON_AddBoolToObject(transport, "valid", result.childWaitStatusValid != 0)) return nullptr;
+    // Without a validated child frame these steps are unknown, including whether
+    // Root was attempted. Parent transfer/wait facts above remain independently useful.
+    if (!available) return data;
+    const auto step = [&](const char* name, const maplesu::su_auth::ReadStepV1& value) {
+        cJSON* item = cJSON_AddObjectToObject(detail, name);
+        return item && cJSON_AddStringToObject(item, "code", std::to_string(value.code).c_str()) &&
+            cJSON_AddNumberToObject(item, "systemErrno", value.systemErrno) &&
+            cJSON_AddBoolToObject(item, "completed", value.completed != 0);
+    };
+    if (!step("root", result.root) || !step("read", result.read) || !step("close", result.close)) return nullptr;
+    const auto& value = result.readback;
+    cJSON* readback = cJSON_AddObjectToObject(detail, "readback");
+    if (!readback || !cJSON_AddStringToObject(readback, "code", std::to_string(value.code).c_str()) ||
+        !cJSON_AddNumberToObject(readback, "systemErrno", value.systemErrno) ||
+        !cJSON_AddNumberToObject(readback, "phase", value.phase) ||
+        !cJSON_AddStringToObject(readback, "capabilities", std::to_string(value.capabilities).c_str()) ||
+        !cJSON_AddStringToObject(readback, "revision", std::to_string(value.revision).c_str()) ||
+        !cJSON_AddNumberToObject(readback, "count", value.count) ||
+        !cJSON_AddNumberToObject(readback, "schema", value.schema)) return nullptr;
+    // phase==0 preserves the actual pre-CLOSE Root reply when typed READ never ran.
+    cJSON* management = cJSON_AddObjectToObject(readback, "management");
+    if (!management || !cJSON_AddNumberToObject(management, "status", value.managementStatus) ||
+        !cJSON_AddNumberToObject(management, "effects", value.managementEffects) ||
+        !cJSON_AddStringToObject(management, "result", std::to_string(value.managementResult).c_str()) ||
+        !cJSON_AddNumberToObject(management, "command", value.managementCommand) ||
+        !cJSON_AddBoolToObject(management, "completed", value.managementCompleted != 0) ||
+        !cJSON_AddBoolToObject(management, "hasHandle", value.managementHasHandle != 0)) return nullptr;
+    return data;
+}
+
+
+struct SuRuntimeReadResult {
+    kernel_module::RequestSuRuntimeStatus observed{};
+    kernel_module::RequestManagementReply read{}, close{};
+    KModErr read_error = KModErr::OK, close_error = KModErr::OK;
+    int read_errno = 0, close_errno = 0;
+    bool borrowed_session = false, read_returned = false;
+    bool close_attempted = false, close_returned = false;
+};
+
+cJSON* write_su_runtime_read_result(cJSON* root, const SuRuntimeReadResult& result) {
+    cJSON* data = cJSON_AddObjectToObject(root, "data");
+    cJSON* detail = data ? cJSON_AddObjectToObject(data, "suRuntimeResult") : nullptr;
+    const auto& record = result.observed.record;
+    const bool available = record.schema == MAPLESU_SU_RUNTIME_STATUS_SCHEMA &&
+        record.bytes == sizeof(record);
+    if (!detail || !cJSON_AddNumberToObject(detail, "schemaVersion", 1) ||
+        !cJSON_AddBoolToObject(detail, "diagnosticAvailable", available) ||
+        !cJSON_AddBoolToObject(detail, "borrowedSession", result.borrowed_session)) return nullptr;
+    const auto step = [&](const char* name, KModErr error, int error_number,
+                          bool attempted, bool returned,
+                          const kernel_module::RequestManagementReply& reply) {
+        cJSON* item = cJSON_AddObjectToObject(detail, name);
+        cJSON* management = item ? cJSON_AddObjectToObject(item, "management") : nullptr;
+        return item && management &&
+            cJSON_AddBoolToObject(item, "attempted", attempted) &&
+            cJSON_AddBoolToObject(item, "returned", returned) &&
+            cJSON_AddStringToObject(item, "code", std::to_string(to_num(error)).c_str()) &&
+            cJSON_AddNumberToObject(item, "systemErrno", error_number) &&
+            cJSON_AddNumberToObject(management, "command", reply.command) &&
+            cJSON_AddNumberToObject(management, "status", reply.status) &&
+            cJSON_AddNumberToObject(management, "effects", reply.effects) &&
+            cJSON_AddStringToObject(management, "result", std::to_string(reply.result).c_str()) &&
+            cJSON_AddBoolToObject(management, "completed", reply.completed) &&
+            cJSON_AddBoolToObject(management, "hasHandle", reply.handle != 0);
+    };
+    if (!step("read", result.read_error, result.read_errno, true, result.read_returned, result.read) ||
+        !step("close", result.close_error, result.close_errno,
+              result.close_attempted, result.close_returned, result.close)) return nullptr;
+    if (!available) return data;
+    const auto generation_hex = [](const uint8_t* bytes, char (&text)[33]) {
+        constexpr char digits[] = "0123456789abcdef";
+        for (size_t i = 0; i < 16; ++i) {
+            text[i * 2] = digits[bytes[i] >> 4];
+            text[i * 2 + 1] = digits[bytes[i] & 15];
+        }
+        text[32] = 0;
+    };
+    char installation[33], runtime[33], host[33], binding_host[33];
+    generation_hex(record.installation_generation, installation);
+    generation_hex(record.runtime_generation, runtime);
+    std::snprintf(host, sizeof(host), "%016llx%016llx",
+        static_cast<unsigned long long>(record.host.high),
+        static_cast<unsigned long long>(record.host.low));
+    const auto& binding = result.observed.binding;
+    std::snprintf(binding_host, sizeof(binding_host), "%016llx%016llx",
+        static_cast<unsigned long long>(binding.host.high),
+        static_cast<unsigned long long>(binding.host.low));
+    cJSON* factory = cJSON_AddObjectToObject(detail, "factory");
+    if (!factory || !cJSON_AddNumberToObject(factory, "schema", record.schema) ||
+        !cJSON_AddNumberToObject(factory, "bytes", record.bytes) ||
+        !cJSON_AddStringToObject(factory, "hostInstance", host) ||
+        !cJSON_AddStringToObject(factory, "installationGeneration", installation) ||
+        !cJSON_AddStringToObject(factory, "runtimeGeneration", runtime) ||
+        !cJSON_AddStringToObject(factory, "installationFence", std::to_string(record.installation_fence).c_str()) ||
+        !cJSON_AddNumberToObject(factory, "flags", record.flags) ||
+        !cJSON_AddNumberToObject(factory, "users", record.users) ||
+        !cJSON_AddNumberToObject(factory, "producers", record.producers) ||
+        !cJSON_AddNumberToObject(factory, "hookCount", record.hook_count) ||
+        !cJSON_AddNumberToObject(factory, "status", record.status) ||
+        !cJSON_AddNumberToObject(factory, "targetError", record.target_error) ||
+        !cJSON_AddNumberToObject(factory, "cleanupError", record.cleanup_error) ||
+        !cJSON_AddNumberToObject(factory, "startError", record.start_error) ||
+        !cJSON_AddNumberToObject(factory, "targetQualified", record.target_qualified) ||
+        !cJSON_AddNumberToObject(factory, "installationFlags", record.installation_flags)) return nullptr;
+    cJSON* identity = cJSON_AddObjectToObject(detail, "binding");
+    if (!identity || !cJSON_AddNumberToObject(identity, "fullUid", binding.full_uid) ||
+        !cJSON_AddNumberToObject(identity, "actualUid", binding.actual_uid) ||
+        !cJSON_AddNumberToObject(identity, "epoch", binding.epoch) ||
+        !cJSON_AddStringToObject(identity, "process", std::to_string(binding.process).c_str()) ||
+        !cJSON_AddStringToObject(identity, "hostInstance", binding_host)) return nullptr;
+    return data;
+}
+
 cJSON* control_to_json(const maplesu::ModuleControlState& state) {
     OwnedJson data(cJSON_CreateObject());
     if (!data || !cJSON_AddNumberToObject(data.get(), "abiVersion", state.abiVersion) ||
@@ -789,6 +962,48 @@ Java_dev_maplesu_manager_runtime_ultra_bridge_NativeBridge_claimManagerIdentity(
         maplesu::LegacyCredentialScope::erase(candidate.data(), candidate.size());
         mark_authenticated_ok(root);
     });
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_maplesu_manager_runtime_ultra_bridge_NativeBridge_invokeWithDeadline(
+    JNIEnv* env, jclass, jstring operation, jlong deadlineNanos, jobject callback) {
+    try {
+        const auto name = jstring_to_utf8(env, operation);
+        if (env->ExceptionCheck()) return nullptr;
+        const auto failed = [&](int code, const char* error, const std::string& reason) {
+            cJSON* root = begin(name.c_str());
+            mark_bridge_error(root, code, error, reason);
+            return finish(env, root, name.c_str(), {});
+        };
+        if (!callback) return failed(kBridgeNullArgument, "MAPLESU_BRIDGE_INVALID_CALLBACK", "Missing observation callback.");
+        timespec began{};
+        if (clock_gettime(CLOCK_MONOTONIC, &began)) return failed(kBridgeProcess,
+            "MAPLESU_SDK_CLOCK_ERROR", "Observation clock failed (errno=" + std::to_string(errno) + ").");
+        const auto system = env->FindClass("java/lang/System");
+        const auto nano_time = system ? env->GetStaticMethodID(system, "nanoTime", "()J") : nullptr;
+        const auto java_now = nano_time ? env->CallStaticLongMethod(system, nano_time) : 0;
+        if (system) env->DeleteLocalRef(system);
+        if (env->ExceptionCheck()) return nullptr;
+        if (!nano_time) return failed(kBridgeException, "MAPLESU_SDK_CLOCK_ERROR", "Observation clock unavailable.");
+        const int64_t remaining = deadlineNanos - java_now;
+        if (remaining <= 0) return failed(-1007, "MAPLESU_SDK_DEADLINE_EXCEEDED",
+            "The observation deadline elapsed before submission.");
+        // Sample native time first: translating the Java clock cannot extend its deadline.
+        maplesu::SdkDeadlineScope deadline(int64_t(began.tv_sec) * INT64_C(1000000000) + began.tv_nsec + remaining);
+        const auto type = env->GetObjectClass(callback);
+        const auto call = type ? env->GetMethodID(type, "call", "()Ljava/lang/Object;") : nullptr;
+        const auto result = call ? static_cast<jstring>(env->CallObjectMethod(callback, call)) : nullptr;
+        if (type) env->DeleteLocalRef(type);
+        // Preserve callback cancellation/exception; RAII restores the caller's TLS.
+        return env->ExceptionCheck() ? nullptr : result;
+    } catch (...) {
+        // A wrapper failure has no SDK result to replace. Pending Java exceptions
+        // keep their original identity; the lexical native deadline has unwound.
+        if (env->ExceptionCheck()) return nullptr;
+        return env->NewStringUTF("{\"schemaVersion\":1,\"backend\":\"maplesu_ultra\",\"bridgeVersion\":1,"
+            "\"operation\":\"invoke_with_deadline\",\"ok\":false,\"sdkError\":\"MAPLESU_BRIDGE_EXCEPTION\","
+            "\"sdkErrorCode\":-1001,\"reason\":\"Observation request scope failed.\"}");
+    }
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -1089,7 +1304,7 @@ extern "C" JNIEXPORT jstring JNICALL
 Java_dev_maplesu_manager_runtime_ultra_bridge_NativeBridge_probeManagerOwnerRoot(
     JNIEnv* env, jclass) {
     return guarded(env, "probe_manager_owner_root", [&](cJSON* root) {
-        const auto observed = maplesu::probe_manager_owner_root();
+        const auto observed = maplesu::probe_manager_owner_root(maplesu::sdk_call_deadline_nanos());
         cJSON* data = cJSON_CreateObject();
         cJSON* root_command = owner_root_command_json(observed.root);
         cJSON* close_command = owner_root_command_json(observed.close);
@@ -1262,7 +1477,7 @@ Java_dev_maplesu_manager_runtime_ultra_bridge_NativeBridge_readInstalledHelper(
         }
         const auto observed = maplesu::read_installed_helper(
             helperPath ? path.c_str() : nullptr, HelperReadbackDigest::consume, &digest,
-            static_cast<uint32_t>(timeoutMillis));
+            static_cast<uint32_t>(timeoutMillis), maplesu::sdk_call_deadline_nanos());
         const int64_t error = observed.mode_error ? observed.mode_error : observed.channel_error ? observed.channel_error :
             observed.sdk_error ? observed.sdk_error : observed.root.error ? observed.root.error : observed.close.error;
         sdk_error = static_cast<KModErr>(error);
@@ -1498,22 +1713,26 @@ Java_dev_maplesu_manager_runtime_ultra_bridge_NativeBridge_getSuUidProfiles(JNIE
     return guarded_authenticated(env, "get_su_uid_profiles",
         [&](cJSON* root, KModErr& error) {
         using maplesu::su_auth::UidProfileV1;
+        maplesu::su_auth::ReadResultV1 result;
         std::vector<UidProfileV1> profiles;
         static thread_local std::vector<UidProfileV1>* output = nullptr;
         output = &profiles;
         try {
             error = maplesu::su_auth::get_uid_profiles_with_cb([](const UidProfileV1* profile) {
                 if (output && profile) output->push_back(*profile);
-            });
+            }, result);
         } catch (...) {
             output = nullptr;
+            if (result.resultCode) error = static_cast<KModErr>(result.resultCode);
+            if (!write_uid_read_result(root, result)) authenticated_receipt_alloc(root, error);
             throw;
         }
         output = nullptr;
+        auto* data = write_uid_read_result(root, result);
+        if (!data) { authenticated_receipt_alloc(root, error); return; }
         if (is_failed(error)) { mark_sdk_error(root, error, {}); return; }
-        OwnedJson data(cJSON_CreateObject());
         OwnedJson rows(cJSON_CreateArray());
-        if (!data || !rows) { authenticated_receipt_alloc(root, error); return; }
+        if (!rows) { authenticated_receipt_alloc(root, error); return; }
         for (const auto& profile : profiles) {
             OwnedJson row(cJSON_CreateObject());
             if (!row || !cJSON_AddNumberToObject(row.get(), "uid", profile.uid) ||
@@ -1525,14 +1744,64 @@ Java_dev_maplesu_manager_runtime_ultra_bridge_NativeBridge_getSuUidProfiles(JNIE
             }
             (void)row.release();
         }
-        if (!attach_owned_json(data.get(), "profiles", rows.release()) ||
-            !cJSON_AddNumberToObject(data.get(), "count", static_cast<double>(profiles.size())) ||
-            !cJSON_AddStringToObject(data.get(), "encoding", "url") ||
-            !cJSON_AddBoolToObject(data.get(), "decisionsVerified", true) ||
-            !attach_owned_json(root, "data", data.release())) {
+        if (!attach_owned_json(data, "profiles", rows.release()) ||
+            !cJSON_AddNumberToObject(data, "count", static_cast<double>(profiles.size())) ||
+            !cJSON_AddStringToObject(data, "encoding", "url") ||
+            !cJSON_AddBoolToObject(data, "decisionsVerified", true)) {
             authenticated_receipt_alloc(root, error);
             return;
         }
+        mark_authenticated_ok(root);
+    });
+}
+
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_maplesu_manager_runtime_ultra_bridge_NativeBridge_getSuRuntimeStatus(JNIEnv* env, jclass) {
+    return guarded_authenticated(env, "get_su_runtime_status",
+        [&](cJSON* root, KModErr& error) {
+        SuRuntimeReadResult result;
+        kernel_module::RequestOwnerLifetimeToken existing;
+        result.borrowed_session = kernel_module::maplesu_request_owner_lifetime_capture(existing);
+        std::exception_ptr read_exception, close_exception;
+        const int original_errno = errno;
+        errno = 0;
+        try {
+            result.read_error = kernel_module::maplesu_request_owner_su_runtime(result.observed);
+            result.read_returned = true;
+        } catch (...) { read_exception = std::current_exception(); }
+        result.read_errno = !result.read_returned || is_failed(result.read_error) ? errno : 0;
+        result.read = kernel_module::maplesu_request_management_reply();
+        if (!result.borrowed_session) {
+            // This call alone owns its new current-task session. A borrowed
+            // session stays with its actual caller, including on a failed read.
+            kernel_module::CleanupReceiptScope preserve_read;
+            result.close_attempted = true;
+            errno = 0;
+            try {
+                result.close_error = kernel_module::maplesu_request_owner_close();
+                result.close_returned = true;
+            } catch (...) { close_exception = std::current_exception(); }
+            result.close_errno = !result.close_returned || is_failed(result.close_error) ? errno : 0;
+            result.close = kernel_module::maplesu_request_management_reply();
+        }
+        error = result.read_error;
+        if (result.read_returned && is_ok(error) && result.close_returned && is_failed(result.close_error))
+            error = result.close_error;
+        cJSON* data = nullptr;
+        try { data = write_su_runtime_read_result(root, result); }
+        catch (...) {
+            if (read_exception) std::rethrow_exception(read_exception);
+            if (close_exception) std::rethrow_exception(close_exception);
+            throw;
+        }
+        if (!data) authenticated_receipt_alloc(root, error);
+        if (read_exception) std::rethrow_exception(read_exception);
+        if (close_exception) std::rethrow_exception(close_exception);
+        errno = is_failed(result.read_error) ? result.read_errno :
+            is_failed(result.close_error) ? result.close_errno : original_errno;
+        if (!data) return;
+        if (is_failed(error)) { mark_sdk_error(root, error, {}); return; }
         mark_authenticated_ok(root);
     });
 }
@@ -2152,9 +2421,9 @@ constexpr int kBridgeSdkSymbol = -1005;
 
 struct ParasiteSdkSymbols {
     // KRootErr parasite_precheck_app_with_cb(cmdline, cb(path, AppDynlibStatus))
-    using PrecheckFn = decltype(&kernel_root::parasite_precheck_app_with_cb);
-    using ImplantFn = decltype(&kernel_root::parasite_implant_app);
-    using SuEnvFn = decltype(&kernel_root::parasite_implant_su_env);
+    using PrecheckFn = kernel_root::ParasiteError (*)(const char*, void (*)(const char*, kernel_root::AppDynlibStatus));
+    using ImplantFn = kernel_root::ParasiteError (*)(const char*, const char*);
+    using SuEnvFn = kernel_root::ParasiteError (*)(const char*, const char*, const char*);
 
     PrecheckFn precheck = nullptr;
     ImplantFn implant = nullptr;

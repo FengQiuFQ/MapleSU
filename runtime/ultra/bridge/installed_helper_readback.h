@@ -68,6 +68,13 @@ __attribute__((visibility("hidden")))
 InstalledHelperReadbackResult read_installed_helper(const char* helper_path,
     InstalledHelperChunkConsumer consume, void* context, uint32_t timeout_ms = 300);
 
+// An absolute CLOCK_MONOTONIC deadline shared with the enclosing probe session.
+// Zero retains the standalone timeout; a caller deadline only shortens it.
+__attribute__((visibility("hidden")))
+InstalledHelperReadbackResult read_installed_helper(const char* helper_path,
+    InstalledHelperChunkConsumer consume, void* context, uint32_t timeout_ms,
+    int64_t session_deadline_nanos);
+
 // Read-only classification of the existing completion facts. This never changes
 // the deadline, worker lifetime, failure errno or the authoritative complete bit.
 __attribute__((visibility("hidden"))) inline const char* installed_helper_readback_failure_stage(

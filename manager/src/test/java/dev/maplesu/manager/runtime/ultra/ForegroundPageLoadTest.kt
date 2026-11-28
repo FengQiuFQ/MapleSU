@@ -140,7 +140,12 @@ class ForegroundPageLoadTest {
             } catch (_: TimeoutException) { }
             release.countDown()
             assertTrue(completed.await(2, TimeUnit.SECONDS))
-            assertEquals("MAPLESU_SDK_BUSY", late.get().sdkError)
+            val receipt = late.get()
+            assertEquals("MAPLESU_SDK_DEADLINE_EXCEEDED", receipt.sdkError)
+            assertEquals(-1007, receipt.sdkErrorCode)
+            val raw = org.json.JSONObject(receipt.raw)
+            assertEquals(receipt.sdkError, raw.getString("sdkError"))
+            assertEquals(receipt.sdkErrorCode, raw.getInt("sdkErrorCode"))
             assertEquals(0, submitted.get())
             assertNull(PageReadDeadline.currentNanos())
             assertTrue(call(client, "get_su_auth_list") { answer("get_su_auth_list", 4) }.succeeded)

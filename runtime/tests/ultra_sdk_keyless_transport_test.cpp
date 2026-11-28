@@ -16,6 +16,7 @@ struct Fixture {
     int32_t status = 0;
     uint32_t extra_effects = 0;
     bool missing = false, malformed = false, helper = false;
+    bool no_uid_capability = false, bad_uid_metadata = false, bad_uid_record = false;
     std::array<unsigned, 40> calls{};
     std::vector<uint8_t> bytes;
     uint64_t last_id = 0, revision = 7;
@@ -38,6 +39,7 @@ maplesu_metadata_owner_v3 metadata() {
     m.common.length = sizeof(m);
     m.common.capabilities = (state.helper ? MAPLESU_HELPER_BASE_CAPABILITIES | MAPLESU_HELPER_OPTIONAL_CAPABILITIES
         : MAPLESU_OWNER_CAPABILITIES) | MAPLESU_CAP_APPEND64;
+    if (state.no_uid_capability) m.common.capabilities &= ~MAPLESU_CAP_UID_SNAPSHOT;
     m.common.kernel_base_displacement = -0x10000000;
     m.common.legacy_metadata_displacement = -0x1000;
     m.owner_schema = MAPLESU_OWNER_SCHEMA;
@@ -182,7 +184,14 @@ extern "C" long __wrap_syscall(long number, ...) {
                     m.record_bytes = sizeof(maplesu_uid_record_v3);
                     m.content_revision = state.revision;
                     m.host = host;
+                    if (state.bad_uid_metadata) m.schema = 99;
+                    if (state.bad_uid_record) m.count = 1;
                     std::memcpy(reinterpret_cast<void*>(read.destination_user), &m, sizeof(m));
+                    if (state.bad_uid_record) {
+                        maplesu_uid_record_v3 row{};
+                        row.full_uid = 12345;
+                        std::memcpy(reinterpret_cast<uint8_t*>(read.destination_user) + sizeof(m), &row, sizeof(row));
+                    }
                     response.result = state.revision;
                     break;
                 }
@@ -277,13 +286,56 @@ int main() {
     maplesu_uid_metadata_v3 mirror{};
     check(maplesu_request_owner_runtime_uid_readback(7, mirror, nullptr, 0) == KModErr::OK && mirror.content_revision == 7,
         "Root handle0 UID mirror readback");
+    const auto readback = maplesu_request_uid_readback_diagnostic();
+    check(readback.phase == RequestUidReadbackPhase::Complete && !readback.errorCode && !readback.systemErrno &&
+        (readback.capabilities & MAPLESU_CAP_UID_SNAPSHOT) && readback.revision == 7 &&
+        readback.reply.completed && readback.reply.command == MAPLESU_REQUEST_UID_READBACK && readback.reply.result == 7,
+        "UID diagnostics retain this successful READ's original facts");
     close();
+    check(maplesu_request_uid_readback_diagnostic().reply.command == MAPLESU_REQUEST_UID_READBACK,
+        "CLOSE does not replace UID READ diagnostics");
     check(!maplesu_request_owner_lifetime_matches(token), "CLOSE invalidates in-flight witness");
     check(maplesu_request_set_auth_mode(RequestAuthMode::EarlyHelper) == KModErr::OK &&
         initial != maplesu_request_auth_state(), "closed phase may select a new mode/generation");
     state.helper = true;
     check(maplesu_request_helper_open() == KModErr::OK, "explicit existing Helper authentication opens without Manager QUERY");
     close();
+
+    for (unsigned fault = 0; fault < 5; ++fault) {
+        reset();
+        state.no_uid_capability = fault == 0;
+        state.bad_uid_metadata = fault == 1;
+        state.bad_uid_record = fault == 2;
+        if (fault >= 3) {
+            state.fail_command = MAPLESU_REQUEST_UID_READBACK;
+            state.missing = fault == 3;
+            state.status = fault == 4 ? -EIO : 0;
+        }
+        maplesu_uid_metadata_v3 saved{};
+        saved.content_revision = 900;
+        maplesu_uid_record_v3 saved_row{};
+        saved_row.full_uid = 54321;
+        errno = EBUSY;
+        const auto error = maplesu_request_owner_runtime_uid_readback(0, saved, &saved_row, 1);
+        const auto detail = maplesu_request_uid_readback_diagnostic();
+        const auto phase = fault == 0 ? RequestUidReadbackPhase::CapabilityMissing :
+            fault == 1 ? RequestUidReadbackPhase::Metadata : fault == 2 ? RequestUidReadbackPhase::Records :
+            RequestUidReadbackPhase::Exchange;
+        const int expected_errno = fault == 0 ? EOPNOTSUPP : fault == 2 ? EBADMSG : fault == 4 ? EIO : EPROTO;
+        check(error == KModErr::ERR_MODULE_TEST_CHANNEL && errno == expected_errno &&
+            detail.errorCode == to_num(error) && detail.systemErrno == expected_errno && detail.phase == phase,
+            "UID failure has one exact phase/code/errno, independent of stale errno");
+        check(saved.content_revision == 900 && saved_row.full_uid == 54321,
+            "failed UID READ preserves all caller outputs");
+        check(state.calls[MAPLESU_REQUEST_UID_READBACK] == (fault == 0 ? 0u : 1u),
+            "UID diagnosis performs no additional exchange or retry");
+        if (fault == 1 || fault == 2 || fault == 4)
+            check(detail.reply.completed && detail.reply.command == MAPLESU_REQUEST_UID_READBACK &&
+                detail.reply.result == (fault == 4 ? 0 : 7), "local validation retains original UID management receipt");
+        close();
+        check(maplesu_request_uid_readback_diagnostic().phase == phase,
+            "session cleanup preserves the UID first failure");
+    }
 
     for (auto status : {-EPERM, -ESTALE, -EINVAL, -EFAULT, -ENOMEM, -EIO}) {
         reset();

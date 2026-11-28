@@ -6,6 +6,7 @@ import java.util.concurrent.FutureTask
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
+import dev.maplesu.manager.runtime.PageReadDeadline
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runInterruptible
@@ -25,9 +26,17 @@ class EnvironmentProbeRunner(
 ) {
     private val running = AtomicBoolean(false)
 
-    suspend fun <T> run(timeoutMillis: Long, probe: () -> T): EnvironmentProbeResult<T> =
-        withContext(Dispatchers.IO) {
-            val task = FutureTask(Callable(probe))
+    suspend fun <T> run(timeoutMillis: Long, probe: () -> T): EnvironmentProbeResult<T> {
+        val deadline = PageReadDeadline.limitNanos(timeoutMillis)
+        if (deadline - System.nanoTime() <= 0) return EnvironmentProbeResult.TimedOut
+        return withContext(Dispatchers.IO) {
+            val task = FutureTask(Callable {
+                PageReadDeadline.onWorker(deadline) {
+                    if (deadline - System.nanoTime() <= 0) throw TimeoutException("ENVIRONMENT_PROBE_DEADLINE")
+                    probe()
+                }
+            })
+            if (deadline - System.nanoTime() <= 0) return@withContext EnvironmentProbeResult.TimedOut
             if (!running.compareAndSet(false, true)) return@withContext EnvironmentProbeResult.Busy
             try {
                 startWorker(Thread({
@@ -43,12 +52,15 @@ class EnvironmentProbeRunner(
                 runInterruptible {
                     // Unwrap before a coroutine boundary can recover/copy ExecutionException.
                     try {
-                        EnvironmentProbeResult.Completed(task.get(timeoutMillis.coerceAtLeast(1), TimeUnit.MILLISECONDS))
+                        val remaining = deadline - System.nanoTime()
+                        if (remaining <= 0) EnvironmentProbeResult.TimedOut
+                        else EnvironmentProbeResult.Completed(task.get(remaining, TimeUnit.NANOSECONDS))
                     } catch (_: TimeoutException) {
                         EnvironmentProbeResult.TimedOut
                     } catch (error: ExecutionException) {
                         val cause = error.cause ?: error
                         if (cause is CancellationException) throw cause
+                        if (cause is TimeoutException) return@runInterruptible EnvironmentProbeResult.TimedOut
                         EnvironmentProbeResult.Failed(cause)
                     }
                 }
@@ -60,4 +72,5 @@ class EnvironmentProbeRunner(
                 task.cancel(true)
             }
         }
+    }
 }

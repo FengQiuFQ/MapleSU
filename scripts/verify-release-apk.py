@@ -88,6 +88,115 @@ def certificate(output, expected):
     return values[0].lower()
 
 
+def packaged_native_inputs(root, base, receipt):
+    gradle = root / 'manager/build.gradle.kts'
+    source = gradle.read_text(encoding='utf-8-sig')
+    abis = re.findall(r'\bndk\s*\{\s*abiFilters\s*\+=\s*"([^"]+)"\s*\}', source)
+    require(abis == ['arm64-v8a'], 'MANAGER_PACKAGING_ABI_FILTER')
+    native_root = base / 'intermediates/stripped_native_libs/release/stripReleaseDebugSymbols/out/lib'
+    outputs = {'lib/' + path.relative_to(native_root).as_posix(): path
+               for path in sorted(native_root.rglob('*.so')) if path.is_file()}
+    native = {entry: path for entry, path in outputs.items() if entry.split('/')[1] in abis}
+    require(bool(native), 'PACKAGED_NATIVE_INPUTS_MISSING')
+    receipt['nativePackagingFilter'] = dict(source=record(gradle), abis=abis,
+        excludedOutputs=[dict(entry=entry, source=record(path))
+                         for entry, path in outputs.items() if entry not in native])
+    return native
+
+
+def verify_normal_jni(root, base, archive, output, commands, variant='release'):
+    """Bind the current Normal TUs and Ninja objects to the exact packaged JNI."""
+    targets = {'maplesu_ksu': ('jni.cc', 'ksu.cc'), 'adbroot': ('adbroot.cc',)}
+    candidates = []
+    for path in (root / 'manager/.cxx').rglob('android_gradle_build.json'):
+        document, identity = load_bound_json(path, 'NORMAL_AGP_METADATA_CHANGED')
+        libraries = {row['artifactName']: Path(row['output']).resolve()
+                     for row in document.get('libraries', {}).values()}
+        if set(libraries) == set(targets) and all(
+                destination.is_relative_to(base / 'intermediates/cxx') and destination.is_file() and
+                record(destination)['sha256'] == digest(archive.read('lib/arm64-v8a/lib' + name + '.so'))
+                for name, destination in libraries.items()):
+            candidates.append((path, document, identity, libraries))
+    require(len(candidates) == 1, 'NORMAL_AGP_COMPILED_OUTPUT_BINDING')
+    metadata, document, identity, libraries = candidates[0]
+    cmake = metadata.parent
+    source_root = root / 'third_party/kernelsu/applied/manager/app/src/main/cpp'
+    require([Path(path).resolve() for path in document['buildFiles']] == [source_root / 'CMakeLists.txt'],
+            'NORMAL_AGP_CMAKE_SOURCE')
+    compile_file = cmake / 'compile_commands.json'
+    compile_rows, compile_identity = load_bound_json(compile_file, 'NORMAL_COMPILE_COMMANDS_CHANGED')
+    require(len(compile_rows) == 3 and
+            {Path(row['file']).resolve() for row in compile_rows} ==
+            {source_root / name for names in targets.values() for name in names}, 'NORMAL_COMPILE_TU_SET')
+    ninja = Path(document['buildTargetsCommandComponents'][0])
+    require(ninja.name in ('ninja', 'ninja.exe') and ninja.is_file(), 'NORMAL_NINJA_TOOL')
+
+    def run(name, argv):
+        argv = [str(item) for item in argv]
+        completed = subprocess.run(argv, capture_output=True)
+        log = output / (name + '.log')
+        log.write_bytes(completed.stdout + completed.stderr)
+        commands.append(dict(name=name, argv=argv, exitCode=completed.returncode, log=record(log)))
+        require(completed.returncode == 0, 'NORMAL_BUILD_TOOL_FAILED: ' + name)
+        return log.read_text(encoding='utf-8', errors='replace')
+
+    result = dict(metadata=identity, compileCommands=compile_identity,
+                  cmakeSource=record(source_root / 'CMakeLists.txt'), buildNinja=record(cmake / 'build.ninja'),
+                  translationUnits=[], libraries=[])
+    object_targets = {}
+    for row in compile_rows:
+        source = Path(row['file']).resolve()
+        target = re.search(r'(?:^|\s)-o\s+("[^"]+"|\S+)', row['command'])
+        require(Path(row['directory']).resolve() == cmake and target is not None and
+                '--target=aarch64-none-linux-android31' in row['command'], 'NORMAL_COMPILE_COMMAND')
+        target = target.group(1).strip('"').replace('\\', '/')
+        obj = (cmake / target).resolve()
+        require(obj.is_relative_to(cmake), 'NORMAL_OBJECT_OUTSIDE_BUILD')
+        object_targets[source.name] = obj.relative_to(cmake).as_posix()
+        deps = run('normal-deps-' + source.stem, [ninja, '-C', cmake, '-t', 'deps', target])
+        require('(VALID)' in deps and source.as_posix() in deps.replace('\\', '/'), 'NORMAL_OBJECT_DEPENDENCIES')
+        local = {source}
+        for line in deps.splitlines()[1:]:
+            path = Path(line.strip())
+            if path.is_absolute() and path.resolve().is_relative_to(root):
+                local.add(path.resolve())
+        result['translationUnits'].append(dict(source=record(source), object=record(obj),
+            command=row['command'], localDependencies=[record(path) for path in sorted(local)]))
+    for name, destination in sorted(libraries.items()):
+        query = run('normal-link-' + name, [ninja, '-C', cmake, '-t', 'query', destination.as_posix()])
+        require(all(object_targets[source] in query.replace('\\', '/') for source in targets[name]),
+                'NORMAL_LINK_OBJECT_INPUTS')
+        relative = Path('arm64-v8a/lib' + name + '.so')
+        merged = base / 'intermediates/merged_native_libs' / variant / ('merge' + variant.title() + 'NativeLibs/out/lib') / relative
+        stripped = base / 'intermediates/stripped_native_libs' / variant / ('strip' + variant.title() + 'DebugSymbols/out/lib') / relative
+        bound = record(destination)
+        require(record(merged)['sha256'] == bound['sha256'] == record(stripped)['sha256'] ==
+                digest(archive.read('lib/' + relative.as_posix())), 'NORMAL_JNI_PACKAGING_DRIFT')
+        result['libraries'].append(dict(name=name, compiled=bound, merged=record(merged), stripped=record(stripped)))
+    current = run('normal-ninja-current', [ninja, '-C', cmake, '-n', *[path.as_posix() for path in libraries.values()]])
+    require('no work to do' in current.lower(), 'NORMAL_COMPILE_OUTPUT_STALE')
+    compiler = Path(document['toolchains']['toolchain']['cppCompilerExecutable'])
+    nm = compiler.parent / ('llvm-nm.exe' if os.name == 'nt' else 'llvm-nm')
+    prefix = 'Java_dev_maplesu_manager_ksu_KsuNatives_'
+    original = root / 'manager/src/main/jniLibs/arm64-v8a/libmaplesu_ksu.so'
+    exports = []
+    for name, path in (('retained', original), ('current', libraries['maplesu_ksu'])):
+        text = run('normal-jni-' + name, [nm, '--dynamic', '--defined-only', '--format=posix', path])
+        exports.append({line.split()[0] for line in text.splitlines() if line.startswith(prefix)})
+    require(exports[0] and exports[0] <= exports[1] and prefix + 'getCurrentInfo' in exports[1], 'NORMAL_JNI_INTERFACE')
+    result['jniInterface'] = dict(retainedSource=record(original), retained=sorted(exports[0]), added=sorted(exports[1] - exports[0]))
+    verify_normal_jni_inputs_unchanged(result)
+    return result
+
+
+def verify_normal_jni_inputs_unchanged(result):
+    for row in [result['metadata'], result['compileCommands'], result['cmakeSource'], result['buildNinja'],
+                result['jniInterface']['retainedSource'],
+                *[item for tu in result['translationUnits'] for item in [tu['object'], *tu['localDependencies']]],
+                *[item for library in result['libraries'] for item in [library['compiled'], library['merged'], library['stripped']]]]:
+        require(record(Path(row['path'])) == row, 'NORMAL_BUILD_INPUT_CHANGED')
+
+
 def verify_claim_release_version(manifest, sdk):
     require(manifest.get('appVersion') == sdk.get('appVersion') and
             type(manifest.get('versionCode')) is int and
@@ -414,6 +523,8 @@ def verify(args, receipt):
     matches(Path(execution['bridgeBindings']['path']), execution['bridgeBindings'])
     release, release_record = load_bound_json(sdk_release_path, 'SDK_RELEASE_INPUT_CHANGED')
     require(release_record == receipt['sdkRelease'], 'SDK_RELEASE_INPUT_CHANGED')
+    require('gateRevalidation' not in release.get('sourceBuild', {}),
+            'SDK_GATE_REVALIDATION_REQUIRES_CURRENT_FULL_RELEASE_BUILD')
     pin_path = root / 'third_party/kernelsu/ksu-payload.json'
     pin_document, pin_record = load_bound_json(pin_path, 'KSU_IDENTITY_MANIFEST_INPUT_CHANGED')
     pin = pin_document['identity']
@@ -462,10 +573,7 @@ def verify(args, receipt):
     receipt['helper'] = matches(helper, release['helper'])
     backend_input = release['environmentPolicyBoot']['backend']
     matches(root / backend_input['path'], backend_input)
-    native_root = base / 'intermediates/stripped_native_libs/release/stripReleaseDebugSymbols/out/lib'
-    native = {'lib/' + path.relative_to(native_root).as_posix(): path
-              for path in sorted(native_root.rglob('*.so')) if path.is_file()}
-    require(bool(native), 'PACKAGED_NATIVE_INPUTS_MISSING')
+    native = packaged_native_inputs(root, base, receipt)
     bundle = base / 'generated/ultraInitBridgeAssets/ultra-init-bridge'
     bundle_sources_path = bundle / 'BUNDLE-SOURCES.json'
     require((bundle / 'manifest.json').is_file() and bundle_sources_path.is_file(),
@@ -487,6 +595,7 @@ def verify(args, receipt):
             data = archive.read(entry)
             require(len(data) == actual['size'] and digest(data) == actual['sha256'], 'NATIVE_ZIP_DRIFT: ' + entry)
             receipt['nativeBindings'].append(dict(entry=entry, source=actual))
+        receipt['normalSourceObjectBindings'] = verify_normal_jni(root, base, archive, args.output, commands)
         backend = archive.read('lib/arm64-v8a/libmaplesu_policy_boot.so')
         require(digest(backend) == backend_input['sha256'], 'HELPER_BACKEND_PAIR_DRIFT')
         bridge = archive.read('lib/arm64-v8a/libmaplesu_ultra_bridge.so')
@@ -570,6 +679,9 @@ def verify(args, receipt):
     require(record(sdk_release_path) == release_record, 'SDK_RELEASE_INPUT_CHANGED')
     require(record(pin_path) == pin_record, 'KSU_IDENTITY_MANIFEST_INPUT_CHANGED')
     require(record(bundle_sources_path) == bundled_record, 'INIT_BOOT_BRIDGE_SOURCES_INPUT_CHANGED')
+    require(record(Path(receipt['nativePackagingFilter']['source']['path'])) == receipt['nativePackagingFilter']['source'],
+            'MANAGER_PACKAGING_ABI_SOURCE_CHANGED')
+    verify_normal_jni_inputs_unchanged(receipt['normalSourceObjectBindings'])
     unchanged_apk('complete')
     receipt['passed'] = True
 

@@ -106,6 +106,22 @@ struct RequestManagementReply {
     bool completed = false;
 };
 RequestManagementReply maplesu_request_management_reply();
+enum class RequestUidReadbackPhase : uint32_t {
+    None, Output, Identity, CapabilityQuery, CapabilityMissing, Exchange,
+    Metadata, Records, Binding, Allocation, Complete
+};
+// Diagnostics from this thread/process's latest typed UID READ only. The
+// original reply survives local shape rejection and subsequent session CLOSE.
+// Neither malformed metadata nor these saved scalars grant current authority.
+struct RequestUidReadbackDiagnostic {
+    int64_t errorCode = 0;
+    int32_t systemErrno = 0;
+    RequestUidReadbackPhase phase = RequestUidReadbackPhase::None;
+    uint64_t capabilities = 0, revision = 0;
+    uint32_t count = 0, schema = 0;
+    RequestManagementReply reply{};
+};
+RequestUidReadbackDiagnostic maplesu_request_uid_readback_diagnostic();
 // Authenticated immutable image path fact. This is neither an installation
 // generation nor vendor/Root/SU readiness. The wire name has no trailing NUL.
 struct RequestDeploymentNamespace {

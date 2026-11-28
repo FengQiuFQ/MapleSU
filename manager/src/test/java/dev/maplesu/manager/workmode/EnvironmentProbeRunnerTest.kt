@@ -3,16 +3,43 @@ package dev.maplesu.manager.workmode
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import dev.maplesu.manager.runtime.PageReadDeadline
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withContext
 import org.junit.Assert.*
 import org.junit.Test
 
 class EnvironmentProbeRunnerTest {
+    @Test fun expiredBudgetDoesNotStartAnotherWorker() = runBlocking {
+        var starts = 0
+        val runner = EnvironmentProbeRunner(startWorker = { starts++; it.start() })
+        assertEquals(EnvironmentProbeResult.TimedOut, runner.run(0) { error("expired probe ran") })
+        assertEquals(0, starts)
+    }
+
+    @Test fun nativeWorkerInheritsTheOriginalPageDeadline() = runBlocking {
+        withContext(PageReadDeadline.context(1_000)) {
+            val deadline = requireNotNull(PageReadDeadline.currentNanos())
+            val result = EnvironmentProbeRunner().run(5_000) { PageReadDeadline.currentNanos() }
+            assertEquals(EnvironmentProbeResult.Completed(deadline), result)
+        }
+    }
+
+    @Test fun workerStartupConsumesTheSameBudgetBeforeSdkSubmission() = runBlocking {
+        var calls = 0
+        val runner = EnvironmentProbeRunner(startWorker = { thread ->
+            CountDownLatch(1).await(80, TimeUnit.MILLISECONDS)
+            thread.start()
+        })
+        assertEquals(EnvironmentProbeResult.TimedOut, runner.run(30) { ++calls })
+        assertEquals(0, calls)
+    }
+
     @Test fun completedProbeReturnsItsValue() = runBlocking {
         assertEquals(EnvironmentProbeResult.Completed(42), EnvironmentProbeRunner().run(1_000) { 42 })
     }

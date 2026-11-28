@@ -17,7 +17,12 @@ internal data class UltraKernelManagerClaimPayload(
     val sessionAbi: SessionAbiFacts? = null,
     val bootEventsAbi: BootEventsAbiFacts? = null,
     val ksuCompatAbi: KsuCompatAbiFacts? = null,
+    val sourceSupport: SourceSupport? = null,
 ) {
+    data class SourceSupport(val deploymentSourceBootEntryOffset: Int, val materializerSourceEntryOffset: Int,
+        val anchorVersion: Int, val anchorBytes: Int, val bindingBytes: Int, val configBytes: Int,
+        val recordBytes: Int, val protocolVersion: Int, val headerBytes: Int,
+        val sourceBytesOffset: Int, val chunkBytes: Int)
     data class RuntimeLayoutField(val type: String, val member: String, val signature: String?, val alignment: Int,
         val key: String = "$type.$member") {
         fun targetKeys(): List<String> {

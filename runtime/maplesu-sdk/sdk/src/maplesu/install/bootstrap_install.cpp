@@ -61,8 +61,6 @@ KModErr bootstrap() {
 
     const err_t publish_err = publish_bootstrap(path);
     if (publish_err != core::kOk) return static_cast<KModErr>(publish_err);
-    if (!platform::set_file_selinux_access_mode(path.c_str(), core::kSelinuxKernel))
-        return KModErr::ERR_SET_FILE_SELINUX;
 
     return KModErr::OK;
 }

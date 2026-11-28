@@ -3,8 +3,7 @@
 #include <cstddef>
 
 namespace maplesu::compat::legacy_install {
-// Same-generation source aliases retain enum and result layouts. Old Key-taking
-// binary signatures are intentionally absent and require SDK recompilation.
+// No-key aliases stay distinct from the keyed 5.2.0 thin exports in this member.
 static_assert(sizeof(sdk::InstallMode) == 4 && alignof(sdk::InstallMode) == 4);
 static_assert(static_cast<unsigned>(sdk::InstallMode::Boot) == 0 &&
               static_cast<unsigned>(sdk::InstallMode::HotLoad) == 1);

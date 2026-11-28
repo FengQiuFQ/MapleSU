@@ -1,6 +1,7 @@
 package com.maplesu.core.ui.screen.settings
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateOf
@@ -38,6 +39,11 @@ fun SettingPager(
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val latestIsCurrentPage by rememberUpdatedState(isCurrentPage)
     val initialResumeHandled = rememberSaveable { mutableStateOf(false) }
+    val heldDiagnostic = if (isCurrentPage && !appearanceOnly)
+        UltraComponentDiagnosticRequests.clickedDiagnostic else null
+    DisposableEffect(heldDiagnostic) {
+        onDispose { UltraComponentDiagnosticRequests.clear(heldDiagnostic) }
+    }
     var showWorkModeSheet by rememberSaveable { mutableStateOf(false) }
     var showUltraPolicyRisk by rememberSaveable { mutableStateOf(false) }
     // Keep each native layout's position outside the skin branch; their pixel offsets differ.

@@ -8,9 +8,34 @@
 
 #include <android/log.h>
 #include <cstring>
+#include <cerrno>
 
 #include "ksu.h"
 #include "logging.h"
+
+extern "C"
+JNIEXPORT jintArray JNICALL
+Java_dev_maplesu_manager_ksu_KsuNatives_getCurrentInfo(JNIEnv *env, jobject) {
+    struct ksu_get_info_cmd info {};
+    jint status = get_current_info(info);
+    // Match the existing pre-driver getVersion()/is_manager() contract using
+    // one current legacy reply, without adding a fallback to the old getters.
+    if (status == -EBADF || status == -ENOTTY) {
+        const auto legacy = legacy_get_info();
+        if (legacy.first > 0) {
+            info.version = static_cast<uint32_t>(legacy.first);
+            info.flags = static_cast<uint32_t>(legacy.second) | KSU_GET_INFO_FLAG_MANAGER;
+            status = 0;
+        }
+    }
+    if (status < 0) errno = -status;
+    const jint values[] = {status, static_cast<jint>(info.version),
+                           static_cast<jint>(info.flags), static_cast<jint>(info.uapi_version)};
+    jintArray result = env->NewIntArray(4);
+    if (result == nullptr) return nullptr;
+    env->SetIntArrayRegion(result, 0, 4, values);
+    return env->ExceptionCheck() ? nullptr : result;
+}
 
 extern "C"
 JNIEXPORT jint JNICALL
@@ -291,7 +316,9 @@ Java_dev_maplesu_manager_ksu_KsuNatives_getAppProfile(JNIEnv *env, jobject, jstr
     const bool keyOk = copy_string_into(env, pkg, profile.key, sizeof(profile.key));
     profile.curr_uid = uid;
 
-    bool useDefaultProfile = !keyOk || get_app_profile(&profile) != 0;
+    const int currentReadCode = keyOk ? get_app_profile(&profile) : -1;
+    const int currentReadErrno = !keyOk ? EINVAL : currentReadCode == 0 ? 0 : errno;
+    const bool useDefaultProfile = currentReadCode != 0;
 
     auto cls = env->FindClass("com/maplesu/core/Natives$Profile");
     if (jni_null(env, cls)) return nullptr;
@@ -301,6 +328,8 @@ Java_dev_maplesu_manager_ksu_KsuNatives_getAppProfile(JNIEnv *env, jobject, jstr
     if (jni_null(env, obj)) return nullptr;
     auto keyField = env->GetFieldID(cls, "name", "Ljava/lang/String;");
     auto currentUidField = env->GetFieldID(cls, "currentUid", "I");
+    auto currentReadCodeField = env->GetFieldID(cls, "currentReadCode", "I");
+    auto currentReadErrnoField = env->GetFieldID(cls, "currentReadErrno", "I");
     auto allowSuField = env->GetFieldID(cls, "allowSu", "Z");
 
     auto rootUseDefaultField = env->GetFieldID(cls, "rootUseDefault", "Z");
@@ -319,7 +348,8 @@ Java_dev_maplesu_manager_ksu_KsuNatives_getAppProfile(JNIEnv *env, jobject, jstr
 
     // 字段 ID 任一为 NULL（类被 R8 改过 / 类加载异常）→ 继续 Set*Field 就是 ART abort。
     // 这种"结构性不匹配"宁可返回 null 让上层看到 null，也绝不能让进程 abort。
-    if (jni_null(env, keyField) || jni_null(env, currentUidField) || jni_null(env, allowSuField) ||
+    if (jni_null(env, keyField) || jni_null(env, currentUidField) ||
+        jni_null(env, currentReadCodeField) || jni_null(env, currentReadErrnoField) || jni_null(env, allowSuField) ||
         jni_null(env, rootUseDefaultField) || jni_null(env, rootTemplateField) ||
         jni_null(env, uidField) || jni_null(env, gidField) || jni_null(env, groupsField) ||
         jni_null(env, capabilitiesField) || jni_null(env, domainField) ||
@@ -330,6 +360,8 @@ Java_dev_maplesu_manager_ksu_KsuNatives_getAppProfile(JNIEnv *env, jobject, jstr
 
     env->SetObjectField(obj, keyField, env->NewStringUTF(profile.key));
     env->SetIntField(obj, currentUidField, profile.curr_uid);
+    env->SetIntField(obj, currentReadCodeField, currentReadCode);
+    env->SetIntField(obj, currentReadErrnoField, currentReadErrno);
 
     if (useDefaultProfile) {
         // no profile found, so just use default profile:

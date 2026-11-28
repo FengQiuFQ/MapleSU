@@ -39,4 +39,30 @@ class UltraMaintenanceRootReceiptTest {
             assertEquals(receipt.succeeded, NativeReceipt.parse(receipt.raw)?.succeeded)
         }
     }
+
+    @Test fun cleanupPendingAndCleanupFailureNeverBecomeSuccessfulReceipts() {
+        val output = "original output\n"
+        for (result in listOf(SuExecResult(0, output, cleanupPending = true),
+            SuExecResult(0, output, cleanupFailure = "CLOSE_FAILED:IOException"))) {
+            val receipt = NativeReceipt.rootCommand(result)
+            assertFalse(receipt.succeeded)
+            assertEquals("MAPLESU_ROOT_COMMAND_IO_FAILURE", receipt.sdkError)
+            assertEquals(0, receipt.int("exitCode"))
+            assertEquals(output, URLDecoder.decode(receipt.string("result"), "UTF-8"))
+            assertEquals(result.cleanupPending, receipt.bool("cleanupPending"))
+            assertEquals(result.cleanupFailure, receipt.string("cleanupFailure"))
+        }
+    }
+
+    @Test fun cleanupFactsDoNotReplaceThePrimaryTimeoutOrExposePrivateFailureText() {
+        val receipt = NativeReceipt.rootCommand(SuExecResult(71, "partial", timedOut = true,
+            failure = "EXEC_INTERRUPTED", cleanupPending = true, cleanupFailure = "private-helper command"))
+        assertFalse(receipt.succeeded)
+        assertEquals("MAPLESU_ROOT_COMMAND_TIMEOUT", receipt.sdkError)
+        assertEquals(71, receipt.int("exitCode"))
+        assertTrue(receipt.bool("cleanupPending") == true)
+        assertEquals("PROCESS_CLEANUP_FAILED", receipt.string("cleanupFailure"))
+        assertFalse(receipt.raw.contains("private-helper"))
+        assertFalse(receipt.raw.contains("command"))
+    }
 }

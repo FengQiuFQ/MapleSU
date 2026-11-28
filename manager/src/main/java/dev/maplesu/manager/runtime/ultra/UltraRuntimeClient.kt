@@ -81,14 +81,14 @@ class UltraRuntimeClient() {
         // Native SdkCallScope owns request identity and conflict-specific admission.
         // A process-wide Java lock would hold unrelated reads behind a slow JNI worker.
         val deadline = PageReadDeadline.currentNanos()
-        if (deadline != null && deadline - System.nanoTime() <= 0) return busy(operation)
+        if (deadline != null && deadline - System.nanoTime() <= 0) return deadlineExceeded(operation)
         if (Thread.currentThread().isInterrupted) return NativeReceipt.bridgeFailure(
             operation, "MAPLESU_SDK_INTERRUPTED", "The request was cancelled before SDK admission.")
         return localCall(operation, block)
     }
 
-    private fun busy(operation: String) = NativeReceipt.bridgeFailure(operation, "MAPLESU_SDK_BUSY",
-        "SDK admission timed out; this request was not submitted.")
+    private fun deadlineExceeded(operation: String) = NativeReceipt.bridgeFailure(operation, "MAPLESU_SDK_DEADLINE_EXCEEDED",
+        "The observation deadline elapsed before submission.", -1007)
 
     // Compiled identity and local OS status never wait for a stateful SDK operation.
     private fun localCall(operation: String, block: () -> String?): NativeReceipt {
@@ -96,8 +96,14 @@ class UltraRuntimeClient() {
         if (failure != null) {
             return NativeReceipt.bridgeFailure(operation, "MAPLESU_BRIDGE_UNAVAILABLE", failure)
         }
+        val deadline = PageReadDeadline.currentNanos()
+        if (Thread.currentThread().isInterrupted) return NativeReceipt.bridgeFailure(
+            operation, "MAPLESU_SDK_INTERRUPTED", "The request was cancelled before SDK admission.")
+        if (deadline != null && deadline - System.nanoTime() <= 0) return deadlineExceeded(operation)
         return try {
-            NativeReceipt.parse(block())
+            val answer = if (deadline == null) block()
+                else NativeBridge.invokeWithDeadline(operation, deadline) { block() }
+            NativeReceipt.parse(answer)
                 ?: NativeReceipt.bridgeFailure(operation, "MAPLESU_BRIDGE_UNPARSEABLE", "answer was not a receipt")
         } catch (error: Throwable) {
             if (error is CancellationException) throw error
@@ -186,6 +192,11 @@ class UltraRuntimeClient() {
         return receipt.string("candidate")?.let(UltraLegacyCredential::fromKernelClaim)
     }
 
+    /** Current native factory facts; no Root attempt or readiness promotion. */
+    internal fun suRuntimeStatus(): NativeReceipt = callWithIdentity("get_su_runtime_status") {
+        NativeBridge.getSuRuntimeStatus()
+    }
+
     fun testRoot(): NativeReceipt = parseRootStatusReport(callWithIdentity("get_root_status_report") {
         NativeBridge.testRoot()
     })
@@ -229,13 +240,13 @@ class UltraRuntimeClient() {
         if (Thread.currentThread().isInterrupted) return NativeReceipt.bridgeFailure(
             operation, "MAPLESU_SDK_INTERRUPTED", "The request was cancelled before helper readback.")
         val deadline = PageReadDeadline.currentNanos()
-        if (deadline != null && deadline - System.nanoTime() <= 0) return busy(operation)
+        if (deadline != null && deadline - System.nanoTime() <= 0) return deadlineExceeded(operation)
         return callWithIdentity(operation) {
             val remaining = deadline?.let { limit -> (limit - System.nanoTime()) / 1_000_000L }
             when {
                 Thread.currentThread().isInterrupted -> NativeReceipt.bridgeFailure(
                     operation, "MAPLESU_SDK_INTERRUPTED", "The request was cancelled before helper readback.").raw
-                remaining != null && remaining <= 0 -> busy(operation).raw
+                remaining != null && remaining <= 0 -> deadlineExceeded(operation).raw
                 else -> NativeBridge.readInstalledHelper(helperPath,
                     remaining?.coerceAtMost(timeoutMillis.toLong())?.toInt() ?: timeoutMillis)
             }

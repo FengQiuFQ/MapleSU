@@ -4190,6 +4190,77 @@ def collect_reference_abi(kernel, out):
 
 
 
+def support_source_probe():
+    return '''#include "source/runtime/ultra/identity/kernel/manager_claim_bootstrap.h"
+_Static_assert(sizeof(void *) == 8 && sizeof(msu_loader_u32) == 4, "support target ABI");
+#if defined(MSU_LOADER_SOURCE_VERSION) != defined(MSU_CLAIM_SOURCE_ANCHOR_VERSION)
+#error "Partial source support ABI"
+#endif
+#if defined(MSU_LOADER_SOURCE_VERSION)
+typedef int (*msu_source_materializer_fn)(const struct msu_loader_binding *,
+    const void *, const void *, msu_loader_u32, void *, msu_loader_u32);
+typedef int (*msu_source_boot_fn)(const struct msu_manager_claim_anchor *,
+    const void *, msu_loader_u32);
+_Static_assert(__builtin_types_compatible_p(__typeof__(&msu_manager_claim_materialize_source),
+    msu_source_materializer_fn), "source materializer function ABI");
+_Static_assert(__builtin_types_compatible_p(__typeof__(&msu_manager_resident_boot_deployment_source),
+    msu_source_boot_fn), "source boot function ABI");
+const msu_loader_u32 msu_support_source_facts[] = {
+    1, MSU_LOADER_SOURCE_VERSION, sizeof(struct msu_loader_source_header),
+    __builtin_offsetof(struct msu_loader_source_header, source_bytes),
+    sizeof(struct msu_loader_chunk), MSU_CLAIM_SOURCE_ANCHOR_VERSION,
+    sizeof(struct msu_manager_claim_anchor), sizeof(struct msu_resident_deployment_binding),
+    sizeof(struct msu_resident_config_v3), sizeof(struct msu_deployment_namespace_record)
+};
+#else
+const msu_loader_u32 msu_support_source_facts[] = { 0 };
+#endif
+'''
+
+
+def support_function_offset(elf, binary, name, required=True):
+    if elf.elfclass != 64 or not elf.little_endian or elf["e_machine"] != "EM_AARCH64" or \
+            elf["e_type"] != "ET_EXEC":
+        raise ValueError("Support entry requires an actual AArch64 executable ELF: " + name)
+    table, text = elf.get_section_by_name(".symtab"), elf.get_section_by_name(".text")
+    symbols = table.get_symbol_by_name(name) if table else None
+    if not symbols and not required:
+        return None
+    if not symbols or len(symbols) != 1:
+        raise ValueError("Missing/ambiguous support entry in actual ELF: " + name)
+    symbol = symbols[0]
+    if text is None or text["sh_type"] != "SHT_PROGBITS" or text["sh_flags"] & 6 != 6 or \
+            text.data() != binary or len(binary) % 4 or \
+            symbol["st_info"]["type"] != "STT_FUNC" or symbol["st_info"]["bind"] != "STB_GLOBAL" or \
+            symbol["st_shndx"] != elf.get_section_index(".text"):
+        raise ValueError("Non-global/non-function support entry outside paired executable bytes: " + name)
+    offset, size = symbol["st_value"] - text["sh_addr"], symbol["st_size"]
+    if offset < 0 or offset % 4 or size <= 0 or size % 4 or offset + size > len(binary):
+        raise ValueError("Support entry bounds/alignment disagree with paired bytes: " + name)
+    return offset
+
+
+def support_source_metadata(elf, binary, facts, component):
+    symbol = {"materializer": "msu_manager_claim_materialize_source",
+              "bootstrap": "msu_manager_resident_boot_deployment_source"}[component]
+    offset = support_function_offset(elf, binary, symbol, required=False)
+    if facts == [0] and offset is None:
+        return {}
+    if facts != [1, 4, 56, 52, 8, 5, 96, 56, 88, 24] or offset is None:
+        raise ValueError("Partial/unsupported compiled source support ABI: " + component)
+    legacy = [0]
+    if component == "bootstrap":
+        legacy += [support_function_offset(elf, binary, name) for name in
+            ("msu_manager_resident_boot", "msu_manager_resident_boot_deployment")]
+    if offset in legacy:
+        raise ValueError("Source support entry aliases a different function ABI: " + component)
+    if component == "materializer":
+        return dict(zip(("sourceEntryOffset", "sourceProtocolVersion", "sourceHeaderBytes",
+                         "sourceBytesOffset", "sourceChunkBytes"), [offset, *facts[1:5]]))
+    return dict(zip(("deploymentSourceBootEntryOffset", "sourceAnchorVersion", "sourceAnchorBytes",
+                     "sourceBindingBytes", "sourceConfigBytes", "sourceRecordBytes"), [offset, *facts[5:]]))
+
+
 def build_support(out, retirement_policy=None, bootstrap_only=False):
     target = out / "support"
     target.mkdir(parents=True, exist_ok=True)
@@ -4212,11 +4283,18 @@ def build_support(out, retirement_policy=None, bootstrap_only=False):
             raise ValueError("Actual selected support copy differs: " + str(source))
         staged_inputs.append({"logicalPath": "runtime/ultra/" + relative,
             "selectedSource": before, "compiledCopy": copied})
+    probe_source, probe_object = target / "source-abi.c", target / "source-abi.o"
+    probe_source.write_text(support_source_probe(), encoding="utf-8", newline="\n")
     source_receipt = target / "source-inputs.json"
-    source_receipt.write_text(json.dumps({"schema": "maplesu-support-selected-source-inputs/1",
+    source_inputs = {"schema": "maplesu-support-selected-source-inputs/1",
         "hostDeployment": host_deployment_public_selection() if HOST_DEPLOYMENT_SELECTION is not None else None,
-        "files": staged_inputs}, indent=2) + "\n", encoding="utf-8", newline="\n")
-    commands = ["set -eu"]
+        "files": staged_inputs, "abiProbe": {"source": identity(probe_source)}}
+    source_receipt.write_text(json.dumps(source_inputs, indent=2) + "\n", encoding="utf-8", newline="\n")
+    commands = ["set -eu", "clang --target=aarch64-none-elf -Os -ffreestanding -fno-builtin "
+        "-fno-stack-protector -fPIC -mcmodel=tiny -ffixed-x18 -mgeneral-regs-only "
+        "-mbranch-protection=standard -mno-outline-atomics -ffunction-sections -fdata-sections "
+        "-fno-asynchronous-unwind-tables -Wall -Wextra -Werror "
+        "-c /output/support/source-abi.c -o /output/support/source-abi.o"]
     support = (("bootstrap", "msu_manager_claim_bootstrap", "manager_claim_bootstrap.c"),
                ("materializer", "msu_manager_claim_materialize", "manager_claim_loader.c"),
                ("permissions", "msu_manager_claim_permissions", "manager_claim_permissions.c"))
@@ -4255,6 +4333,18 @@ def build_support(out, retirement_policy=None, bootstrap_only=False):
     (target / "build.log").write_text(result.stdout + result.stderr, encoding="utf-8")
     if result.returncode:
         raise RuntimeError(result.stdout + result.stderr)
+    with probe_object.open("rb") as stream:
+        probe_elf = ELFFile(stream)
+        if probe_elf.elfclass != 64 or not probe_elf.little_endian or \
+                probe_elf["e_machine"] != "EM_AARCH64" or probe_elf["e_type"] != "ET_REL":
+            raise ValueError("Source support ABI facts require the same AArch64 target")
+    source_facts = object_words(probe_object, "msu_support_source_facts")
+    if source_facts not in ([0], [1, 4, 56, 52, 8, 5, 96, 56, 88, 24]):
+        raise ValueError("Compiled source support layouts disagree with the selected ABI")
+    if identity(probe_source) != source_inputs["abiProbe"]["source"]:
+        raise ValueError("Source support ABI probe changed during compilation")
+    source_inputs["abiProbe"]["object"] = identity(probe_object)
+    source_receipt.write_text(json.dumps(source_inputs, indent=2) + "\n", encoding="utf-8", newline="\n")
     report = {}
     for name, _, _ in support:
         with (target / f"{name}.elf").open("rb") as stream:
@@ -4316,6 +4406,8 @@ def build_support(out, retirement_policy=None, bootstrap_only=False):
                         raise ValueError("Actual deployment support facts disagree with the selected ABI")
                     report[name].update(deploymentBootEntryOffset=offset, deploymentAnchorVersion=facts[0],
                         deploymentBindingBytes=facts[1], deploymentConfigBytes=facts[2], deploymentRecordBytes=facts[3])
+            if name in ("materializer", "bootstrap"):
+                report[name].update(support_source_metadata(elf, binary.read_bytes(), source_facts, name))
     return report
 
 

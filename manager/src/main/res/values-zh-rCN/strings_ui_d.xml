@@ -85,6 +85,10 @@
     <string name="ui_d_env_repair_summary">重新安装工作环境，保留已有数据。</string>
     <string name="ui_d_env_repair_action">修复</string>
     <string name="ui_d_env_repair_confirm">重新安装 Ultra 环境，保留授权和模块数据，完成后将自动重启设备。</string>
+    <string name="ui_d_env_restore_title">SDK 安装与恢复</string>
+    <string name="ui_d_env_restore_summary">按需安装或恢复工作环境，保留已有数据。</string>
+    <string name="ui_d_env_restore_action">安装 / 恢复</string>
+    <string name="ui_d_env_restore_confirm">安装或恢复 Ultra 环境，保留授权和模块数据，完成后将自动重启设备。</string>
     <string name="ultra_env_existing_upgrade_title">需要升级 Ultra</string>
     <string name="ultra_env_existing_upgrade_summary">升级 Ultra，完成后自动重启设备。</string>
     <string name="ultra_env_existing_upgrade_confirm">升级 Ultra，保留授权和模块数据，完成后将自动重启设备。</string>
@@ -114,7 +118,7 @@
     <string name="ui_d_env_install_busy">正在安装，请稍候</string>
     <string name="ui_d_env_install_action">安装</string>
     <string name="ui_d_env_install_done">请重启设备以完成安装</string>
-    <string name="ui_d_env_install_failed">安装未完成，请稍后重试</string>
+    <string name="ui_d_env_install_failed">安装遇到问题，请查看详情</string>
     <string name="ui_d_env_install_kernel_channel">当前未检测到可用的 MapleSU Ultra 内核通道，请先安装匹配的 Ultra 镜像并重启，再安装工作环境</string>
     <string name="ui_d_env_install_key_mismatch">本机凭据与当前内核镜像不匹配，请刷入匹配的 MapleSU Ultra 镜像并重启</string>
     <string-array name="ui_d_gravity_modes">

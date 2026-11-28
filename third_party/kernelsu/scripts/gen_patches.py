@@ -42,6 +42,7 @@ from patch_defs_maplesu93260 import PATCHES_MAPLESU93260
 from patch_defs_jailbreak_session import PATCHES_JAILBREAK_SESSION
 from patch_defs_module_install_transaction import PATCHES_MODULE_INSTALL_TRANSACTION
 from patch_defs_module_removal_transaction import PATCHES_MODULE_REMOVAL_TRANSACTION
+from patch_defs_native_current_info import PATCHES_NATIVE_CURRENT_INFO
 
 UPSTREAM = "upstream"
 S7K = "source7k"
@@ -1124,7 +1125,7 @@ PATCHES = PATCHES + PATCHES_W18B + PATCHES_NORMAL_RECOVERY + PATCHES_KSUD_IDENTI
     "summary": "Align JNI profile lookup and Magica entry with the MapleSU manager namespace",
     "apply": patch_maplesu_namespace,
     "status": "implemented",
-}] + PATCHES_BOOT_COPY + PATCHES_BACKUP_OPTIONAL + PATCHES_EMPTY_RAMDISK_RESTORE + PATCHES_TARGET_KERNEL_KMI + PATCHES_MODULE_INSTALL_TRANSACTION + PATCHES_MODULE_REMOVAL_TRANSACTION
+}] + PATCHES_BOOT_COPY + PATCHES_BACKUP_OPTIONAL + PATCHES_EMPTY_RAMDISK_RESTORE + PATCHES_TARGET_KERNEL_KMI + PATCHES_MODULE_INSTALL_TRANSACTION + PATCHES_MODULE_REMOVAL_TRANSACTION + PATCHES_NATIVE_CURRENT_INFO
 _W18B_RESOLVED_TODOS = {
     "0006b-webadmin-ksud-api-surface",
     "0007b-boot-patch-rewrite",

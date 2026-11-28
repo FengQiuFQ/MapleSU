@@ -65,7 +65,7 @@ object UltraEnvironmentInstaller {
         verified = false,
         detail = "phase=$phase operation=${receipt.operation} bridgeVersion=${receipt.bridgeVersion}",
         submissionUnknown = phase == "install" && (receipt.operationCompleted ||
-            receipt.sdkError !in setOf("MAPLESU_SDK_BUSY", "MAPLESU_SDK_INTERRUPTED",
+            receipt.sdkError !in setOf("MAPLESU_SDK_BUSY", "MAPLESU_SDK_INTERRUPTED", "MAPLESU_SDK_DEADLINE_EXCEEDED",
                 "MAPLESU_BRIDGE_UNAVAILABLE", "SDK_IDENTITY_SCOPE_CHANGED")),
     )
 
@@ -173,12 +173,9 @@ object UltraEnvironmentInstaller {
                 attachments = Attachments(
                     whitelist = { UltraSelfWhitelist.onEnvironmentInstalled(context, scopedClient) { checkScope() == null } },
                     verify = {
-                        // Boot 安装返回后设备马上重启，文件可能刚写完：给 3 次、每次 1s 的有界重试。
                         UltraInstalledIdentityProbe.readAndVerify(
                             context,
                             scopedClient,
-                            attempts = 3,
-                            delayMillis = 1_000L,
                         )
                     },
                     persist = { identity ->
@@ -270,15 +267,22 @@ object UltraEnvironmentInstaller {
             )
         }
         if (!receipt.succeeded) return failureOutcome(receipt, "install")
-        fun submittedUnverified(reason: String) = Outcome(
+        fun submittedUnverified(reason: String, buildId: String? = null) = Outcome(
             true, receipt.sdkError, receipt.reason, detail = "UNVERIFIED:$reason", verified = false,
+            buildId = buildId,
             sdkErrorCode = receipt.sdkErrorCode,
-            submissionUnknown = true,
         )
         scopeFailure(attachments)?.let { return submittedUnverified(it) }
         // Persist readback before whitelist/identity deployment can consume the reboot window.
-        val verified = if (!reuse) verifyAndPersist(attachments) else IdentityVerification.passed(null)
-        scopeFailure(attachments)?.let { return submittedUnverified(it) }
+        val observation = if (!reuse) verifyAndPersist(attachments)
+            else IdentityObservation(InstalledIdentity.unknown(), IdentityVerification.passed(null))
+        val verified = observation.verification
+        val verificationScopeFailure = scopeFailure(attachments)
+        if (!verified.verified || verificationScopeFailure != null) {
+            val reason = verificationScopeFailure ?: verified.reason ?: "UNKNOWN"
+            return submittedUnverified(reason +
+                (observation.readbackFailure?.let { " readback=$it" } ?: ""), verified.buildId)
+        }
         val completeUpgrade = intent == Intent.UpgradeToBundledBuild
         val authorityFailure = if ((intent == Intent.InstallToBundledBuild || completeUpgrade) && verified.verified) {
             try { attachments.initializeAuthority() }
@@ -308,7 +312,6 @@ object UltraEnvironmentInstaller {
         val result = outcome.copy(
             verified = verified.verified && authorityFailure == null && authorizationFailure == null,
             detail = when {
-                !verified.verified -> "UNVERIFIED:${verified.reason ?: "UNKNOWN"}"
                 authorityFailure != null -> "UNVERIFIED:AUTHORITY:$authorityFailure"
                 authorizationFailure != null -> "UNVERIFIED:AUTHORIZATION:$authorizationFailure"
                 else -> outcome.detail
@@ -326,14 +329,19 @@ object UltraEnvironmentInstaller {
      * 所有日志都用 [quietLog]：主机单测里 `android.util.Log` 是 stub 会抛，编排路径不能
      * 因为记一行日志就失败（与 [UltraSuChannel] 的既有纪律一致）。
      */
-    private fun verifyAndPersist(attachments: Attachments): IdentityVerification {
-        scopeFailure(attachments)?.let { return IdentityVerification(false, it, null) }
+    private fun verifyAndPersist(attachments: Attachments): IdentityObservation {
+        scopeFailure(attachments)?.let {
+            return IdentityObservation(InstalledIdentity.unknown(), IdentityVerification(false, it, null))
+        }
         val observation = try {
             attachments.verify()
         } catch (error: Throwable) {
-            return IdentityVerification(false, "VERIFY_EXCEPTION:${error.javaClass.simpleName}", null)
+            return IdentityObservation(InstalledIdentity.unknown(),
+                IdentityVerification(false, "VERIFY_EXCEPTION:${error.javaClass.simpleName}", null))
         }
-        scopeFailure(attachments)?.let { return IdentityVerification(false, it, null) }
+        scopeFailure(attachments)?.let {
+            return observation.copy(verification = IdentityVerification(false, it, null))
+        }
         if (!observation.verification.verified) {
             quietLog {
                 Log.w(
@@ -342,23 +350,28 @@ object UltraEnvironmentInstaller {
                         "source=${observation.identity.source}",
                 )
             }
-            return observation.verification
+            return observation
         }
         // 校验通过 = 设备上的 helper 就是随包这一份：把随包构建号盖上去再落盘。
         // 不盖的话「摘要相同但构建号未知」会永远停在待确认，用户会每点一次都重装。
         val stamped = observation.identity.copy(
             buildId = observation.identity.buildId ?: observation.verification.buildId,
         )
-        scopeFailure(attachments)?.let { return IdentityVerification(false, it, null) }
+        scopeFailure(attachments)?.let {
+            return observation.copy(verification = IdentityVerification(false, it, null))
+        }
         try {
             attachments.persist(stamped)
         } catch (error: Throwable) {
             quietLog { Log.w(TAG, "identity persist failed: ${error.javaClass.simpleName}") }
-            return IdentityVerification(false, "IDENTITY_PERSIST_FAILED", null)
+            return observation.copy(verification = IdentityVerification(false, "IDENTITY_PERSIST_FAILED", null))
         }
-        scopeFailure(attachments)?.let { return IdentityVerification(false, it, null) }
-        return observation.verification.copy(
-            buildId = stamped.buildId ?: observation.verification.buildId,
+        scopeFailure(attachments)?.let {
+            return observation.copy(verification = IdentityVerification(false, it, null))
+        }
+        return observation.copy(
+            identity = stamped,
+            verification = observation.verification.copy(buildId = stamped.buildId ?: observation.verification.buildId),
         )
     }
 

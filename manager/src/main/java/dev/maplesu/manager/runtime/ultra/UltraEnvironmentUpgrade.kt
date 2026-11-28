@@ -15,6 +15,8 @@ import dev.maplesu.manager.workmode.superuser.LiteImplantQuiesceGate
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.CancellationException
 import java.security.MessageDigest
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * 「MapleSU_Ultra 工作环境」升级：读事实、执行升级。
@@ -47,6 +49,9 @@ object UltraEnvironmentUpgrade {
     enum class Result { SUBMITTED, FAILED, REFUSED }
 
     private val running = AtomicBoolean(false)
+    internal data class OperationState(val inProgress: Boolean = false, val completedRevision: Long = 0L)
+    private val _operation = MutableStateFlow(OperationState())
+    internal val operationFlow = _operation.asStateFlow()
     private val installedKernel = UltraInstalledKernelObservation()
     val installedKernelRevision = installedKernel.revisions
 
@@ -260,7 +265,7 @@ object UltraEnvironmentUpgrade {
         val marker = UltraSdkCredentials.captureOwnerMarker(context)
         val client = UltraSdkCredentials.client(context)
         fun current() = marker() && client.queryManagerOwnerIdentity().identity == owner
-        val observation = UltraInstalledIdentityProbe.readAndVerify(context, client, attempts = 3, delayMillis = 1_000L)
+        val observation = UltraInstalledIdentityProbe.readAndVerify(context, client)
         if (!observation.verification.verified || !current()) return Result.FAILED
         val scope = UltraAuthorization.Scope(client, ::current, ::current)
         val initialized = dev.maplesu.manager.runtime.authorization.SuperuserControl
@@ -304,6 +309,7 @@ object UltraEnvironmentUpgrade {
             notePreflightRefusal("preflight", "PREFLIGHT_IN_PROGRESS")
             return Result.REFUSED
         }
+        _operation.value = _operation.value.copy(inProgress = true)
         invalidateObservation()
         val app = context.applicationContext
         var phase = "preflight"
@@ -448,6 +454,8 @@ object UltraEnvironmentUpgrade {
             return Result.FAILED
         } finally {
             running.set(false)
+            // The revision survives StateFlow conflation of a short true/false operation.
+            _operation.value = OperationState(completedRevision = _operation.value.completedRevision + 1)
         }
     }
 

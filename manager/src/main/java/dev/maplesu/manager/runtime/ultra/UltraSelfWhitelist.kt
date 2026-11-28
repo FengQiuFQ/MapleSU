@@ -20,6 +20,7 @@ interface SuAuthPort {
     val supportsUidProfiles: Boolean get() = false
     fun uidProfiles(): List<SuUidProfile>? = null
     fun uidProfileReadError(): String? = null
+    fun uidProfileReadReceipt(): NativeReceipt? = null
     fun setUidProfile(uid: Int, packageName: String, allow: Boolean): NativeReceipt =
         NativeReceipt.bridgeFailure("set_su_uid_profile", "SU_UID_PROFILE_UNSUPPORTED", null)
 
@@ -60,6 +61,10 @@ object UltraSelfWhitelist {
         val failure: String? = null,
         /** Same add receipt, also retained when the later membership readback fails. */
         val receipt: NativeReceipt? = null,
+        /** Original authority detail for failure consumers; excluded from log summaries. */
+        val detail: String? = null,
+        /** Independent current UID read; the original write receipt stays in [receipt]. */
+        val readReceipt: NativeReceipt? = null,
     ) {
         val succeeded: Boolean get() = inList && listVerified && failure == null
 
@@ -68,7 +73,10 @@ object UltraSelfWhitelist {
             get() = "inList=$inList added=$added already=$alreadyPresent " +
                 "attempted=$attempted verified=$listVerified" +
                 (failure?.let { " failure=${suAuthLogCode(it)}" } ?: "") +
-                (receipt?.let { " ${it.authorizationDiagnosticSummary()}" } ?: "")
+                (receipt?.let { " ${it.authorizationDiagnosticSummary()}" } ?: "") +
+                (readReceipt?.takeUnless { it === receipt }?.let {
+                    " readReceipt=[${it.authorizationDiagnosticSummary()}]"
+                } ?: "")
 
         override fun toString(): String = "Result($summary)"
     }
@@ -184,14 +192,21 @@ object UltraSelfWhitelist {
 
     private fun ensureAuthority(context: Context, scope: UltraAuthorization.Scope): Result {
         val authority = dev.maplesu.manager.runtime.authorization.SuperuserControl.ensureManagerGrant(context, scope)
-        if (!authority.succeeded || !scope.current()) return Result(false, false, false, true, false,
-            authority.code ?: if (!scope.current()) "SU_AUTH_SCOPE_CHANGED" else "SU_AUTH_APPLY_PENDING")
+        return ensureAuthority(context, scope, authority, clientPort(scope.client))
+    }
+
+    internal fun ensureAuthority(context: Context, scope: UltraAuthorization.Scope,
+                                 authority: dev.maplesu.manager.runtime.authorization.SuperuserControl.Result,
+                                 port: SuAuthPort): Result {
+        if (!scope.current()) return Result(false, false, false, false, false, "SU_AUTH_SCOPE_CHANGED")
+        if (!authority.succeeded) return Result(false, false, false, true, false,
+            authority.code ?: "SU_AUTH_APPLY_PENDING", detail = authority.detail)
         val uid = context.applicationInfo.uid
-        val port = clientPort(scope.client)
         val profiles = port.uidProfiles()
+        val readReceipt = port.uidProfileReadReceipt()
         if (!scope.current()) return Result(false, false, false, false, false, "SU_AUTH_SCOPE_CHANGED")
         if (profiles == null) return Result(false, false, false, false, false,
-            port.uidProfileReadError() ?: "READ_FAILED")
+            port.uidProfileReadError() ?: "READ_FAILED", receipt = readReceipt, readReceipt = readReceipt)
         val present = profiles.any { it.uid == uid && it.allow }
         // Always synchronize this already-committed decision: list membership alone
         // does not establish the current installation's standard-su delivery.
@@ -199,7 +214,7 @@ object UltraSelfWhitelist {
             durableDecisionCommitted = true)
         return Result(attempt.decisionVerified && attempt.succeeded, added = !present && attempt.succeeded,
             alreadyPresent = present, attempted = true, listVerified = attempt.decisionVerified,
-            failure = attempt.error, receipt = attempt.receipt)
+            failure = attempt.error, receipt = attempt.receipt, readReceipt = attempt.readReceipt)
     }
 
     /** Reconfirm the sole authority before synchronizing standard-su delivery. */
@@ -219,12 +234,19 @@ object UltraSelfWhitelist {
         ensureCurrentAuthority(context, client, current)
 
     /** 把 [UltraRuntimeClient] 适配成 [SuAuthPort]（`snapshot()` 只在成功时返回列表）。 */
-    fun clientPort(client: UltraRuntimeClient): SuAuthPort = object : SuAuthPort {
+    fun clientPort(client: UltraRuntimeClient): SuAuthPort = clientPort(client) {}
+
+    internal fun clientPort(client: UltraRuntimeClient,
+                            onUidRead: (UltraRuntimeClient.SuUidProfilesSnapshot) -> Unit): SuAuthPort = object : SuAuthPort {
         override val supportsUidProfiles: Boolean = true
         private var profileReadError: String? = null
+        private var profileReadReceipt: NativeReceipt? = null
         override fun uidProfileReadError(): String? = profileReadError
+        override fun uidProfileReadReceipt(): NativeReceipt? = profileReadReceipt
         override fun uidProfiles(): List<SuUidProfile>? {
             val snapshot = client.suUidProfiles()
+            profileReadReceipt = snapshot.receipt
+            onUidRead(snapshot)
             if (snapshot.ok) {
                 profileReadError = null
                 return snapshot.profiles

@@ -20,7 +20,9 @@ class UltraAppListWiringTest {
 
     @Test fun initialUltraListRequiresOneSuccessfulAuthorizationSnapshotBeforeMapping() {
         assertTrue("SDK failure must fail the batch before profiles are projected", initialLoad().contains("UltraAppListSnapshot.withPackages("))
-        assertTrue(initialLoad().contains("UltraAuthorization.refresh(application)"))
+        assertTrue(initialLoad().contains("delivery = refreshUltraDelivery()"))
+        assertTrue(repository().contains("UltraAuthorization.refreshDetailed(ksuApp)"))
+        assertTrue(repository().contains("ManagerAuthorizations.currentDeliveryRead(refreshed.scope, snapshot)"))
         assertTrue(initialLoad().contains("UltraAuthorization.grantedPackages()"))
         assertTrue(initialLoad().contains("grants.isGranted("))
     }
@@ -32,6 +34,8 @@ class UltraAppListWiringTest {
             .substringBefore("\n            currentApps.map {")
         assertTrue("Ultra refresh branch is missing", refresh.contains("if (ModeRuntime.active == WorkMode.LITE && usesReadyUltraBackend())"))
         assertTrue(ultra.contains("UltraAppListSnapshot.read("))
+        assertTrue(ultra.contains("delivery = refreshUltraDelivery()"))
+        assertTrue(ultra.contains("currentDeliveryRead = delivery"))
         assertTrue(ultra.contains("grants.isGranted("))
         assertFalse(ultra.contains("Natives.getAppProfile("))
         assertTrue("Normal/legacy profiles must keep their original backend", refresh.contains("Natives.getAppProfile(it.profileKey, it.uid)"))
@@ -43,12 +47,12 @@ class UltraAppListWiringTest {
         val save = authorization.substringAfter("fun saveProfile(")
         assertTrue(read.contains("AndroidApplicationIdentities(context).read(uid)"))
         assertTrue(save.contains("AndroidApplicationIdentities(context).read(profile.currentUid)"))
-        assertTrue(save.contains("identity.packageName != profile.name"))
+        assertTrue(save.contains("profile.name !in identity.members.keys"))
         val details = source("com/maplesu/core/ui/screen/appprofile/AppProfileScreen.kt")
-        assertTrue(details.contains("else Natives.getAppProfile(packageName, uid)"))
+        assertTrue(details.contains("Natives.getAppProfileFreshDetailed(packageName, uid)"))
         assertTrue(details.contains("Natives.setAppProfileDetailed(profileToSave)"))
-        assertTrue(details.contains("val saved = result.decisionCommitted"))
-        assertTrue(details.contains("result.pendingApply || result.commitUnknown"))
+        assertTrue(details.contains("policy.complete(request, profileToSave, result, observed?.profile)"))
+        assertTrue(details.contains("result.pendingApply} unknown=\${result.commitUnknown}"))
     }
     @Test fun ultraProfileDetailsResolveSystemPackageUidsBeforeTheLegacyApplicationIdentity() {
         val authorization = source("dev/maplesu/manager/runtime/authorization/ManagerAuthorizations.kt")

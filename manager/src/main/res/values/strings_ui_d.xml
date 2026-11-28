@@ -85,6 +85,10 @@
     <string name="ui_d_env_repair_summary">Reinstall the environment and keep existing data.</string>
     <string name="ui_d_env_repair_action">Repair</string>
     <string name="ui_d_env_repair_confirm">Reinstall the Ultra environment, retain authorizations and module data, and restart the device.</string>
+    <string name="ui_d_env_restore_title">SDK installation and recovery</string>
+    <string name="ui_d_env_restore_summary">Install or restore the environment when needed and keep existing data.</string>
+    <string name="ui_d_env_restore_action">Install / restore</string>
+    <string name="ui_d_env_restore_confirm">Install or restore the Ultra environment, retain authorizations and module data, and restart the device.</string>
     <string name="ultra_env_existing_upgrade_title">Ultra update required</string>
     <string name="ultra_env_existing_upgrade_summary">Update Ultra and restart the device.</string>
     <string name="ultra_env_existing_upgrade_confirm">Upgrade Ultra, retain authorizations and module data, and restart the device.</string>

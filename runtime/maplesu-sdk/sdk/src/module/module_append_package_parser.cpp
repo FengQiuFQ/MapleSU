@@ -248,7 +248,8 @@ static KModErr read_append_field(uint32_t displacement, void* value, uint32_t si
         bool supported = false;
         auto error = maplesu_kernel_metadata_facts(facts, supported);
         if (is_failed(error)) return error;
-        if (!supported || !identity.matches()) return KModErr::ERR_MODULE_ROOT_KEY;
+        if (!supported) return KModErr::ERR_MODULE_TEST_CHANNEL;
+        if (!identity.matches()) return KModErr::ERR_MODULE_ROOT_KEY;
         if (required_bytes > facts.append_bytes || displacement > facts.append_bytes ||
             size > facts.append_bytes - displacement) return KModErr::ERR_MODULE_INTERNAL_APPEND;
         error = maplesu_request_owner_read(facts.append + displacement, value, size, facts.owner);

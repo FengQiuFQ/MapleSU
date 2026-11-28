@@ -6,6 +6,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import com.maplesu.core.BuildConfig
+import dev.maplesu.manager.runtime.PageReadDeadline
 import dev.maplesu.manager.workmode.ModeActivation
 import dev.maplesu.manager.workmode.ModeRuntime
 import dev.maplesu.manager.workmode.WorkMode
@@ -32,6 +33,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -49,7 +51,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * 可用性证据（凭据→UID0 握手、控制面 root 会话）只能在阶段二获得；只做阶段一会让 Lite
  * 永远停在 `MODE_A_INSTALLED_UNBOUND`（activeMode=null），把 Lite 整个关死。
  *
- * 幂等：阶段一只跑一次；阶段二互斥执行，未判定时有限重试，激活后停止探测。
+ * 幂等：阶段一只跑一次；阶段二互斥执行，真实重试请求可重核，激活后停止探测。
  * 失败/未判定一律保持"未判定"，**绝不默认 LITE**（主文档:786）。
  */
 object ModeBootstrap {
@@ -58,8 +60,9 @@ object ModeBootstrap {
 
     /** 阶段二延迟：让首帧/解锁完成后再拿 root 证据，不阻塞启动。 */
     const val SECOND_PHASE_DELAY_MS = 2_500L
-    private const val MAX_SECOND_PHASE_ATTEMPTS = 3
-    private const val SECOND_PHASE_RETRY_DELAY_MS = 750L
+    private const val MAX_SECOND_PHASE_ATTEMPTS = 1
+    private const val SECOND_PHASE_RETRY_DELAY_MS = 0L
+    private const val SECOND_PHASE_TIMEOUT_MS = 10_000L
 
     private val started = AtomicBoolean(false)
     private val secondPhaseScheduled = AtomicBoolean(false)
@@ -172,6 +175,10 @@ object ModeBootstrap {
     fun pendingEnvironmentDetection(): Deferred<Unit>? = secondPhaseRetry.pendingCompletion()
 
     private fun schedulePhaseTwo(delayMillis: Long) {
+        if (delayMillis <= 0L) {
+            executePhaseTwo()
+            return
+        }
         schedulePhaseTwo(delayMillis) { task, delay ->
             Handler(Looper.getMainLooper()).postDelayed(task, delay)
         }
@@ -240,42 +247,54 @@ object ModeBootstrap {
             Log.w(TAG, "mode phase-two worker unavailable", error)
         }) {
             try {
-                runBlocking {
-                    // Early scheduling must not race a still-running local-only observation.
-                    var startedAt = SystemClock.elapsedRealtime()
-                    startupTrace("stage=phase_two_wait event=begin")
-                    firstPhaseComplete.await()
-                    startupTrace("stage=phase_two_wait event=end elapsedMs=${SystemClock.elapsedRealtime() - startedAt}")
-                    startedAt = SystemClock.elapsedRealtime()
-                    startupTrace("stage=phase_two_prepare event=begin")
-                    val preparation = preparationProbeRunner.run(8_000) {
-                        beforeDetection()
-                        startupContext?.let {
-                            runCatching {
-                                dev.maplesu.manager.workmode.backend.KsuBackendRegistry.prepareJailbreakManager(it)
-                            }.onFailure { error -> Log.w(TAG, "Normal manager driver handover pending", error) }
-                            val observed = dev.maplesu.manager.runtime.ultra.UltraEnvironmentProbe.currentSnapshot(it)
-                            val currentUltraConfirmed = observed.rootAvailable ||
-                                observed.state == dev.maplesu.manager.runtime.ultra.UltraEnvironmentProbe.State.Fault ||
-                                dev.maplesu.manager.runtime.HookRootExecutor.production(it).available()
-                            if (!currentUltraConfirmed) {
-                                dev.maplesu.manager.runtime.ultra.UltraIdentityRecovery.recover(it)
+                runBlocking(PageReadDeadline.context(SECOND_PHASE_TIMEOUT_MS)) {
+                    val completed = withTimeoutOrNull(SECOND_PHASE_TIMEOUT_MS) {
+                        // Early scheduling must not race a still-running local-only observation.
+                        var startedAt = SystemClock.elapsedRealtime()
+                        startupTrace("stage=phase_two_wait event=begin")
+                        firstPhaseComplete.await()
+                        startupTrace("stage=phase_two_wait event=end elapsedMs=${SystemClock.elapsedRealtime() - startedAt}")
+                        startedAt = SystemClock.elapsedRealtime()
+                        startupTrace("stage=phase_two_prepare event=begin")
+                        val preparation = preparationProbeRunner.run(SECOND_PHASE_TIMEOUT_MS) {
+                            beforeDetection()
+                            startupContext?.let {
+                                runCatching {
+                                    dev.maplesu.manager.workmode.backend.KsuBackendRegistry.prepareJailbreakManager(it)
+                                }.onFailure { error -> Log.w(TAG, "Normal manager driver handover pending", error) }
+                                val observed = dev.maplesu.manager.runtime.ultra.UltraEnvironmentProbe.currentSnapshot(it)
+                                val currentUltraConfirmed = observed.rootAvailable ||
+                                    observed.state == dev.maplesu.manager.runtime.ultra.UltraEnvironmentProbe.State.Fault ||
+                                    dev.maplesu.manager.runtime.HookRootExecutor.production(it).available()
+                                if (!currentUltraConfirmed) {
+                                    dev.maplesu.manager.runtime.ultra.UltraIdentityRecovery.recover(it)
+                                }
                             }
                         }
+                        val preparationFailure = when (preparation) {
+                            is EnvironmentProbeResult.Completed -> null
+                            EnvironmentProbeResult.TimedOut -> "MODE_PREPARE_TIMEOUT" to "environment preparation timed out"
+                            EnvironmentProbeResult.Busy -> "MODE_PREPARE_BUSY" to "previous environment preparation is still stopping"
+                            is EnvironmentProbeResult.Failed -> "MODE_PREPARE_FAILED" to preparation.cause.message.orEmpty()
+                        }
+                        if (preparationFailure != null) {
+                            val (code, detail) = preparationFailure
+                            recordGate(BootstrapPhase.AFTER_ROOT_GRANTED, BootstrapOutcome.Failed(
+                                code, detail))
+                            return@withTimeoutOrNull
+                        }
+                        startupTrace("stage=phase_two_prepare event=end elapsedMs=${SystemClock.elapsedRealtime() - startedAt}")
+                        startedAt = SystemClock.elapsedRealtime()
+                        startupTrace("stage=phase_two_detect event=begin")
+                        coordinator.runPhaseTwo()
+                        startupTrace("stage=phase_two_detect event=end elapsedMs=${SystemClock.elapsedRealtime() - startedAt} active=${ModeRuntime.active?.name ?: "UNKNOWN"}")
+                        ModeRuntime.latestDetection?.trace?.forEach { probe ->
+                            startupTrace("stage=probe id=${probe.id} elapsedMs=${probe.elapsedMillis} ok=${probe.ok}")
+                        }
                     }
-                    if (preparation !is EnvironmentProbeResult.Completed) {
+                    if (completed == null) {
                         recordGate(BootstrapPhase.AFTER_ROOT_GRANTED, BootstrapOutcome.Failed(
-                            if (preparation == EnvironmentProbeResult.TimedOut) "MODE_PREPARE_TIMEOUT" else "MODE_PREPARE_FAILED",
-                            "environment preparation did not complete"))
-                        return@runBlocking
-                    }
-                    startupTrace("stage=phase_two_prepare event=end elapsedMs=${SystemClock.elapsedRealtime() - startedAt}")
-                    startedAt = SystemClock.elapsedRealtime()
-                    startupTrace("stage=phase_two_detect event=begin")
-                    coordinator.runPhaseTwo()
-                    startupTrace("stage=phase_two_detect event=end elapsedMs=${SystemClock.elapsedRealtime() - startedAt} active=${ModeRuntime.active?.name ?: "UNKNOWN"}")
-                    ModeRuntime.latestDetection?.trace?.forEach { probe ->
-                        startupTrace("stage=probe id=${probe.id} elapsedMs=${probe.elapsedMillis} ok=${probe.ok}")
+                            "MODE_PHASE_TWO_TIMEOUT", "environment session deadline exceeded"))
                     }
                 }
                 // Reboot convergence also runs once when phase one already resolved Normal.
@@ -310,8 +329,7 @@ object ModeBootstrap {
             ),
             runtime = ProductionModeRuntimePort,
             probeRunner = detectionProbeRunner,
-            // T14：先"继承上次状态 / 降级快速核对"；只有 KSU 与"未安装"两个终态会覆盖
-            // 三阶段判定（LITE/ULTRA/UNKNOWN 一律返回 null，交回既有两阶段判定）。
+            // 当前 Normal 身份解除互锁；Ultra owner 仍交回完整检测取得能力证据。
             // Auxiliary SU endpoints keep local KSU/Hook wiring, without repeating the
             // Manager's executable SU probes or writing its environment preferences.
             environmentOverride = if (managerProcess) ({ environmentOverride(context) }) else null,
@@ -319,14 +337,11 @@ object ModeBootstrap {
         )
     }
 
-    /**
-     * T14 前置环境检查（单飞 + 8 s 预算）：能继承就零探测；不能继承才走
-     * 「当前 Ultra → su → Ultra 恢复 → KSU」链。返回 null = 不覆盖（照常三阶段探测）。
-     */
+    /** Current identity only; the Home and startup consumers share this one flight. */
     private suspend fun environmentOverride(context: Context): DetectionResult? {
         val startedAt = SystemClock.elapsedRealtime()
         val outcome = try {
-            EnvironmentCheckProduction.runner(context.applicationContext).check()
+            EnvironmentCheckProduction.freshRunner(context.applicationContext).check()
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Throwable) {
@@ -429,7 +444,7 @@ object ModeBootstrap {
                 ModeGate.skip(ModeComponentIds.APP_MODE_BOOTSTRAP, ModeGateFormat.Reason.UNDETERMINED, extras)
             }
             is BootstrapOutcome.Failed -> {
-                ModeRuntime.failBootstrap(outcome.code)
+                ModeRuntime.failBootstrap(outcome.code, outcome.detail)
                 extras["reason"] = outcome.code.lowercase()
                 ModeGate.skip(ModeComponentIds.APP_MODE_BOOTSTRAP, ModeGateFormat.Reason.UNDETERMINED, extras)
             }

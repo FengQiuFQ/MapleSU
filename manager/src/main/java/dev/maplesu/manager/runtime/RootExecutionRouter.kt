@@ -112,7 +112,8 @@ class UltraEnvRootExecutor(
             // Admission failures submitted no SDK work and contain no new root evidence.
             // Invalidating here turns a busy startup probe into repeated environment reads.
             val notSubmitted = result.detail == "ULTRA_ROOT_FAILED:MAPLESU_SDK_BUSY" ||
-                result.detail == "ULTRA_ROOT_FAILED:MAPLESU_SDK_INTERRUPTED"
+                result.detail == "ULTRA_ROOT_FAILED:MAPLESU_SDK_INTERRUPTED" ||
+                result.detail == "ULTRA_ROOT_FAILED:MAPLESU_SDK_DEADLINE_EXCEEDED"
             if (!result.commandCompleted && !notSubmitted) runCatching(onFailure)
             RootExecResult(RootBackend.ULTRA_ENV, result.code, result.output, result.detail)
         }
@@ -180,7 +181,7 @@ class RootExecutionRouter(
     private fun executeSelected(script: String, select: () -> List<RootExecutor>): RootExecResult {
         val deadline = PageReadDeadline.currentNanos()
         val budget = deadline?.let { it - System.nanoTime() } ?: TimeUnit.MILLISECONDS.toNanos(1_500L)
-        if (budget <= 0) return RootExecResult(RootBackend.NONE, -1, "", "ROOT_EXECUTION_BUSY")
+        if (budget <= 0) return RootExecResult(RootBackend.NONE, -1007, "", "ROOT_EXECUTION_DEADLINE_EXCEEDED")
         if (Thread.currentThread().isInterrupted) {
             return RootExecResult(RootBackend.NONE, -1, "", "ROOT_EXECUTION_INTERRUPTED")
         }
@@ -190,16 +191,18 @@ class RootExecutionRouter(
         // SDK transports keep their existing exclusive admission.
         if (selected.singleOrNull()?.backend == RootBackend.HOOK) return executeOn(script, selected)
         val lockBudget = deadline?.let { it - System.nanoTime() } ?: budget
-        if (lockBudget <= 0) return RootExecResult(RootBackend.NONE, -1, "", "ROOT_EXECUTION_BUSY")
+        if (lockBudget <= 0) return RootExecResult(RootBackend.NONE, -1007, "", "ROOT_EXECUTION_DEADLINE_EXCEEDED")
         val acquired = try { executionLock.tryLock(lockBudget, TimeUnit.NANOSECONDS) }
         catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
             return RootExecResult(RootBackend.NONE, -1, "", "ROOT_EXECUTION_INTERRUPTED")
         }
-        if (!acquired) return RootExecResult(RootBackend.NONE, -1, "", "ROOT_EXECUTION_BUSY")
+        if (!acquired) return if (deadline != null && deadline - System.nanoTime() <= 0) {
+            RootExecResult(RootBackend.NONE, -1007, "", "ROOT_EXECUTION_DEADLINE_EXCEEDED")
+        } else RootExecResult(RootBackend.NONE, -1, "", "ROOT_EXECUTION_BUSY")
         return try {
             if (deadline != null && deadline - System.nanoTime() <= 0) {
-                RootExecResult(RootBackend.NONE, -1, "", "ROOT_EXECUTION_BUSY")
+                RootExecResult(RootBackend.NONE, -1007, "", "ROOT_EXECUTION_DEADLINE_EXCEEDED")
             } else {
                 // A mode activation or switch may have completed while this request waited.
                 executeOn(script, select())

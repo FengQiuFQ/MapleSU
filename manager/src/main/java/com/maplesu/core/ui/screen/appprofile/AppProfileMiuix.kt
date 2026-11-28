@@ -118,6 +118,9 @@ fun AppProfileScreenMiuix(
                 if (state.isLoading) InfiniteProgressIndicator()
                 else {
                     Text(stringResource(R.string.failed_to_load_app_profile).format(state.appGroup.primary.label))
+                    state.diagnostic?.let {
+                        TextButton(text = stringResource(R.string.ui_polish_diagnostics_show), onClick = actions.onShowDiagnostic)
+                    }
                     TextButton(text = stringResource(R.string.network_retry), onClick = actions.onRetry)
                 }
             }
@@ -159,6 +162,9 @@ fun AppProfileScreenMiuix(
                         affectedApps = state.appGroup.apps,
                         suState = state.suState,
                         isSaving = state.isSaving,
+                        diagnostic = state.diagnostic,
+                        onShowDiagnostic = actions.onShowDiagnostic,
+                        onRetry = actions.onRetry,
                         onProfileChange = actions.onProfileChange,
                     )
                     Spacer(
@@ -189,6 +195,9 @@ private fun AppProfileInner(
     affectedApps: List<SuperUserViewModel.AppInfo> = emptyList(),
     suState: State = State.NOT_AUTHORIZED,
     isSaving: Boolean = false,
+    diagnostic: AppProfileDiagnostic? = null,
+    onShowDiagnostic: () -> Unit = {},
+    onRetry: () -> Unit = {},
     onProfileChange: (Natives.Profile) -> Unit,
 ) {
     val isRootGranted = !isSpecialApp && profile.allowSu
@@ -327,8 +336,13 @@ private fun AppProfileInner(
                     // one place a user can see them for this application.
                     summary = stringResource(if (isSaving) R.string.ui_editing_saving_authorization else suStateLabel(suState)),
                     checked = isRootGranted,
+                    enabled = !isSaving,
                     onCheckedChange = { onProfileChange(profile.copy(allowSu = it)) },
                 )
+                diagnostic?.let { issue ->
+                    BasicComponent(title = issue.title, summary = stringResource(R.string.ui_polish_diagnostics_show), onClick = onShowDiagnostic)
+                    TextButton(text = stringResource(R.string.work_mode_recheck), onClick = onRetry, enabled = !isSaving)
+                }
             }
         }
 

@@ -93,7 +93,7 @@ class UltraRootCommandReceiptTest {
             runner = { calls++; UltraRootCommandReceipt(it, "lost").decode("truncated") },
             running = { true }, onFailure = { invalidations++ },
         )
-        val result = RootExecutionRouter(ultra).execute("write-once")
+        val result = RootExecutionRouter(ultra, modeProvider = { dev.maplesu.manager.workmode.WorkMode.LITE }).execute("write-once")
         assertFalse(result.ok)
         assertEquals("ULTRA_ROOT_COMMAND_RESULT_UNCONFIRMED", result.detail)
         assertEquals(1, calls)
@@ -153,6 +153,83 @@ class UltraRootCommandReceiptTest {
         assertFalse(result.commandCompleted)
         assertEquals(-19999, result.code)
         assertEquals("written", result.output)
+    }
+
+    @Test fun nativeRootStageErrorsAndEffectsSurviveWithoutPrivateReceiptFields() {
+        val command = UltraRootCommandReceipt("private command", "root-diagnostic")
+        val root = org.json.JSONObject().put("error", "-19934").put("phase", 7).put("systemError", 13)
+            .put("rootPhase", "task_state").put("rootError", "-19912").put("rootSystemError", 30)
+            .put("workingDirectoryError", 5).put("vendorChildStatus", 256).put("vendorChildStatusValid", true)
+            .put("rootInvocationKnown", true).put("rootAttempted", true).put("rootReturned", true)
+            .put("rootReportReceived", true).put("ownerMode", true).put("environmentCompleted", false)
+            .put("threadsTotal", 4).put("cpusetMoved", 3).put("stuneMoved", 2).put("cgroupError", 16)
+            .put("credentials", org.json.JSONObject().put("attempted", true).put("replyObserved", true)
+                .put("error", "-19934").put("status", 13).put("effects", 8).put("completed", true)
+                .put("command", 10).put("handle", "private handle").put("result", "private result"))
+            .put("taskState", org.json.JSONObject().put("attempted", true).put("replyObserved", false)
+                .put("error", "-19912").put("status", 30).put("effects", 0).put("completed", false)
+                .put("token", "private token"))
+        val native = dev.maplesu.manager.runtime.ultra.NativeReceipt(1, "maplesu_ultra", 1,
+            "run_root_cmd", false, "ERR_MODULE_OPEN_FILE", -19934, "private reason",
+            org.json.JSONObject().put("result", "partial\n\n").put("rootCommand", root), "private raw")
+        val result = command.decodeSdk(native) { it }
+        assertFalse(result.ok)
+        assertFalse(result.commandCompleted)
+        assertEquals(-19934, result.code)
+        assertEquals("partial\n\n", result.output)
+        for (fact in listOf("error=-19934", "phase=7", "systemError=13", "rootPhase=task_state", "rootError=-19912",
+            "rootSystemError=30", "workingDirectoryError=5", "vendorChildStatus=256", "vendorChildStatusValid=1",
+            "rootAttempted=1", "rootReturned=1", "rootReportReceived=1", "ownerMode=1", "environmentCompleted=0",
+            "threadsTotal=4", "cpusetMoved=3", "stuneMoved=2", "cgroupError=16", "credentials.error=-19934",
+            "credentials.status=13", "credentials.effects=8", "credentials.completed=1", "taskState.error=-19912",
+            "taskState.effects=0", "taskState.completed=0")) {
+            assertTrue("Missing current native fact: $fact", result.detail.split(';').contains(fact))
+        }
+        assertFalse(result.detail.contains("private"))
+        for (field in listOf("command=", "handle=", "result=", "token=", "reason=", "raw=")) {
+            assertFalse(result.detail.contains(field))
+        }
+    }
+
+    @Test fun failedEnvelopeWithoutRootFactsStillKeepsItsOriginalSdkCodeInDetails() {
+        val native = dev.maplesu.manager.runtime.ultra.NativeReceipt(1, "maplesu_ultra", 1,
+            "run_root_cmd", false, "ERR_MODULE_OPEN_FILE", -19934, "private reason", null, "private raw")
+        val result = UltraRootCommandReceipt("id", "sdk-code").decodeSdk(native) { it }
+        assertEquals(-19934, result.code)
+        assertEquals("ULTRA_ROOT_FAILED:ERR_MODULE_OPEN_FILE;sdkCode=-19934", result.detail)
+    }
+
+    @Test fun rootDiagnosticsAcceptOnlyFixedScalarTypesAndBoundedPhases() {
+        val root = org.json.JSONObject().put("phase", "private phase").put("systemError", 1.5)
+            .put("rootPhase", "task_state\nprivate credential").put("rootError", "private error")
+            .put("credentials", org.json.JSONObject().put("error", "-19934").put("effects", "private effects")
+                .put("completed", "true").put("handle", 99))
+        val native = dev.maplesu.manager.runtime.ultra.NativeReceipt(1, "maplesu_ultra", 1,
+            "run_root_cmd", false, "ERR_MODULE_OPEN_FILE", -19934, "private reason",
+            org.json.JSONObject().put("rootCommand", root), "private raw")
+        val result = UltraRootCommandReceipt("id", "typed-facts").decodeSdk(native) { it }
+        assertTrue(result.detail.contains("credentials.error=-19934"))
+        assertFalse(result.detail.contains("private"))
+        for (field in listOf(";phase=", ";systemError=", ";rootPhase=", ";rootError=", ";credentials.effects=",
+            ";credentials.completed=", "handle=")) assertFalse(result.detail.contains(field))
+    }
+
+    @Test fun sdkAdmissionDetailsStayExactForTheRootRouterWithoutNewProbes() {
+        for ((name, code) in listOf("MAPLESU_SDK_BUSY" to -1005, "MAPLESU_SDK_INTERRUPTED" to -1001,
+            "MAPLESU_SDK_DEADLINE_EXCEEDED" to -1007)) {
+            var invalidations = 0
+            var calls = 0
+            val native = dev.maplesu.manager.runtime.ultra.NativeReceipt(1, "maplesu_ultra", 1,
+                "run_root_cmd", false, name, code, "private reason", null, "private raw")
+            val executor = UltraEnvRootExecutor(runner = {
+                calls++; UltraRootCommandReceipt(it, "admission-detail").decodeSdk(native) { value -> value }
+            }, running = { true }, onFailure = { invalidations++ })
+            val result = executor.run("read once")
+            assertEquals(code, result.code)
+            assertEquals("ULTRA_ROOT_FAILED:$name", result.detail)
+            assertEquals(1, calls)
+            assertEquals(0, invalidations)
+        }
     }
 
     @Test fun admissionAndMalformedDiagnosticsKeepTheirOriginalFailureProjection() {

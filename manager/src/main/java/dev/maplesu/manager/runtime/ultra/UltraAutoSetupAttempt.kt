@@ -49,8 +49,8 @@ internal object UltraAutoSetupAttempt {
             return UltraEnvironmentAutoSetup.Result(true, false, "EXCEPTION:${error.javaClass.simpleName}")
         }
         if (!outcome.ok && !outcome.submissionUnknown) port.clearUnsubmitted()
-        runCatchingCancellable { port.refresh() }
         val installed = outcome.ok && outcome.verified
+        if (installed) runCatchingCancellable { port.refresh() }
         return UltraEnvironmentAutoSetup.Result(true, installed, when {
             outcome.submissionUnknown -> "INSTALL_RECONCILIATION_REQUIRED"
             !outcome.ok && outcome.sdkError == "POLICY_BACKEND_PREPARATION_FAILED" ->

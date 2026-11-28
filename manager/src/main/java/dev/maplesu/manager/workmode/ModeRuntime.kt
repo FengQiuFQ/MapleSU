@@ -84,6 +84,10 @@ object ModeRuntime {
     var detectionFailure: String? = null
         private set
 
+    @Volatile
+    var detectionFailureDetail: String? = null
+        private set
+
     val detectionComplete: Boolean get() = detectionSettled.isCompleted
 
     @Volatile
@@ -123,6 +127,7 @@ object ModeRuntime {
     fun recordDetection(result: DetectionResult) {
         lastDetection = result
         detectionFailure = null
+        detectionFailureDetail = null
     }
 
     /** A completed check may legitimately leave the mode unresolved. */
@@ -134,10 +139,14 @@ object ModeRuntime {
     fun beginDetection() {
         detectionSettled = CompletableDeferred()
         detectionFailure = null
+        detectionFailureDetail = null
     }
 
-    fun failBootstrap(code: String) {
+    fun failBootstrap(code: String) = failBootstrap(code, null)
+
+    fun failBootstrap(code: String, detail: String?) {
         detectionFailure = code
+        detectionFailureDetail = detail
         finishDetection()
         (bootstrapHandle?.detection as? CompletableDeferred<DetectionResult>)
             ?.completeExceptionally(IllegalStateException(code))
@@ -281,6 +290,7 @@ object ModeRuntime {
         activated = CompletableDeferred()
         detectionSettled = CompletableDeferred()
         detectionFailure = null
+        detectionFailureDetail = null
         _detectionRevision.value = 0
     }
 }

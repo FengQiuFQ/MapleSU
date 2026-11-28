@@ -320,6 +320,7 @@ namespace {
 std::mutex publication_mutex;
 thread_local unsigned publication_depth = 0;
 thread_local bool publication_fork_locked = false;
+thread_local unsigned publication_fork_depth = 0;
 struct PublicationOperation {
     bool acquired = false;
     PublicationOperation() {
@@ -539,9 +540,20 @@ extern "C" __attribute__((visibility("hidden"))) void maplesu_hook_fork_prepare(
         publication_mutex.lock();
         publication_fork_locked = true;
     }
+    ++publication_fork_depth;
+}
+extern "C" __attribute__((visibility("hidden"))) bool maplesu_hook_try_fork_prepare() noexcept {
+    using namespace kernel_module;
+    if (!publication_depth && !publication_fork_locked) {
+        if (!publication_mutex.try_lock()) { errno = EAGAIN; return false; }
+        publication_fork_locked = true;
+    }
+    ++publication_fork_depth;
+    return true;
 }
 extern "C" __attribute__((visibility("hidden"))) void maplesu_hook_fork_complete() noexcept {
     using namespace kernel_module;
+    if (!publication_fork_depth || --publication_fork_depth) return;
     if (publication_fork_locked) {
         publication_fork_locked = false;
         publication_mutex.unlock();

@@ -15,12 +15,15 @@ data class AppProfileUiState(
     val isLoading: Boolean = false,
     val loadFailed: Boolean = false,
     val isSaving: Boolean = false,
-    // Delivery/wiring truth for this identity, resolved off the main thread by one root
-    // probe. Separate from [profile].allowSu: a grant is not a working `su`.
+    // Current delivery observation from the bounded page read, separate from the saved decision.
     val suState: State = State.NOT_AUTHORIZED,
+    val diagnostic: AppProfileDiagnostic? = null,
 ) {
     val isUidGroup get() = appGroup.apps.size > 1
 }
+
+@Immutable
+data class AppProfileDiagnostic(val title: String, val detail: String)
 
 @Immutable
 data class AppProfileActions(
@@ -32,4 +35,5 @@ data class AppProfileActions(
     val onManageTemplate: () -> Unit,
     val onProfileChange: (Natives.Profile) -> Unit,
     val onRetry: () -> Unit = {},
+    val onShowDiagnostic: () -> Unit = {},
 )

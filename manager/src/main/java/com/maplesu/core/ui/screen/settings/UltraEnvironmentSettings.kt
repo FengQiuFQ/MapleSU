@@ -5,8 +5,10 @@ import android.util.Log
 import android.widget.Toast
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
@@ -103,9 +105,97 @@ internal fun environmentDiagnosticDetail(
     rootProbeDetail: String?,
     detail: String? = null,
     persistedFailure: String? = null,
-): String? = listOf(rootProbeDetail, detail,
+    componentFailureDetail: String? = null,
+): String? = listOf(rootProbeDetail, detail, componentFailureDetail,
     persistedFailure?.takeIf(String::isNotBlank)?.let { "lastFailure=$it" })
-    .filterNotNull().filter(String::isNotBlank).distinct().joinToString("\n").takeIf(String::isNotBlank)
+    .filterNotNull().filter(String::isNotBlank).map(UltraSdkLogging::redact)
+    .distinct().joinToString("\n").takeIf(String::isNotBlank)
+
+internal enum class UltraEnvironmentRecoveryAction { NONE, RESTORE, REPAIR }
+
+/** Fresh admission failures have no publication; they only retire unchanged cached UI evidence. */
+internal fun environmentReadStillCurrent(
+    observation: UltraEnvironmentProbe.Snapshot,
+    publication: UltraEnvironmentProbe.Snapshot,
+    latest: UltraEnvironmentProbe.Snapshot,
+): Boolean = publication === latest && (observation.observedAtElapsedMs < 0 ||
+    observation == publication.copy(managerSuFailureDetail = observation.managerSuFailureDetail))
+
+internal fun environmentRepairEvidence(observation: UltraEnvironmentProbe.Snapshot): Boolean {
+    val detail = observation.detail ?: return false
+    val sdkError = detail.substringAfter("sdkError=", "").substringBefore(';')
+    val sdkCode = detail.substringAfter("sdkErrorCode=", "").substringBefore(';').toIntOrNull()
+    return observation.sdkChannelAvailable && sdkError in setOf("OK", "NONE") && sdkCode == 0 &&
+        (observation.managerOwnerIdentity != null || observation.legacyCredentialFingerprint != null)
+}
+
+/** Missing reads offer manual recovery; only this page's current fault recommends repair. */
+internal fun environmentRecoveryAction(
+    state: UltraEnvironmentProbe.State,
+    kernelRootVerified: Boolean,
+    currentEvidence: Boolean,
+    diagnosticsOnly: Boolean,
+    hookEnvironment: Boolean,
+): UltraEnvironmentRecoveryAction = when {
+    diagnosticsOnly || hookEnvironment -> UltraEnvironmentRecoveryAction.NONE
+    currentEvidence && (state == UltraEnvironmentProbe.State.Fault ||
+        state == UltraEnvironmentProbe.State.NotInstalled && kernelRootVerified) -> UltraEnvironmentRecoveryAction.REPAIR
+    state == UltraEnvironmentProbe.State.Unknown || state == UltraEnvironmentProbe.State.Fault ||
+        state == UltraEnvironmentProbe.State.NotInstalled && kernelRootVerified -> UltraEnvironmentRecoveryAction.RESTORE
+    else -> UltraEnvironmentRecoveryAction.NONE
+}
+
+/** A clicked Home result remains read-only, including when its failed read had no owner. */
+@Composable
+internal fun rememberHomeUltraComponentDiagnostic(enabled: Boolean): String? {
+    if (!enabled) return null
+    val request = UltraComponentDiagnosticRequests.clickedDiagnostic ?: return null
+    val context = LocalContext.current.applicationContext
+    val revision by ModeRuntime.detectionRevision.collectAsStateWithLifecycle()
+    val observation by UltraEnvironmentProbe.observations.collectAsStateWithLifecycle(
+        initialValue = UltraEnvironmentProbe.currentSnapshot())
+    val activation = ModeRuntime.activation
+    val superseded = request.isSupersededBy(activation, revision, null, observation)
+    var detail by remember(request) { mutableStateOf<String?>(null) }
+    LaunchedEffect(request, activation, revision, observation) {
+        val current = withContext(Dispatchers.IO) {
+            val snapshot = UltraEnvironmentProbe.currentSnapshot(context)
+            val changed = request.isSupersededBy(ModeRuntime.activation,
+                ModeRuntime.detectionRevision.value, UltraEnvironmentAutoSetup.currentBootId(), snapshot)
+            val hidden = com.maplesu.core.ui.security.HiddenStartupConfirm.masks(
+                com.maplesu.core.ui.security.LiteHiddenRuntime.currentState(),
+                com.maplesu.core.ui.security.LiteHiddenRuntime.lastKnownOn(), ModeRuntime.active)
+            val pending = com.maplesu.core.ui.security.HiddenStartupConfirm.isPending(context) ||
+                dev.maplesu.manager.workmode.ui.WorkModeSwitchSession.pending ||
+                dev.maplesu.manager.workmode.superuser.LiteImplantQuiesceGate.isBlocked() ||
+                UltraRootKeyStore.isSuspended(context)
+            changed to request.takeUnless { changed || hidden || pending || ModeRuntime.active == WorkMode.KSU }
+        }
+        if (UltraComponentDiagnosticRequests.clickedDiagnostic !== request) return@LaunchedEffect
+        if (current.first) UltraComponentDiagnosticRequests.clear(request)
+        detail = current.second?.let {
+            environmentDiagnosticDetail(it.failureCode?.let { code -> "code=$code" }, it.detail)
+        }
+    }
+    return detail.takeUnless { superseded }
+}
+
+@Composable
+internal fun HomeUltraComponentDiagnosticMiuix(detail: String) {
+    Column {
+        BasicComponent(title = stringResource(R.string.work_mode_open_diagnosis))
+        MiuixText(detail, color = colorScheme.onSurfaceVariantSummary,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+    }
+}
+
+@Composable
+internal fun HomeUltraComponentDiagnosticMaterial(detail: String) {
+    SegmentedListItem(
+        headlineContent = { MaterialText(stringResource(R.string.work_mode_open_diagnosis)) },
+        supportingContent = { MaterialText(detail) },
+    )
+}
 
 /** History is a read-only result; no owner or runtime capability is inferred from it. */
 internal fun savedUltraInstallFailureDiagnostic(
@@ -252,11 +342,21 @@ class UltraEnvironmentPanel internal constructor(
 
     var state by mutableStateOf(seed?.state ?: initialSnapshot.state)
         private set
-    var detail by mutableStateOf(environmentDiagnosticDetail(
-        if (seed != null) seed.detail else environmentDiagnosticDetail(initialSnapshot.rootProbeDetail, initialSnapshot.detail),
+    private var observationDetail by mutableStateOf(environmentDiagnosticDetail(
+        if (seed != null) seed.detail else environmentDiagnosticDetail(initialSnapshot.rootProbeDetail,
+            initialSnapshot.detail, componentFailureDetail = initialSnapshot.managerSuFailureDetail),
         persistedFailure = UltraEnvironmentUpgrade.persistedFailure(context),
     ))
-        private set
+    private var homeDiagnosticDetail by mutableStateOf<String?>(null)
+    private var currentRepairEvidence by mutableStateOf(false)
+    private var repairEvidencePublication: UltraEnvironmentProbe.Snapshot? = null
+    val detail: String? get() = environmentDiagnosticDetail(observationDetail, homeDiagnosticDetail)
+    internal val recoveryAction: UltraEnvironmentRecoveryAction
+        get() = environmentRecoveryAction(state, kernelRootVerified, currentRepairEvidence, diagnosticsOnly, hookEnvironment)
+
+    internal fun updateHomeDiagnostic(detail: String?) {
+        homeDiagnosticDetail = detail
+    }
     var kernelRootVerified by mutableStateOf(seed?.kernelRootVerified ?: initialSnapshot.kernelRootVerified)
         private set
     var version by mutableStateOf(seed?.version)
@@ -289,14 +389,14 @@ class UltraEnvironmentPanel internal constructor(
         if (diagnosticsOnly) {
             withContext(Dispatchers.IO) { currentDiagnosticObservation() }
                 ?.let(UltraComponentDiagnosticRequests::retry)
-        } else applyFacts(readFacts(force = true))
+        } else applyFacts(readFacts())
         ""
     }
 
     fun repairEnvironment() = runAction {
         if (diagnosticsOnly) return@runAction ""
         val result = withContext(Dispatchers.IO) { UltraEnvironmentUpgrade.repairEnvironment(context) }
-        applyFacts(readFacts(force = true))
+        applyFacts(readFacts())
         when (result) {
             UltraEnvironmentUpgrade.Result.SUBMITTED -> context.getString(R.string.ui_d_env_repair_submitted)
             UltraEnvironmentUpgrade.Result.REFUSED -> context.getString(R.string.ui_d_env_repair_refused)
@@ -318,7 +418,7 @@ class UltraEnvironmentPanel internal constructor(
                 "uninstall failed sdkError=${result.sdkError} sdkErrorCode=${result.sdkErrorCode}"))
             context.getString(R.string.ui_d_env_remove_failed)
         } else {
-            applyFacts(readFacts(force = true))
+            applyFacts(readFacts())
             context.getString(R.string.ui_d_env_remove_done)
         }
     }
@@ -330,13 +430,19 @@ class UltraEnvironmentPanel internal constructor(
         }
 
     internal suspend fun observeDiagnostic() {
-        if (!diagnosticsOnly) return
-        val observation = withContext(Dispatchers.IO) { currentDiagnosticObservation() } ?: return
-        state = observation.state
-        detail = environmentDiagnosticDetail(observation.rootProbeDetail, observation.detail,
-            UltraEnvironmentUpgrade.persistedFailure(context))
-        kernelRootVerified = observation.kernelRootVerified
-        observedAtWallClockMs = observation.observedAtWallClockMs
+        val observation = withContext(Dispatchers.IO) {
+            if (diagnosticsOnly) currentDiagnosticObservation() else UltraEnvironmentProbe.currentSnapshot(context)
+        } ?: return
+        if (UltraEnvironmentProbe.currentSnapshot() !== repairEvidencePublication) {
+            currentRepairEvidence = false
+        }
+        observationDetail = environmentDiagnosticDetail(observation.rootProbeDetail, observation.detail,
+            UltraEnvironmentUpgrade.persistedFailure(context), observation.managerSuFailureDetail)
+        if (diagnosticsOnly) {
+            state = observation.state
+            kernelRootVerified = observation.kernelRootVerified
+            observedAtWallClockMs = observation.observedAtWallClockMs
+        }
     }
 
     private fun captureObservation(): () -> Boolean {
@@ -350,7 +456,7 @@ class UltraEnvironmentPanel internal constructor(
         }
     }
     /** 一次读全：减少重组次数，也避免版本行和状态胶囊错开刷新。 */
-    private suspend fun readFacts(force: Boolean = false): Facts = withContext(Dispatchers.IO) {
+    private suspend fun readFacts(): Facts = withContext(Dispatchers.IO) {
         val hook = HookRootExecutor.production(context)
         if (ModeRuntime.active == WorkMode.LITE && UltraSdkCredentials.hookWithoutSdk(context) && hook.available()) {
             val current = captureObservation()
@@ -364,18 +470,23 @@ class UltraEnvironmentPanel internal constructor(
                 current = current,
             )
         }
-        val nextState = runCatching { UltraEnvironmentProbe.refresh(context, force = force) }
-            .onFailure { if (it is kotlinx.coroutines.CancellationException) throw it }
-            .getOrDefault(UltraEnvironmentProbe.State.Unknown)
-        val current = captureObservation()
-        val observation = UltraEnvironmentProbe.currentSnapshot(context)
+        val scopeCurrent = captureObservation()
+        val observation = UltraEnvironmentProbe.observeFresh(context)
+        val publication = UltraEnvironmentProbe.currentSnapshot()
+        val current = {
+            scopeCurrent() && environmentReadStillCurrent(observation, publication,
+                UltraEnvironmentProbe.currentSnapshot())
+        }
+        val detailObservation = if (observation.observedAtElapsedMs >= 0 && current()) publication else observation
         Facts(
-            state = nextState,
+            state = observation.state,
             version = if (current()) readVersion(current) else null,
             observedAt = observation.observedAtWallClockMs,
-            kernelRootVerified = observation.state == nextState && observation.kernelRootVerified,
-            detail = environmentDiagnosticDetail(observation.rootProbeDetail, observation.detail)
-                .takeIf { observation.state == nextState },
+            kernelRootVerified = observation.kernelRootVerified,
+            repairEvidence = environmentRepairEvidence(observation),
+            detail = environmentDiagnosticDetail(detailObservation.rootProbeDetail, detailObservation.detail,
+                componentFailureDetail = detailObservation.managerSuFailureDetail),
+            publication = publication,
             current = current,
         )
     }
@@ -405,7 +516,9 @@ class UltraEnvironmentPanel internal constructor(
         }
         lastFacts = merged
         state = merged.state
-        detail = environmentDiagnosticDetail(merged.detail,
+        repairEvidencePublication = merged.publication
+        currentRepairEvidence = merged.repairEvidence
+        observationDetail = environmentDiagnosticDetail(merged.detail,
             persistedFailure = UltraEnvironmentUpgrade.persistedFailure(context))
         kernelRootVerified = merged.kernelRootVerified
         version = merged.version
@@ -440,7 +553,9 @@ class UltraEnvironmentPanel internal constructor(
         val observedAt: Long,
         val hookEnvironment: Boolean = false,
         val kernelRootVerified: Boolean = false,
+        val repairEvidence: Boolean = false,
         val detail: String? = null,
+        val publication: UltraEnvironmentProbe.Snapshot? = null,
         val current: () -> Boolean,
     )
 
@@ -463,17 +578,20 @@ fun rememberUltraEnvironmentPanel(enabled: Boolean): UltraEnvironmentPanel? {
     if (!enabled) return null
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val panel = remember {
+    val observation by UltraEnvironmentProbe.observations.collectAsStateWithLifecycle(
+        initialValue = UltraEnvironmentProbe.currentSnapshot(context.applicationContext))
+    val panel = remember(observation.modeActivation, observation.managerOwnerIdentity, observation.legacyCredentialFingerprint) {
         UltraEnvironmentPanel(
             context = context.applicationContext,
             scope = scope,
             initialSnapshot = UltraEnvironmentProbe.currentSnapshot(context.applicationContext),
         )
     }
-    val observation by UltraEnvironmentProbe.observations.collectAsStateWithLifecycle(
-        initialValue = UltraEnvironmentProbe.currentSnapshot(context.applicationContext))
     LaunchedEffect(panel, observation.state, observation.kernelRootVerified,
         observation.managerOwnerIdentity, observation.sdkChannelAvailable, observation.detail) { panel.loadInitialState() }
+    LaunchedEffect(panel, observation) {
+        panel.observeDiagnostic()
+    }
     return panel
 }
 
@@ -544,6 +662,7 @@ private fun rememberUltraUninstallChoices(panel: UltraEnvironmentPanel): List<Un
 @Composable
 fun UltraEnvironmentSectionMiuix(panel: UltraEnvironmentPanel, showInstalledKernelUpdate: Boolean = false) {
     val confirmRepair = rememberFaultRepairAction(panel)
+    val repair = panel.recoveryAction == UltraEnvironmentRecoveryAction.REPAIR
     MiuixCard(
         modifier = Modifier
             .padding(top = 12.dp)
@@ -588,13 +707,14 @@ fun UltraEnvironmentSectionMiuix(panel: UltraEnvironmentPanel, showInstalledKern
         if (showInstalledKernelUpdate) InstalledUltraUpgradeRowMiuix()
         if (panel.canShowRepair) {
             BasicComponent(
-                title = stringResource(R.string.ui_d_env_repair_title),
-                summary = stringResource(R.string.ui_d_env_repair_summary),
+                title = stringResource(if (repair) R.string.ui_d_env_repair_title else R.string.ui_d_env_restore_title),
+                summary = stringResource(if (repair) R.string.ui_d_env_repair_summary else R.string.ui_d_env_restore_summary),
                 endActions = {
                     MiuixTextButton(
-                        text = stringResource(R.string.ui_d_env_repair_action),
+                        text = stringResource(if (repair) R.string.ui_d_env_repair_action else R.string.ui_d_env_restore_action),
                         onClick = confirmRepair,
                         enabled = !panel.busy,
+                        modifier = Modifier.heightIn(min = 48.dp),
                     )
                 },
             )
@@ -642,6 +762,7 @@ fun UltraUninstallRowMiuix(panel: UltraEnvironmentPanel) {
 @Composable
 fun UltraEnvironmentRowMaterial(panel: UltraEnvironmentPanel) {
     val confirmRepair = rememberFaultRepairAction(panel)
+    val repair = panel.recoveryAction == UltraEnvironmentRecoveryAction.REPAIR
     val title = stringResource(R.string.ui_d_env_title)
     SegmentedListItem(
         onClick = panel::refresh,
@@ -675,12 +796,12 @@ fun UltraEnvironmentRowMaterial(panel: UltraEnvironmentPanel) {
         SegmentedListItem(
             onClick = confirmRepair,
             enabled = !panel.busy,
-            headlineContent = { MaterialText(stringResource(R.string.ui_d_env_repair_title)) },
-            supportingContent = { MaterialText(stringResource(R.string.ui_d_env_repair_summary)) },
+            headlineContent = { MaterialText(stringResource(if (repair) R.string.ui_d_env_repair_title else R.string.ui_d_env_restore_title)) },
+            supportingContent = { MaterialText(stringResource(if (repair) R.string.ui_d_env_repair_summary else R.string.ui_d_env_restore_summary)) },
             leadingContent = { MaterialIcon(Icons.Rounded.Security, contentDescription = null) },
             trailingContent = {
-                MaterialTextButton(onClick = confirmRepair, enabled = !panel.busy) {
-                    MaterialText(stringResource(R.string.ui_d_env_repair_action))
+                MaterialTextButton(onClick = confirmRepair, enabled = !panel.busy, modifier = Modifier.heightIn(min = 48.dp)) {
+                    MaterialText(stringResource(if (repair) R.string.ui_d_env_repair_action else R.string.ui_d_env_restore_action))
                 }
             },
         )
@@ -690,16 +811,15 @@ fun UltraEnvironmentRowMaterial(panel: UltraEnvironmentPanel) {
 @Composable
 private fun rememberFaultRepairAction(panel: UltraEnvironmentPanel): () -> Unit {
     val dialog = rememberConfirmDialog(onConfirm = { panel.repairEnvironment() })
-    val title = stringResource(R.string.ui_d_env_repair_title)
-    val content = stringResource(R.string.ui_d_env_repair_confirm)
-    val confirm = stringResource(R.string.ui_d_env_repair_action)
+    val repair = panel.recoveryAction == UltraEnvironmentRecoveryAction.REPAIR
+    val title = stringResource(if (repair) R.string.ui_d_env_repair_title else R.string.ui_d_env_restore_title)
+    val content = stringResource(if (repair) R.string.ui_d_env_repair_confirm else R.string.ui_d_env_restore_confirm)
+    val confirm = stringResource(if (repair) R.string.ui_d_env_repair_action else R.string.ui_d_env_restore_action)
     return { if (!panel.busy) dialog.showConfirm(title = title, content = content, confirm = confirm) }
 }
 
 private val UltraEnvironmentPanel.canShowRepair: Boolean
-    get() = !diagnosticsOnly && !hookEnvironment && (state == UltraEnvironmentProbe.State.Fault ||
-        state == UltraEnvironmentProbe.State.Unknown ||
-        state == UltraEnvironmentProbe.State.NotInstalled && kernelRootVerified)
+    get() = recoveryAction != UltraEnvironmentRecoveryAction.NONE
 
 @Composable
 private fun envTagColorsMaterial(panel: UltraEnvironmentPanel): Pair<Color, Color> {
@@ -888,19 +1008,22 @@ fun UltraEnvironmentInstallCardMiuix(panel: UltraEnvironmentInstallPanel, onOpen
                 )
             },
         )
-        Row(
+        FlowRow(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(start = 16.dp, end = 16.dp, bottom = 12.dp),
-            horizontalArrangement = Arrangement.End,
+            horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             if (!panel.detail.isNullOrBlank()) {
-                MiuixTextButton(text = stringResource(R.string.work_mode_open_diagnosis), onClick = onOpenDiagnostics)
+                MiuixTextButton(text = stringResource(R.string.work_mode_open_diagnosis), onClick = onOpenDiagnostics,
+                    modifier = Modifier.heightIn(min = 48.dp))
             }
             MiuixTextButton(
                 text = installActionLabel(panel),
                 onClick = { panel.install() },
                 enabled = !panel.busy,
+                modifier = Modifier.heightIn(min = 48.dp),
             )
         }
     }
@@ -911,18 +1034,23 @@ fun UltraEnvironmentInstallCardMaterial(panel: UltraEnvironmentInstallPanel, onO
     if (!panel.visible) return
     MaterialCard(modifier = Modifier.fillMaxWidth().padding(top = 12.dp)) {
         Column(modifier = Modifier.padding(16.dp)) {
-            MaterialText(stringResource(R.string.ultra_sdk_install_title))
+            MaterialText(stringResource(R.string.ultra_sdk_install_title), style = MaterialTheme.typography.titleMedium)
             MaterialText(
                 installSummary(panel),
-                modifier = Modifier.padding(top = 2.dp),
+                modifier = Modifier.padding(top = 4.dp),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+            FlowRow(modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (!panel.detail.isNullOrBlank()) {
-                    MaterialTextButton(onClick = onOpenDiagnostics) {
+                    MaterialTextButton(onClick = onOpenDiagnostics, modifier = Modifier.heightIn(min = 48.dp)) {
                         MaterialText(stringResource(R.string.work_mode_open_diagnosis))
                     }
                 }
-                MaterialTextButton(onClick = { panel.install() }, enabled = !panel.busy) {
+                MaterialTextButton(onClick = { panel.install() }, enabled = !panel.busy,
+                    modifier = Modifier.heightIn(min = 48.dp)) {
                     MaterialText(installActionLabel(panel))
                 }
             }

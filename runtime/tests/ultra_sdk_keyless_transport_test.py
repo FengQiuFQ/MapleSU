@@ -23,6 +23,9 @@ inputs = [Path(__file__), root / 'runtime/tests/ultra_sdk_keyless_transport_test
         'runtime/maplesu-sdk/sdk/include/module_base_kernel_request.h',
         'runtime/maplesu-sdk/sdk/include/maplesu_request_private.h',
         'runtime/maplesu-sdk/sdk/include/maplesu_request_identity.h',
+        'runtime/maplesu-sdk/sdk/include/maplesu_deadline_private.h',
+        'runtime/maplesu-sdk/sdk/include/maplesu_operation_wait_private.h',
+        'runtime/maplesu-sdk/sdk/include/maplesu_operation_fork_private.h',
         'runtime/ultra/authorization/kernel_read.cpp',
         'runtime/ultra/authorization/kernel_read_metadata.h',
         'runtime/ultra/authorization/request_protocol.h')]]

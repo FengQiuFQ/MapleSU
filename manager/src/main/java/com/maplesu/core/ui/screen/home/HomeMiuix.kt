@@ -4,7 +4,6 @@ import com.maplesu.core.ui.screen.settings.UltraEnvironmentInstallCardMiuix
 import com.maplesu.core.ui.screen.settings.rememberUltraEnvironmentInstallPanel
 import com.maplesu.core.ui.screen.settings.UltraEnvironmentUpdatePanel
 import com.maplesu.core.ui.screen.settings.UltraEnvironmentUpdateCardMiuix
-import com.maplesu.core.ui.screen.settings.ultraEnvironmentLabel
 
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandVertically
@@ -21,7 +20,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.add
-import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -257,20 +256,6 @@ fun HomePagerMiuix(
                                 WarningCard(stringResource(R.string.home_lite_root_failure))
                             }
                         }
-                        if (state.showUltraObservationFailure) {
-                            val summary = stringResource(when (state.ultraObservationFailure) {
-                                HomeEnvironmentFailure.TIMED_OUT -> R.string.home_ultra_observation_timeout_summary
-                                HomeEnvironmentFailure.BUSY -> R.string.home_ultra_observation_busy_summary
-                                HomeEnvironmentFailure.UNCONFIRMED -> R.string.home_ultra_observation_unconfirmed_summary
-                                else -> R.string.home_ultra_observation_failed_summary
-                            })
-                            Column(modifier = sideInset) {
-                                WarningCard(
-                                    message = summary,
-                                    onClick = actions.onOpenEnvironmentSettings,
-                                )
-                            }
-                        }
                         if (state.showEnvironmentRefreshWarning) {
                             val summary = stringResource(when (state.manualEnvironmentFailure) {
                                 HomeEnvironmentFailure.TIMED_OUT -> R.string.home_environment_check_timeout_summary
@@ -293,8 +278,22 @@ fun HomePagerMiuix(
                             actions = actions,
                             flat = flatHome,
                             modifier = Modifier.fillMaxWidth(),
-                            ultraVersionLabel = if (state.ultraBrandVisible) ultraEnvironmentLabel(ultraEnvironment?.version) else null,
+                            ultraVersionLabel = if (state.ultraBrandVisible) ultraEnvironment?.version else null,
                         ) }
+                        if (state.showUltraObservationFailure) {
+                            val summary = stringResource(when (state.ultraObservationFailure) {
+                                HomeEnvironmentFailure.TIMED_OUT -> R.string.home_ultra_observation_timeout_summary
+                                HomeEnvironmentFailure.BUSY -> R.string.home_ultra_observation_busy_summary
+                                HomeEnvironmentFailure.UNCONFIRMED -> R.string.home_ultra_observation_unconfirmed_summary
+                                else -> R.string.home_ultra_observation_failed_summary
+                            })
+                            Column(modifier = sideInset) {
+                                WarningCard(
+                                    message = summary,
+                                    onClick = actions.onOpenEnvironmentSettings,
+                                )
+                            }
+                        }
                         // 「发现 Ultra 环境更新」：紧贴状态卡下方，写法与交互同 KSU 的管理器更新卡。
                         if (ultraEnvironment != null && !showInstalledKernelUpdate) {
                             UltraEnvironmentUpdateCardMiuix(ultraEnvironment, modifier = sideInset)
@@ -441,7 +440,7 @@ internal fun StatusCard(
     // 只影响「未安装 / 不支持」这两张兜底卡；绿色主卡永远是绿色
     flat: Boolean = false,
     modifier: Modifier = Modifier,
-    // Ultra 下的版本行（例如 `MapleSU_Ultra 5.0.5`）；为 null 时沿用原来的版本行。
+    // Ultra 当前版本值；身份名由独立标题显示。
     ultraVersionLabel: String? = null,
 ) {
     // Keep normal content available while automatic observations finish.
@@ -509,7 +508,7 @@ internal fun StatusCard(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Card(
-                        // The large layout stays square; compact content determines its own height.
+                        // The large layout keeps its proportion and grows when text needs more space.
                         colors = CardDefaults.defaultColors(
                             // Green denotes confirmed readiness; artwork takes priority.
                             color = when {
@@ -528,17 +527,10 @@ internal fun StatusCard(
                         modifier = Modifier.fillMaxWidth(),
                     ) {
                         Column {
-                        Box(Modifier.fillMaxWidth().then(
-                            if (decorPrefs.largeCard) Modifier.aspectRatio(StatusDecoration.CARD_ASPECT_RATIO) else Modifier
-                        )) {
+                        BoxWithConstraints(Modifier.fillMaxWidth()) {
+                            val cardMinHeight = homeStatusCardMinHeight(maxWidth, decorPrefs.largeCard)
                             StatusThemeBackdrop(themeArt)
                             val custom = decoration.takeIf { themeArt.file == null }
-                            // 关键:Box 的尺寸得有人撑起来。
-                            // 图片和压暗层都是 matchParentSize(按定义不参与定尺寸),
-                            // 文字又被「只留图片」隐藏后 → Box 塔成 0×0 → 图看不见,
-                            // 而卡底色又是透明(自定义图分支) → 整张卡看起来全透明。
-                            // 这个空占位负责撑尺寸(内在高度为 0,不会把卡撑高)。
-                            if (decorPrefs.largeCard) Spacer(Modifier.fillMaxSize())
                             // 自定义图时给文字加描边:这样即使不压暗也看得清
                             val decorTextStyle = if (custom != null) {
                                 MiuixTheme.textStyles.main.copy(
@@ -601,8 +593,7 @@ internal fun StatusCard(
                             // 自定义图 + 开了"只留图片"→ 文字全部不画
                             if (custom == null || !decorHideText || state.showSafeModeBanner) {
                             Column(
-                                modifier = (if (decorPrefs.largeCard) Modifier.fillMaxSize()
-                                    else Modifier.fillMaxWidth().heightIn(min = 112.dp))
+                                modifier = Modifier.fillMaxWidth().heightIn(min = cardMinHeight)
                                     .padding(horizontal = 16.dp, vertical = 14.dp),
                                 verticalArrangement = Arrangement.SpaceBetween,
                             ) {
@@ -658,12 +649,11 @@ internal fun StatusCard(
                                     )
                                 }
                             }
-                            } else if (!decorPrefs.largeCard) {
-                                Spacer(Modifier.fillMaxWidth().height(112.dp))
+                            } else {
+                                Spacer(Modifier.fillMaxWidth().height(cardMinHeight))
                             }
                             }
                         }
-                        EnvironmentRefreshAction(state.environmentChecking || state.manualEnvironmentChecking, actions.onEnvironmentRetry)
                         }
                     }
                 }
@@ -751,7 +741,6 @@ internal fun StatusCard(
                             }
                         },
                     )
-                    EnvironmentRefreshAction(state.environmentChecking || state.manualEnvironmentChecking, actions.onEnvironmentRetry)
                     }
                 }
             }
@@ -784,7 +773,6 @@ internal fun StatusCard(
                             )
                         }
                     )
-                    EnvironmentRefreshAction(state.environmentChecking || state.manualEnvironmentChecking, actions.onEnvironmentRetry)
                     }
                 }
             }

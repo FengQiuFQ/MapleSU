@@ -4,10 +4,13 @@ import android.content.pm.ApplicationInfo
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -28,26 +31,29 @@ import com.maplesu.core.ksuApp
 import com.maplesu.core.ui.component.SearchStatus
 import com.maplesu.core.ui.screen.superuser.GroupedApps
 import com.maplesu.core.ui.screen.superuser.SuperUserUiState
+import com.maplesu.core.ui.screen.superuser.withoutDeliveryConfirmation
+import com.maplesu.core.ui.screen.superuser.withCurrentDelivery
 import com.maplesu.core.ui.util.PinyinUtil
 import com.maplesu.core.ui.util.ownerNameForUid
 import com.maplesu.core.ui.util.pickPrimary
 import dev.maplesu.manager.runtime.State
+import dev.maplesu.manager.runtime.PageReadDeadline
 import dev.maplesu.manager.runtime.HookRootExecutor
 import dev.maplesu.manager.runtime.HookSuCompatibility
 import dev.maplesu.manager.runtime.RuntimeDeployment
 import dev.maplesu.manager.runtime.managerSuState
 import dev.maplesu.manager.runtime.authorization.DirectPolicy
 import dev.maplesu.manager.runtime.authorization.ManagerAuthorizations
-import dev.maplesu.manager.runtime.ultra.UltraAuthorization
 import dev.maplesu.manager.runtime.ultra.UltraEnvironmentProbe
+import dev.maplesu.manager.runtime.ultra.UltraSdkLogging
 import dev.maplesu.manager.runtime.statesFor
 import dev.maplesu.manager.workmode.ModeActivation
 import dev.maplesu.manager.workmode.ModeRuntime
 import dev.maplesu.manager.workmode.WorkMode
 import java.text.Collator
 import java.util.Locale
-import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.TimeoutException
 
 internal const val RECENTLY_INSTALLED_WINDOW_MILLIS = 60 * 60 * 1000L
 
@@ -138,7 +144,7 @@ class SuperUserViewModel(
                     check(mode != null && ModeRuntime.active == mode && ModeRuntime.activation === activation) {
                         "PAGE_QUERY_CONTEXT_CHANGED"
                     }
-                    cachedApps = apps
+                    cachedApps = apps.map { it.copy() }
                     cachedUserIds = ids
                     cachedAppsActivation = activation
                 }
@@ -165,10 +171,11 @@ class SuperUserViewModel(
     private var sortJob: Job? = null
     private var loadJob: Job? = null
     private val appListRevision = AtomicLong()
+    private var pageDeliveryRead: ManagerAuthorizations.CurrentDeliveryRead? = null
     private val forceRequestRevision = AtomicLong(-1L)
     private val startupLoader = SuperuserStartupLoader(
         currentMode = { ModeRuntime.active },
-        awaitMode = { ModeRuntime.awaitPageMode(15_000L) },
+        awaitMode = { ModeRuntime.awaitPageMode(SUPERUSER_PAGE_TIMEOUT_MILLIS) },
     )
     var isNeedRefresh = false
         private set
@@ -184,10 +191,11 @@ class SuperUserViewModel(
 
     /** Publication can finish after profile/list reads; rebind existing rows without Root work. */
     private suspend fun refreshEntryStates() = refreshMutex.withLock {
-        if (!_uiState.value.hasLoaded || ModeRuntime.active != WorkMode.LITE) return@withLock
+        if (!_uiState.value.hasLoaded || _uiState.value.authorizationReadFailed ||
+            ModeRuntime.active != WorkMode.LITE) return@withLock
         val entryReady = withContext(Dispatchers.IO) {
             if (!ManagerAuthorizations.usesManagerAuthority(ksuApp)) null else {
-                !HookRootExecutor.production(ksuApp).available() || HookSuCompatibility.traditionalReady(ksuApp)
+                if (HookRootExecutor.production(ksuApp).available()) HookSuCompatibility.traditionalReady(ksuApp) else null
             }
         } ?: return@withLock
         if (ModeRuntime.active != WorkMode.LITE) return@withLock
@@ -208,23 +216,24 @@ class SuperUserViewModel(
     private val suStateRevision = AtomicLong()
 
     fun refreshSuState() {
-        // 未判定：只读空态，不发起任何后端调用（suEnabled=null 表示"不知道"）。
-        if (ModeRuntime.active == null) {
-            _uiState.update { it.copy(suEnabled = null) }
-            return
-        }
+        // Page entry and resume join the same read instead of starting a detached probe.
+        loadAppList(resort = false)
+    }
+
+    private suspend fun readSuEnabled(
+        mode: WorkMode?,
+        delivery: ManagerAuthorizations.CurrentDeliveryRead?,
+    ): Pair<Long, Boolean?> {
         val revision = suStateRevision.get()
-        val requestedMode = ModeRuntime.active
-        viewModelScope.launch(Dispatchers.IO) {
-            val probe = dev.maplesu.manager.runtime.ultra.UltraEnvironmentProbe
-            val enabled = if (requestedMode == WorkMode.LITE && probe.usesUltraBackend(ksuApp) &&
-                !dev.maplesu.manager.runtime.authorization.ManagerAuthorizations.usesManagerAuthority(ksuApp)) {
-                probe.suEnabledState(probe.refresh(ksuApp, force = false))
+        val enabled = withContext(Dispatchers.IO) {
+            if (mode == WorkMode.LITE && UltraEnvironmentProbe.usesUltraBackend(ksuApp) &&
+                !ManagerAuthorizations.usesManagerAuthority(ksuApp)) {
+                // The page already obtained this current UID/entry result. Missing proof is
+                // unknown, rather than a disabled global switch or another environment read.
+                true.takeIf { delivery?.isCurrent() == true && delivery.entryConfirmed == true }
             } else settingsRepo.isSuEnabled()
-            _uiState.update {
-                if (suStateRevision.get() == revision && ModeRuntime.active == requestedMode) it.copy(suEnabled = enabled) else it
-            }
         }
+        return revision to enabled
     }
 
     fun enableSu() {
@@ -269,7 +278,8 @@ class SuperUserViewModel(
             val grouped = withContext(Dispatchers.IO) {
                 withSuStates(buildGroups(filterApps(apps)))
             }
-            updateVisibleApps(grouped)
+            updateVisibleApps(if (_uiState.value.authorizationReadFailed)
+                grouped.map { it.withoutDeliveryConfirmation() } else grouped)
         }
     }
 
@@ -337,7 +347,7 @@ class SuperUserViewModel(
                 state.copy(
                     searchResults = emptyList(),
                     searchStatus = state.searchStatus.copy(resultStatus = SearchStatus.ResultStatus.DEFAULT)
-                )
+                ).fenceDelivery()
             }
             return@withLock
         }
@@ -350,13 +360,15 @@ class SuperUserViewModel(
             it.copy(
                 searchResults = result,
                 searchStatus = it.searchStatus.copy(resultStatus = searchResultStatusFor(text, result.isEmpty()))
-            )
+            ).fenceDelivery()
         }
     }
 
     private fun updateCachedGroupedApps(grouped: List<GroupedApps>, activation: ModeActivation) {
         synchronized(groupedAppsLock) {
-            cachedGroupedApps = grouped
+            cachedGroupedApps = grouped.map { group ->
+                group.copy(apps = group.apps.map { it.copy() }, primary = group.primary.copy(), suState = State.NOT_AUTHORIZED)
+            }
             cachedGroupedAppsActivation = activation
         }
     }
@@ -388,7 +400,7 @@ class SuperUserViewModel(
 
     private suspend fun updateVisibleApps(grouped: List<GroupedApps>, resort: Boolean = true) {
         val visible = projectVisibleApps(grouped, resort)
-        _uiState.update { it.withVisibleApps(visible) }
+        _uiState.update { it.withVisibleApps(visible).fenceDelivery() }
     }
 
     /**
@@ -405,7 +417,7 @@ class SuperUserViewModel(
      *   **不调用任何 Lite runtime 方法**（无一次性 root 进程、无 libsu RootService）；
      * - 未判定 / KSU 后端不可用 → 不给断言（默认 NOT_AUTHORIZED），只读空态。
      */
-    private fun withSuStates(groups: List<GroupedApps>): List<GroupedApps> {
+    private fun withSuStates(groups: List<GroupedApps>, deliveryRead: ManagerAuthorizations.CurrentDeliveryRead? = pageDeliveryRead): List<GroupedApps> {
         if (groups.isEmpty()) return groups
         val mode = ModeRuntime.active
         val ksuBackendAvailable = mode == WorkMode.KSU &&
@@ -419,11 +431,11 @@ class SuperUserViewModel(
         }
         if (dev.maplesu.manager.runtime.authorization.ManagerAuthorizations.usesManagerAuthority(ksuApp)) {
             // Read publication once for the page; no root process or target launch per row.
-            val entryReady = !HookRootExecutor.production(ksuApp).available() ||
-                HookSuCompatibility.traditionalReady(ksuApp)
-            return withManagerSuStates(groups, entryReady)
+            if (HookRootExecutor.production(ksuApp).available())
+                return withManagerSuStates(groups, HookSuCompatibility.traditionalReady(ksuApp))
+            return groups.map { it.withCurrentDelivery(deliveryRead) }
         }
-        return withLiteSuStates(groups)
+        return withLiteSuStates(groups, deliveryRead)
     }
 
     private fun withManagerSuStates(groups: List<GroupedApps>, entryReady: Boolean): List<GroupedApps> =
@@ -436,19 +448,14 @@ class SuperUserViewModel(
             ))
         }
 
-    private fun withLiteSuStates(groups: List<GroupedApps>): List<GroupedApps> {
+    private fun withLiteSuStates(groups: List<GroupedApps>, deliveryRead: ManagerAuthorizations.CurrentDeliveryRead? = pageDeliveryRead): List<GroupedApps> {
         if (groups.isEmpty()) return groups
-        // 🟢 Ultra 环境：用户看到的「已授权/未授权」直接来自 SDK 的 su_auth 白名单
-        //    （profile.allowSu 由 `ManagerAuthorizations.profile` 从 [UltraAuthorization] 缓存读出）。
-        //    KerneSU 的投递/PATH 状态机在 Ultra 下不存在，而 `DirectPolicy` / `SuDelivery`
-        //    每一步都会起 root 进程（Ultra 内核上会重启系统），所以这里不进那两条路径。
-        //    映射：在白名单 = WIRED（内核在请求时即放行），否则 NOT_AUTHORIZED。
+        // The page already read the Ultra authority once. Keep its decision separate from
+        // current delivery, without starting a DirectPolicy process or a PATH probe per row.
         if (UltraEnvironmentProbe.usesUltraBackend(ksuApp)) {
-            // A transient SDK probe does not change which backend owns these cached rows.
-            if (!UltraEnvironmentProbe.isRunning()) return groups
-            return groups.map {
-                it.copy(suState = if (it.anyAllowSu) State.WIRED else State.NOT_AUTHORIZED)
-            }
+            // A UID list confirms the decision. The absence of a recorded delivery failure
+            // (including the cold default) does not confirm a traditional su entry.
+            return groups.map { it.withCurrentDelivery(deliveryRead) }
         }
         return runCatching {
             val identities = groups.associate { it.primary.packageName to it.anyAllowSu }
@@ -575,35 +582,42 @@ class SuperUserViewModel(
             _uiState.update { it.copy(isRefreshing = true, error = null) }
 
             repo.getAppList().onSuccess { (newApps, ids) ->
+                val delivery = newApps.firstNotNullOfOrNull { it.currentDeliveryRead }
+                val deliveryError = deliveryFailure(delivery)
                 val (cachedGroups, grouped) = withContext(Dispatchers.IO) {
                     val cached = buildCachedGroups(newApps)
                     val umountByUid = cached.associate { it.uid to it.shouldUmount }
                     val visible = buildGroups(filterApps(newApps)) { umountByUid[it] ?: Natives.uidShouldUmount(it) }
-                    cached to withSuStates(visible)
+                    cached to withSuStates(visible, delivery)
                 }
 
+                val (suRevision, enabled) = readSuEnabled(mode, delivery)
                 val visible = projectVisibleApps(grouped)
+                currentCoroutineContext().ensureActive()
                 if (!currentListRequest(mode, revision, activation)) {
                     discardListRequest(revision)
                     return@onSuccess
                 }
                 // Commit only after the last projection suspension.
                 synchronized(appsLock) {
-                    cachedApps = newApps
+                    cachedApps = newApps.map { it.copy() }
                     cachedUserIds = ids
                     cachedAppsActivation = activation
                 }
                 updateCachedGroupedApps(cachedGroups, activation)
+                pageDeliveryRead = delivery
                 if (BuildConfig.DEBUG) Log.i("MapleSUStartup",
                     "superusers_fetch ready elapsedMs=${android.os.SystemClock.elapsedRealtime() - startupAt} appsCount=${newApps.size}")
                 _uiState.update {
                     it.withVisibleApps(visible).copy(
                         userIds = ids,
+                        suEnabled = if (suStateRevision.get() == suRevision) enabled else it.suEnabled,
                         isRefreshing = false,
                         hasLoaded = true,
-                        error = null,
+                        error = deliveryError,
                         blockedReason = null,
-                    )
+                        authorizationReadFailed = deliveryError != null,
+                    ).fenceDelivery(delivery)
                 }
             }.onFailure { e ->
                 if (BuildConfig.DEBUG) Log.i("MapleSUStartup",
@@ -612,11 +626,12 @@ class SuperUserViewModel(
                 if (currentListRequest(mode, revision, activation)) recordLoadFailure(e) else discardListRequest(revision)
             }
 
-            if (currentListRequest(mode, revision, activation) && _uiState.value.error == null) isNeedRefresh = false
+            if (currentListRequest(mode, revision, activation)) isNeedRefresh = _uiState.value.error != null
         }
     }
 
     private fun recordLoadFailure(error: Throwable) {
+        pageDeliveryRead = null
         val blocked = when (error) {
             is com.maplesu.core.data.repository.SuperUserModeUnresolvedException ->
                 ksuApp.getString(R.string.work_mode_superuser_unresolved)
@@ -626,7 +641,9 @@ class SuperUserViewModel(
         }
         // Preserve both a successful previous list and the cold page's retryability.
         isNeedRefresh = true
-        _uiState.update { it.copy(isRefreshing = false, error = error, blockedReason = blocked) }
+        _uiState.update {
+            it.withoutDeliveryConfirmation().copy(suEnabled = null, isRefreshing = false, error = error, blockedReason = blocked)
+        }
     }
 
     private suspend fun refreshAppList(mode: WorkMode?, revision: Long, activation: ModeActivation, resort: Boolean = true) {
@@ -639,6 +656,8 @@ class SuperUserViewModel(
             if (currentApps.isEmpty()) return
 
             repo.refreshProfiles(currentApps).onSuccess { updatedApps ->
+                val delivery = updatedApps.firstNotNullOfOrNull { it.currentDeliveryRead }
+                val deliveryError = deliveryFailure(delivery)
                 val (cachedGroups, grouped) = withContext(Dispatchers.IO) {
                     val cached = buildCachedGroups(updatedApps)
                     val umountByUid = cached.associate { it.uid to it.shouldUmount }
@@ -653,26 +672,43 @@ class SuperUserViewModel(
                             byUid[group.uid] ?: group.copy(shouldUmount = Natives.uidShouldUmount(group.uid))
                         }
                     }
-                    cached to withSuStates(result)
+                    cached to withSuStates(result, delivery)
                 }
+                val (suRevision, enabled) = readSuEnabled(mode, delivery)
                 val visible = projectVisibleApps(grouped, resort)
+                currentCoroutineContext().ensureActive()
                 if (!currentListRequest(mode, revision, activation)) {
                     discardListRequest(revision)
                     return@onSuccess
                 }
                 synchronized(appsLock) {
-                    cachedApps = updatedApps
+                    cachedApps = updatedApps.map { it.copy() }
                     cachedAppsActivation = activation
                 }
                 updateCachedGroupedApps(cachedGroups, activation)
-                _uiState.update { it.withVisibleApps(visible).copy(isRefreshing = false) }
-                isNeedRefresh = false
+                pageDeliveryRead = delivery
+                _uiState.update { it.withVisibleApps(visible).copy(
+                    suEnabled = if (suStateRevision.get() == suRevision) enabled else it.suEnabled,
+                    isRefreshing = false, error = deliveryError,
+                    blockedReason = null, authorizationReadFailed = deliveryError != null).fenceDelivery(delivery) }
+                isNeedRefresh = _uiState.value.error != null
             }.onFailure { error ->
                 Log.e(TAG, "refreshProfiles failed", error)
                 if (currentListRequest(mode, revision, activation)) recordLoadFailure(error) else discardListRequest(revision)
             }
         }
     }
+
+    private fun deliveryFailure(read: ManagerAuthorizations.CurrentDeliveryRead?): Throwable? {
+        if (read == null) return null
+        val code = read.code ?: read.entryCode ?: "SU_ENTRY_UNCONFIRMED".takeIf { read.entryConfirmed != true }
+            ?: return null
+        return IllegalStateException(UltraSdkLogging.redact(listOf(code, read.detail, read.entryDetail)
+            .filter { it.isNotEmpty() }.joinToString("\n")))
+    }
+
+    private fun SuperUserUiState.fenceDelivery(read: ManagerAuthorizations.CurrentDeliveryRead? = pageDeliveryRead): SuperUserUiState =
+        if (read != null && !read.isCurrent()) withoutDeliveryConfirmation().copy(suEnabled = null, error = deliveryFailure(read)) else this
 
     fun loadAppList(force: Boolean = false, resort: Boolean = true): Job {
         if (force) {
@@ -682,55 +718,64 @@ class SuperUserViewModel(
         loadJob?.takeIf { it.isActive }?.let { return it }
         // React before mode detection; a pending force remains part of this same Job.
         _uiState.update { it.copy(isRefreshing = true, error = null, blockedReason = null) }
-        val job = viewModelScope.launch(start = CoroutineStart.LAZY) {
-            try {
-                var forcePass = force
-                do {
-                    val revision = appListRevision.get()
-                    var requestedMode: WorkMode? = null
-                    var activation = ModeRuntime.activation
-                    try {
-                        val loaded = startupLoader.load(
-                            onWaiting = { _uiState.update { it.copy(suEnabled = null) } },
-                        ) { mode ->
-                            requestedMode = mode
-                            activation = ModeRuntime.activation
-                            initializePreferences()
-                            refreshSuState()
-                            if (forcePass || _uiState.value.groupedApps.isEmpty() || apps.isEmpty()) {
-                                fetchAppList(mode, revision, activation)
-                            } else {
-                                refreshAppList(mode, revision, activation, resort)
-                            }
-                            val failure = _uiState.value.error
-                            if (currentListRequest(mode, revision, activation) && !_uiState.value.hasLoaded &&
-                                (failure is TimeoutException || failure?.message == "HOOK_AUTHORITY_UNAVAILABLE")) {
-                                // Preserve the existing single startup retry; newer requests own a fresh pass.
-                                delay(750L)
-                                if (currentListRequest(mode, revision, activation)) fetchAppList(mode, revision, activation)
-                            }
+        // Capture before dispatch: queueing, mode waiting and coalesced force passes
+        // consume this one absolute deadline, including the repository's IO children.
+        val deadline = PageReadDeadline.context(SUPERUSER_PAGE_TIMEOUT_MILLIS)
+        val job = viewModelScope.launch(deadline, start = CoroutineStart.LAZY) {
+            var forcePass = force
+            do {
+                val revision = appListRevision.get()
+                var requestedMode: WorkMode? = null
+                var activation = ModeRuntime.activation
+                try {
+                    val loaded = startupLoader.load(
+                        onWaiting = { _uiState.update { it.copy(suEnabled = null) } },
+                    ) { mode ->
+                        requestedMode = mode
+                        activation = ModeRuntime.activation
+                        initializePreferences()
+                        if (forcePass || _uiState.value.groupedApps.isEmpty() || apps.isEmpty()) {
+                            fetchAppList(mode, revision, activation)
+                        } else {
+                            refreshAppList(mode, revision, activation, resort)
                         }
-                        if (!loaded && currentListRequest(requestedMode, revision, activation)) {
-                            _uiState.update {
-                                it.copy(
-                                    hasLoaded = false,
-                                    blockedReason = ksuApp.getString(R.string.work_mode_superuser_unresolved),
-                                )
-                            }
-                        }
-                    } catch (e: kotlin.coroutines.cancellation.CancellationException) {
-                        throw e
-                    } catch (e: Throwable) {
-                        Log.e(TAG, "loadAppList failed", e)
-                        if (currentListRequest(requestedMode, revision, activation)) recordLoadFailure(e) else discardListRequest(revision)
                     }
-                    forcePass = forceRequestRevision.get() > revision
-                } while (forcePass)
-            } finally {
-                _uiState.update { it.copy(isRefreshing = false) }
-            }
+                    if (!loaded && currentListRequest(requestedMode, revision, activation)) {
+                        _uiState.update {
+                            it.copy(
+                                hasLoaded = false,
+                                blockedReason = ksuApp.getString(R.string.work_mode_superuser_unresolved),
+                            )
+                        }
+                    }
+                } catch (timeout: TimeoutCancellationException) {
+                    currentCoroutineContext().ensureActive()
+                    val failure = TimeoutException("PAGE_QUERY_TIMEOUT:${SUPERUSER_PAGE_TIMEOUT_MILLIS}ms")
+                        .apply { initCause(timeout) }
+                    if (ModeRuntime.active == requestedMode && ModeRuntime.activation === activation)
+                        recordLoadFailure(failure) else discardListRequest(revision)
+                    return@launch
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Throwable) {
+                    Log.e(TAG, "loadAppList failed", error)
+                    if (currentListRequest(requestedMode, revision, activation)) recordLoadFailure(error) else discardListRequest(revision)
+                }
+                forcePass = forceRequestRevision.get() > revision
+            } while (forcePass)
         }
         loadJob = job
+        // Also release a lazy request cancelled before its body starts. An older completion
+        // never clears a later flight or publishes its observation into that flight.
+        job.invokeOnCompletion { error ->
+            if (loadJob === job) {
+                if (error is CancellationException) {
+                    pageDeliveryRead = null
+                    isNeedRefresh = true
+                    _uiState.update { it.withoutDeliveryConfirmation().copy(suEnabled = null, isRefreshing = false) }
+                } else _uiState.update { it.copy(isRefreshing = false) }
+            }
+        }
         job.start()
         return job
     }

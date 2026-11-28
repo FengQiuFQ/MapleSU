@@ -12,11 +12,12 @@ import dev.maplesu.manager.workmode.WorkMode
  * `activeMode` 就是 [WorkMode.KSU] —— 先激活、接上 KSU 通道，root 才拿得到。
  *
  * 覆盖只发生在两个**终态**上，其余一律交回既有两阶段判定：
- * - [EnvironmentVerdict.KSU_NORMAL] / 继承的 KSU → `MODE_B_KERNEL_ONLY`（激活 KSU）。
- * - [EnvironmentVerdict.NOT_INSTALLED] / 继承的"未安装" → `NOT_INSTALLED`（无 activeMode，
+ * - 本轮 [EnvironmentVerdict.KSU_NORMAL] → `MODE_B_KERNEL_ONLY`（激活 KSU）。
+ * - 本轮 [EnvironmentVerdict.NOT_INSTALLED] → `NOT_INSTALLED`（无 activeMode，
  *   立即终态，不再跑任何 root 探测）。
  * - 当前完整 Ultra owner 只投影为已安装未绑定，不授予 activeMode 或 Root 通道。
- * - 缺少本次 owner 的 [EnvironmentVerdict.ULTRA] / [EnvironmentVerdict.UNKNOWN] → 不覆盖（照常全量判定；
+ * - 历史 [EnvironmentVerdict.INHERITED]、缺少本次 owner 的 [EnvironmentVerdict.ULTRA] /
+ *   [EnvironmentVerdict.UNKNOWN] → 不覆盖（照常全量判定；
  *   UNKNOWN 尤其不得被写成任何结论）。
  */
 object EnvironmentDetectionProjection {
@@ -28,11 +29,7 @@ object EnvironmentDetectionProjection {
         val state = when (outcome.verdict) {
             EnvironmentVerdict.KSU_NORMAL -> ModeState.MODE_B_KERNEL_ONLY
             EnvironmentVerdict.NOT_INSTALLED -> ModeState.NOT_INSTALLED
-            EnvironmentVerdict.INHERITED -> when (outcome.mode) {
-                WorkMode.KSU -> ModeState.MODE_B_KERNEL_ONLY
-                null -> ModeState.NOT_INSTALLED
-                WorkMode.LITE -> return null
-            }
+            EnvironmentVerdict.INHERITED -> return null
             EnvironmentVerdict.ULTRA -> if (outcome.mode == WorkMode.LITE && outcome.ultraOwnerIdentity != null)
                 ModeState.MODE_A_INSTALLED_UNBOUND else return null
             EnvironmentVerdict.UNKNOWN -> return null

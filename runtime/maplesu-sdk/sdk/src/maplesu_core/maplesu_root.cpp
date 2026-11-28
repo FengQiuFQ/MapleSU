@@ -1,25 +1,25 @@
 // MapleSU root implementation.
 //
-#include "maplesu_root_private.h"
+#include <maplesu_root_private.h>
 #include "maplesu_root_command_private.h"
+#include "maplesu_operation_wait_private.h"
+#include "maplesu_operation_fork_private.h"
+#include "../maplesu/compat/fork_legacy_abi.h"
 #include "../maplesu/compat/root_legacy_abi.h"
 
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
 #include <new>
 #include <stdexcept>
 #include <string>
 #include <sys/wait.h>
 #include <unistd.h>
 
-namespace maplesu::sdk {
+namespace default_modules::module_root { KModErr set_current_root(bool); }
 
-// Actual m046 transport exports; do not include its duplicate legacy types.
-bool write_int_from_child(const fork_pipe_info&, int);
-bool read_int_from_child(const fork_pipe_info&, int&);
-bool write_uint64_from_child(const fork_pipe_info&, uint64_t);
-bool read_uint64_from_child(const fork_pipe_info&, uint64_t&);
+namespace maplesu::sdk {
 
 namespace {
 thread_local RootCommandResult last_command;
@@ -60,6 +60,77 @@ int pipe_terminal_error() {
     // m046 retries both errors internally; either may remain when EOF follows.
     const int error = errno;
     return error == EINTR || error == EAGAIN ? 0 : error;
+}
+
+bool open_deadline_shell(const char* command, int& output, pid_t& child) {
+    if (!maplesu::deadline::available()) return false;
+    int descriptors[2];
+    if (pipe2(descriptors, O_CLOEXEC) != 0) return false;
+    maplesu::deadline::ForkAdmission admission;
+    if (fcntl(descriptors[0], F_SETFL, O_NONBLOCK) != 0 || !admission.prepare()) {
+        const int error = errno;
+        close(descriptors[0]); close(descriptors[1]);
+        errno = error;
+        return false;
+    }
+    child = fork();
+    const int fork_error = errno;
+    admission.complete();
+    errno = fork_error;
+    if (child < 0) {
+        const int error = errno;
+        close(descriptors[0]); close(descriptors[1]);
+        errno = error;
+        return false;
+    }
+    if (!child) {
+        close(descriptors[0]);
+        if (setpgid(0, 0) != 0 || dup2(descriptors[1], STDOUT_FILENO) < 0) _exit(127);
+        if (descriptors[1] != STDOUT_FILENO) close(descriptors[1]);
+        else if (fcntl(STDOUT_FILENO, F_SETFD, 0) != 0) _exit(127);
+#ifdef __ANDROID__
+        constexpr const char* shell = "/system/bin/sh";
+#else
+        constexpr const char* shell = "/bin/sh";
+#endif
+        execl(shell, "sh", "-c", command, static_cast<char*>(nullptr));
+        _exit(127);
+    }
+    close(descriptors[1]);
+    output = descriptors[0];
+    return true;
+}
+
+pid_t wait_command_child(pid_t child, int* status, int& error) {
+    const pid_t waited = maplesu::deadline::wait_child(child, status);
+    error = waited < 0 ? errno : 0;
+    if (waited >= 0 || !maplesu_request_operation_deadline_nanos()) return waited;
+    if (error == ETIMEDOUT) {
+        // Cancellation stops this same worker; it never proves rollback of
+        // Root or shell work that has already been submitted.
+        (void)kill(child, SIGKILL);
+        if (waitpid(child, status, WNOHANG) == child) { errno = error; return child; }
+    }
+    errno = error;
+    return -1;
+}
+
+int close_deadline_shell(int& output, pid_t child, int& error) {
+    const int closed = close(output);
+    output = -1;
+    const int close_error = closed < 0 ? errno : 0;
+    int status = -1;
+    const pid_t waited = maplesu::deadline::wait_child(child, &status);
+    error = waited < 0 ? errno : close_error;
+    if (waited == child) return status;
+    if (error == ETIMEDOUT) {
+        // The shell owns a process group so its already-started descendants
+        // are cancelled together. A missing reap remains an unknown status;
+        // the worker's real exit transfers orphan reaping to init.
+        if (kill(-child, SIGKILL) != 0) (void)kill(child, SIGKILL);
+        if (waitpid(child, &status, WNOHANG) == child) return status;
+    }
+    return -1;
 }
 
 void snapshot_root_result(RootCommandResult& result) {
@@ -384,14 +455,13 @@ void receive_command_result(fork_pipe_info& pipe, RootCommandResult& result,
     // A failed read must not leave a child blocked while this parent waits.
     pipe.close_all();
     int status = 0;
-    pid_t waited;
-    do { waited = waitpid(pipe.child_pid, &status, 0); } while (waited < 0 && errno == EINTR);
-    const int wait_error = waited < 0 ? errno : 0;
+    int wait_error = 0;
+    const pid_t waited = wait_command_child(pipe.child_pid, &status, wait_error);
     if (waited == pipe.child_pid) {
         result.child_status = status;
         result.child_status_valid = true;
     }
-    if (waited != pipe.child_pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+    if (wait_error || waited != pipe.child_pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
         transport_failure(result, KModErr::ERR_READ_CHILD_ERRCODE, RootCommandPhase::Wait, wait_error);
 }
 }
@@ -440,6 +510,8 @@ KModErr run_root_cmd(const char* cmd, std::string& out_result) {
     fork_pipe_info pipe;
     if (fork_pipe_child_process(pipe)) {
         FILE* shell = nullptr;
+        int shell_output = -1;
+        pid_t shell_child = -1;
         bool sent = false;
         try {
             result.phase = RootCommandPhase::Root;
@@ -462,18 +534,28 @@ KModErr run_root_cmd(const char* cmd, std::string& out_result) {
             if (is_ok(result.error)) {
                 result.phase = RootCommandPhase::Popen;
                 errno = 0;
-                shell = popen(shell_cmd.c_str(), "r");
-                if (!shell) command_failure(result, KModErr::ERR_MODULE_OPEN_FILE, result.phase, errno);
+                const bool bounded = maplesu_request_operation_deadline_nanos() != 0;
+                if (bounded) (void)open_deadline_shell(shell_cmd.c_str(), shell_output, shell_child);
+                else shell = popen(shell_cmd.c_str(), "r");
+                if (!shell && shell_output < 0)
+                    command_failure(result, KModErr::ERR_MODULE_OPEN_FILE, result.phase, errno);
                 else {
                     result.phase = RootCommandPhase::Read;
                     errno = 0;
-                    const int fd = fileno(shell);
+                    const int fd = shell ? fileno(shell) : shell_output;
                     if (fd < 0) command_failure(result, KModErr::ERR_MODULE_READ_FILE, result.phase, errno);
                     else for (;;) {
+                        if (!maplesu::deadline::available()) {
+                            command_failure(result, KModErr::ERR_MODULE_READ_FILE, result.phase, errno);
+                            break;
+                        }
                         char bytes[1024];
                         const ssize_t count = read(fd, bytes, sizeof(bytes));
                         if (count < 0) {
                             if (errno == EINTR) continue;
+                            if (bounded && errno == EAGAIN) {
+                                if (maplesu::deadline::wait_fd(fd, POLLIN)) continue;
+                            }
                             // popen supplies a blocking descriptor; EAGAIN is
                             // an actual read failure, not an unbounded spin.
                             command_failure(result, KModErr::ERR_MODULE_READ_FILE, result.phase, errno);
@@ -497,6 +579,12 @@ KModErr run_root_cmd(const char* cmd, std::string& out_result) {
             result.shell_status = pclose(shell);
             result.shell_error = result.shell_status < 0 ? errno : 0;
             if (result.shell_status < 0 || !WIFEXITED(result.shell_status) ||
+                WEXITSTATUS(result.shell_status) != 0)
+                command_failure(result, KModErr::ERR_READ_CHILD_ERRCODE, RootCommandPhase::Pclose, result.shell_error);
+        } else if (shell_child > 0) {
+            result.shell_close_attempted = true;
+            result.shell_status = close_deadline_shell(shell_output, shell_child, result.shell_error);
+            if (result.shell_error || result.shell_status < 0 || !WIFEXITED(result.shell_status) ||
                 WEXITSTATUS(result.shell_status) != 0)
                 command_failure(result, KModErr::ERR_READ_CHILD_ERRCODE, RootCommandPhase::Pclose, result.shell_error);
         }

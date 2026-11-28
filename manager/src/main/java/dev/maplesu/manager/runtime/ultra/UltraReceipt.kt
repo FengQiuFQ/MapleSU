@@ -42,7 +42,7 @@ data class NativeReceipt(
             val error = when {
                 result == null -> "MAPLESU_ROOT_CHANNEL_UNAVAILABLE"
                 result.timedOut -> "MAPLESU_ROOT_COMMAND_TIMEOUT"
-                result.failure != null -> "MAPLESU_ROOT_COMMAND_IO_FAILURE"
+                result.failure != null || result.cleanupPending || result.cleanupFailure != null -> "MAPLESU_ROOT_COMMAND_IO_FAILURE"
                 result.exitCode != 0 -> "MAPLESU_ROOT_COMMAND_EXIT"
                 else -> "OK"
             }
@@ -53,6 +53,11 @@ data class NativeReceipt(
                 .put("resultBytes", output.toByteArray(Charsets.UTF_8).size)
                 .put("exitCode", result?.exitCode ?: -1)
                 .put("timedOut", result?.timedOut == true)
+                .put("cleanupPending", result?.cleanupPending == true)
+                .put("cleanupFailure", result?.cleanupFailure?.let { failure ->
+                    failure.takeIf { it.matches(Regex("[A-Z][A-Z0-9_]{0,63}(?::[A-Za-z][A-Za-z0-9]{0,63})?")) }
+                        ?: "PROCESS_CLEANUP_FAILED"
+                })
             val raw = JSONObject().put("schemaVersion", 1).put("backend", UltraRuntimeClient.BACKEND)
                 .put("bridgeVersion", 0).put("operation", "run_root_cmd").put("ok", error == "OK")
                 .put("sdkError", error).put("sdkErrorCode", if (error == "OK") 0 else -1001)
@@ -93,6 +98,9 @@ data class NativeReceipt(
 
         /** A receipt for the case where the bridge never ran (load failure, exception). */
         fun bridgeFailure(operation: String, error: String, detail: String?): NativeReceipt =
+            bridgeFailure(operation, error, detail, -1001)
+
+        internal fun bridgeFailure(operation: String, error: String, detail: String?, code: Int): NativeReceipt =
             NativeReceipt(
                 schemaVersion = 1,
                 backend = UltraRuntimeClient.BACKEND,
@@ -100,7 +108,7 @@ data class NativeReceipt(
                 operation = operation,
                 ok = false,
                 sdkError = error,
-                sdkErrorCode = -1001,
+                sdkErrorCode = code,
                 reason = detail,
                 data = null,
                 raw = JSONObject()
@@ -109,7 +117,7 @@ data class NativeReceipt(
                     .put("operation", operation)
                     .put("ok", false)
                     .put("sdkError", error)
-                    .put("sdkErrorCode", -1001)
+                    .put("sdkErrorCode", code)
                     .put("reason", detail ?: "")
                     .toString(),
             )
@@ -237,4 +245,73 @@ data class UltraReceipt(
             unknowns = unknowns,
         )
     }
+}
+
+private fun JSONObject.uidReadInteger(name: String, range: LongRange): String? =
+    when (val value = opt(name)) {
+        is Byte, is Short, is Int, is Long -> value.toString().toLongOrNull()?.takeIf { it in range }?.toString()
+        else -> null
+    }
+
+private fun JSONObject.uidReadUint(name: String): String? = uidReadInteger(name, 0L..0xffffffffL)
+private fun JSONObject.uidReadSint(name: String): String? =
+    uidReadInteger(name, Int.MIN_VALUE.toLong()..Int.MAX_VALUE.toLong())
+private fun JSONObject.uidReadBoolean(name: String): String? = (opt(name) as? Boolean)?.toString()
+private fun JSONObject.uidReadDecimal(name: String, unsigned: Boolean = false): String? =
+    (opt(name) as? String)?.takeIf { value ->
+        if (unsigned) value.toULongOrNull()?.toString() == value else value.toLongOrNull()?.toString() == value
+    }
+
+/** Fixed public scalars only; this read diagnosis never establishes identity or delivery. */
+internal fun NativeReceipt.uidReadDiagnosticSummary(): String {
+    if (operation != "get_su_uid_profiles") return "uidRead=false"
+    val json = data?.opt("uidReadResult") as? JSONObject ?: return "uidRead=false"
+    if (json.uidReadUint("schemaVersion") != "1") return "uidRead=false"
+    val available = json.opt("operationResultAvailable") as? Boolean ?: return "uidRead=false"
+    val result = json.uidReadDecimal("resultCode") ?: return "uidRead=false"
+    val phase = json.uidReadUint("primaryPhase") ?: return "uidRead=false"
+    val errno = json.uidReadSint("primaryErrno") ?: return "uidRead=false"
+    val mode = json.uidReadUint("authMode") ?: return "uidRead=false"
+    val count = json.uidReadUint("recordCount") ?: return "uidRead=false"
+    val transport = json.opt("transport") as? JSONObject ?: return "uidRead=false"
+    val status = transport.uidReadUint("status") ?: return "uidRead=false"
+    val transportErrno = transport.uidReadSint("errno") ?: return "uidRead=false"
+    val childWait = transport.uidReadSint("childWaitStatus") ?: return "uidRead=false"
+    val valid = transport.uidReadBoolean("valid") ?: return "uidRead=false"
+    fun step(name: String): String? {
+        val value = json.opt(name) as? JSONObject ?: return null
+        val code = value.uidReadDecimal("code") ?: return null
+        val systemErrno = value.uidReadSint("systemErrno") ?: return null
+        val completed = value.uidReadBoolean("completed") ?: return null
+        return " ${name}Code=$code ${name}SystemErrno=$systemErrno ${name}Completed=$completed"
+    }
+    val payload = if (available) {
+        val root = step("root") ?: return "uidRead=false"
+        val read = step("read") ?: return "uidRead=false"
+        val close = step("close") ?: return "uidRead=false"
+        val back = json.opt("readback") as? JSONObject ?: return "uidRead=false"
+        val code = back.uidReadDecimal("code") ?: return "uidRead=false"
+        val systemErrno = back.uidReadSint("systemErrno") ?: return "uidRead=false"
+        val readPhase = back.uidReadUint("phase") ?: return "uidRead=false"
+        val capabilities = back.uidReadDecimal("capabilities", unsigned = true) ?: return "uidRead=false"
+        val revision = back.uidReadDecimal("revision", unsigned = true) ?: return "uidRead=false"
+        val readCount = back.uidReadUint("count") ?: return "uidRead=false"
+        val schema = back.uidReadUint("schema") ?: return "uidRead=false"
+        val management = back.opt("management") as? JSONObject ?: return "uidRead=false"
+        val managementStatus = management.uidReadSint("status") ?: return "uidRead=false"
+        val effects = management.uidReadUint("effects") ?: return "uidRead=false"
+        val managementResult = management.uidReadDecimal("result", unsigned = true) ?: return "uidRead=false"
+        val command = management.uidReadUint("command") ?: return "uidRead=false"
+        val completed = management.uidReadBoolean("completed") ?: return "uidRead=false"
+        val hasHandle = management.uidReadBoolean("hasHandle") ?: return "uidRead=false"
+        root + read + close + " readbackCode=$code readbackSystemErrno=$systemErrno readbackPhase=$readPhase" +
+            " capabilities=$capabilities revision=$revision count=$readCount schema=$schema" +
+            " managementStatus=$managementStatus managementEffects=$effects managementResult=$managementResult" +
+            " managementCommand=$command managementCompleted=$completed managementHasHandle=$hasHandle"
+    } else {
+        if (listOf("root", "read", "close", "readback").any(json::has)) return "uidRead=false"
+        ""
+    }
+    return "uidRead=true available=$available result=$result phase=$phase errno=$errno authMode=$mode recordCount=$count" +
+        " transport=$status transportErrno=$transportErrno childWait=$childWait childWaitStatusValid=$valid" + payload
 }

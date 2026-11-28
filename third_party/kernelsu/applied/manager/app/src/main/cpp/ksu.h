@@ -18,6 +18,9 @@ uint32_t get_manager_uapi_version();
 
 uint32_t get_version();
 
+// One current response: 0 on success, -errno on failure with zeroed fields.
+int get_current_info(struct ksu_get_info_cmd &info);
+
 bool uid_should_umount(int uid);
 
 bool is_safe_mode();

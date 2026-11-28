@@ -50,7 +50,7 @@ class EnvironmentProbesAdapter(
 
     private val readinessProbe = SuReadinessProbeAdapter(context)
 
-    /** 「有内核在响应」的只读探针（APK 自带 ksud `debug info`，不解互锁的 root 通道）。 */
+    /** 当前明确外来分支的只读探针（APK 自带 ksud `debug info`）。 */
     private val foreignKsuProbe = ForeignKsuProbe(context)
 
     init {
@@ -156,10 +156,10 @@ class EnvironmentProbesAdapter(
     }
 
     /**
-     * 只读地确认"有没有内核在响应"。
+     * 只读地确认当前内核是否明确属于本项目模式以外的分支。
      *
-     * 与 [ksuNormal] 互补：后者回答"是不是 MapleSU_Normal"，依赖 JNI；本端口回答
-     * "这台机器上有没有 KSU 内核"，走 APK 自带 ksud。二者都为 null 才允许落到 UNKNOWN。
+     * 与 [ksuNormal] 互补：本端口使用 APK 自带 ksud 的内核 UAPI 与认主字段，
+     * 同分支未认主或 legacy 回执不构成外来证据，保持 UNKNOWN。
      */
     override fun foreignKsuKernel(): Boolean? {
         val answer = foreignKsuProbe.kernelResponds(fresh = freshIdentity)

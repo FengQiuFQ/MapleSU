@@ -162,12 +162,33 @@ object Natives {
         NativesFacadeTarget.BLOCKED -> NativesFacade.blockedPort().getAppProfile(key, uid)
     }
 
-    internal fun getAppProfileFresh(key: String?, uid: Int): Profile? = when (NativesFacade.target()) {
-        NativesFacadeTarget.LITE -> runCatching {
-            ManagerAuthorizations.profile(ksuApp, key, uid, forceRefresh = true)
-        }.getOrNull()
-        NativesFacadeTarget.KSU -> NativesFacade.ksuPort().getAppProfile(key, uid)
-        NativesFacadeTarget.BLOCKED -> NativesFacade.blockedPort().getAppProfile(key, uid)
+    internal data class ProfileReadResult(
+        val profile: Profile?,
+        val deliveryConfirmed: Boolean? = null,
+        val code: String? = null,
+        val detail: String = "",
+        val entryConfirmed: Boolean? = null,
+    )
+
+    internal fun getAppProfileFresh(key: String?, uid: Int): Profile? =
+        getAppProfileFreshDetailed(key, uid).profile
+
+    internal fun getAppProfileFreshDetailed(key: String?, uid: Int): ProfileReadResult = runCatching {
+        when (NativesFacade.target()) {
+            NativesFacadeTarget.LITE -> ManagerAuthorizations.profileDetailed(ksuApp, key, uid)
+            NativesFacadeTarget.KSU -> {
+                val profile = NativesFacade.ksuPort().getAppProfile(key, uid)
+                    ?.takeIf { it.currentUid == uid && it.name == key }
+                val read = profile?.currentReadCode
+                ProfileReadResult(profile, deliveryConfirmed = read == 0,
+                    code = "PROFILE_CURRENT_READ_FAILED".takeUnless { read == 0 },
+                    detail = profile?.let { "ioctlStatus=${it.currentReadCode}; errno=${it.currentReadErrno}" }.orEmpty())
+            }
+            NativesFacadeTarget.BLOCKED -> ProfileReadResult(null, code = "PROFILE_BACKEND_UNAVAILABLE")
+        }
+    }.getOrElse {
+        ProfileReadResult(null, code = "PROFILE_READ_EXCEPTION",
+            detail = listOfNotNull(it.javaClass.simpleName, it.message).joinToString(": "))
     }
 
     internal data class ProfileWriteResult(
@@ -335,6 +356,17 @@ object Natives {
 
         val flags: Long = FLAG_KSU_NO_NEW_PRIVS,
     ) : Parcelable {
+        /** This getter's ioctl result only; it is never copied or persisted with the profile. */
+        @kotlinx.parcelize.IgnoredOnParcel
+        @kotlinx.serialization.Transient
+        @JvmField
+        internal var currentReadCode: Int = Int.MIN_VALUE
+
+        @kotlinx.parcelize.IgnoredOnParcel
+        @kotlinx.serialization.Transient
+        @JvmField
+        internal var currentReadErrno: Int = 0
+
         @Keep
         enum class RootProfileFlag(val display: String, val desc: Int) {
             NO_NEW_PRIVS(

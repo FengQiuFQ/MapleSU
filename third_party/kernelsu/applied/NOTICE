@@ -32,9 +32,10 @@ f4603d14bd7f3bf21206d6f7c622ddf1c049ade3）逐字节复制后，按 `patches/7k/
   - 0025-target-kernel-kmi.patch  (sha256 8bfd88fd26dd9b2a883edff01b792f90733e744fd3313e9cba3e060b84128c41)
   - 0026-module-install-transaction.patch  (sha256 23545696208d6ed5bf77324406f5bde7e96e0f11e83b8519938fed6db5fce334)
   - 0027-module-removal-transaction.patch  (sha256 1e691c3e162b8d422484380fa4f525cd92d8ce59bdc620d174d3d594c600678d)
+  - 0028-native-current-info.patch  (sha256 bcec656b1abc3d18bd17c30dc60978c9d4dde49223b20f4bb614992d7e1cae4a)
 
-补丁序列聚合哈希：8c4378727233580fa58b33ddc9de76df8e8fd2bdaa199144a97f498bf73735ed
-补丁序列文件哈希：b33042f04e7e19b2f85c305bc82eaa63589bf74ceb5094d27dc84e0599fcd9e3
+补丁序列聚合哈希：ff4a77815370bf588c93bb2f9db55b071c3b093a69f0ba056a088e50c8ba566a
+补丁序列文件哈希：91a318716efe54fce84ffaa5bcb79862b0d9204807cd2ae8323f949e1556f1cf
 upstream 快照树哈希：见 third_party/kernelsu/manifest.json（upstream.treeSha256）
 
 许可证

@@ -83,6 +83,18 @@ class LiteHiddenStateReaderTest {
         assertTrue(Thread.currentThread().isInterrupted)
     }
 
+    @Test fun expiredAdmissionStopsWithoutAnotherReadOrAnOffState() {
+        var calls = 0
+        val failure = "ULTRA_ROOT_FAILED:MAPLESU_SDK_DEADLINE_EXCEEDED"
+        val read = LiteHiddenStateReader.read(
+            execute = { calls++; RootExecResult(RootBackend.ULTRA_ENV, -1007, "", failure) },
+            pause = { fail("An expired request must not back off or replay") },
+        )
+        assertEquals(1, calls)
+        assertEquals(LiteHiddenState.UNKNOWN, read.state)
+        assertEquals(failure, read.failure)
+    }
+
     @Test fun backendStateReadUsesTheSameMissingAndInvalidSemanticsAsThePage() {
         val state = RootFileHiddenState(HiddenRootRunner { RecoveryCommandResult(0, "LITE_MISSING\n") })
         assertEquals(false, state.read())

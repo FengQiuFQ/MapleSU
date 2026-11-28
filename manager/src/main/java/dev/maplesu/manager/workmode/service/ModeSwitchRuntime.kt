@@ -15,6 +15,7 @@ import dev.maplesu.manager.ultrakernel.UltraKernelFlow
 import dev.maplesu.manager.ultrakernel.UltraKernelContextAssets
 import dev.maplesu.manager.modules.UltraRootKeyStore
 import dev.maplesu.manager.installer.RootScriptResult
+import dev.maplesu.manager.runtime.PageReadDeadline
 import dev.maplesu.manager.runtime.RootExecResult
 import dev.maplesu.manager.workmode.storage.AndroidModeSwitchDataPaths
 import dev.maplesu.manager.workmode.switch.CandidateResult
@@ -91,6 +92,11 @@ object ModeSwitchRuntime {
             val pinnedRoot = ModeSwitchRootPin(rootSession::ensureReady, rootSession::execute,
                 rootSession::uninstallUltra, rootSession::acquire, rootSession::release)
             val durableRoot: (String) -> RootExecResult = pinnedRoot::execute
+            val statusRoot: (String) -> RootExecResult = { script ->
+                PageReadDeadline.onWorker(PageReadDeadline.limitNanos(1_500L)) {
+                    pinnedRoot.observe(script) { RootExec.execute(appContext, it) }
+                }
+            }
             val authorizationRunner = dev.maplesu.manager.workmode.superuser.RootScriptRunner { script ->
                 val result = durableRoot(script)
                 dev.maplesu.manager.workmode.superuser.RootScriptResult(result.code, result.output)
@@ -105,10 +111,10 @@ object ModeSwitchRuntime {
             val pathsFor: (WorkMode) -> List<dev.maplesu.manager.workmode.storage.MoveEntry> = { mode ->
                 checkNotNull(frozenPaths) { "SWITCH_DATA_PATHS_NOT_FROZEN" }.entries(mode)
             }
-            val runtimeClient = client ?: buildClient(appContext, root, durableRoot)
+            val runtimeClient = client ?: buildClient(appContext, root, durableRoot, statusRoot)
             val ordinaryClient = if (client != null) runtimeClient else ServiceResumeModeSwitchClient(
                 runtimeClient, ServiceClientModeSwitchClient(appContext),
-            ) { hasServiceHistory(durableRoot) }
+            ) { hasServiceHistory(statusRoot) }
             val producers = buildMap<WorkMode, SwitchCandidateProducer> {
                 buildLiteProducer(appContext)?.let { put(WorkMode.LITE, it) }
                 put(WorkMode.KSU, KsuSwitchCandidateProducer(
@@ -283,6 +289,7 @@ object ModeSwitchRuntime {
         context: Context,
         appWorkRoot: File,
         runner: (String) -> RootExecResult,
+        statusRunner: (String) -> RootExecResult,
     ): UltraRootModeSwitchClient {
         val recovery = ModeSwitchSourceRecovery(
             assets = UltraKernelContextAssets(context),
@@ -298,6 +305,7 @@ object ModeSwitchRuntime {
         )
         return UltraRootModeSwitchClient(
             runner = runner,
+            statusRunner = statusRunner,
             workRoot = File(ControlPaths.ROOT),
             logger = { line -> Log.i(TAG, line) },
             // 导出目标只允许落在 App 自己的切换工作目录（facade 传入的文件都在这里）。

@@ -63,9 +63,12 @@ class DefaultModeDetector(
         }
         val credentialPresent = liteProbeResult.first
         val ultraStarted = clock.nowMillis()
+        // Ultra's read-only KSU compatibility FD also reports a positive version
+        // with uapi=0. That receipt permits a current owner query, never a Root attempt.
+        val legacyKsuIdentityUnknown = ksu.responded && !ksu.isManager && ksu.uapi <= 0
         val ultra = runCatching { ultraPort.observe(
             allowRefresh = request.allowLiteExecutor && !ksu.responded,
-            allowOwnerQuery = !ksu.responded,
+            allowOwnerQuery = !ksu.responded || legacyKsuIdentityUnknown,
         ) }
             .getOrDefault(UltraEnvironmentObservation(UltraState.UNKNOWN))
         val ultraState = ultra.state
@@ -115,7 +118,7 @@ class DefaultModeDetector(
         )
 
         // R6 already determines the mode; control-plane reads are separate recovery work.
-        val ownerOnlyDecisive = !ksu.responded && !ultraConfirmed &&
+        val ownerOnlyDecisive = (!ksu.responded || legacyKsuIdentityUnknown) && !ultraConfirmed &&
             ultra.managerOwnerBound && handshakeOk != true && !jailbreakLeaseValid
         val ultraIdentityDecisive = !ksu.responded && ultraConfirmed || ownerOnlyDecisive
         // 阶段 2：只在"已确认通道"上取证。

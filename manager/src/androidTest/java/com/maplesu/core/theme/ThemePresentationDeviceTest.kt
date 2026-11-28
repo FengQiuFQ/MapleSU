@@ -10,7 +10,13 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.text.TextLayoutResult
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.assertIsNotEnabled
@@ -33,6 +39,8 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTextReplacement
+import androidx.compose.ui.test.performSemanticsAction
+import androidx.compose.ui.test.getUnclippedBoundsInRoot
 import androidx.compose.ui.test.captureToImage
 import androidx.compose.ui.graphics.toPixelMap
 import androidx.compose.ui.graphics.toArgb
@@ -91,6 +99,8 @@ class ThemePresentationDeviceTest(private val initialSkin: UiMode, private val d
     private var renderedWallpaperStyle: ThemeWallpaperStyle? = null
     private val counts = mutableStateOf(ThemeHomeCounts(7,11))
     private val rootReady = mutableStateOf(true)
+    private val largeText = mutableStateOf(false)
+    private var environmentRetryClicks = 0
 
     @Before fun resetFixture() {
         val arguments = InstrumentationRegistry.getArguments()
@@ -415,7 +425,69 @@ class ThemePresentationDeviceTest(private val initialSkin: UiMode, private val d
         }
     }
 
-    private fun assertThreeCardGeometry() {
+    @Test fun homeCardsKeepAllTextAndRetryReachableOnNarrowScreensWithLargeFonts() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        largeText.value = true
+        page.value = "home"
+        render()
+        val viewport = compose.onNodeWithTag("home-test-viewport").getUnclippedBoundsInRoot()
+        val viewportWidth = viewport.right - viewport.left
+        assertTrue("The actual Home viewport must be at most 320dp wide", viewportWidth > 0.dp && viewportWidth <= 320.dp)
+        for (layout in ThemeHomeLayout.entries) {
+            runBlocking { ThemeRepository(context).homeLayout(layout) }
+            val cardTag = if (layout == ThemeHomeLayout.Three) "home-three" else "home-original-status"
+            compose.onNodeWithTag(cardTag).performScrollTo().assertIsDisplayed()
+            val title = compose.onNodeWithText(text(R.string.work_mode_ksu), useUnmergedTree = true)
+            title.performScrollTo().assertIsDisplayed()
+            val layouts = mutableListOf<TextLayoutResult>()
+            title.performSemanticsAction(SemanticsActions.GetTextLayoutResult) { it(layouts) }
+            val measured = layouts.single()
+            org.junit.Assert.assertEquals(2f, measured.layoutInput.density.fontScale, .001f)
+            assertTrue("The complete mode name must fit its measured text layout", !measured.hasVisualOverflow)
+            repeat(measured.lineCount) { line ->
+                assertTrue("The mode name must not be ellipsized", !measured.isLineEllipsized(line))
+            }
+            val titleBounds = title.getUnclippedBoundsInRoot()
+            val cardBounds = compose.onNodeWithTag(cardTag).getUnclippedBoundsInRoot()
+            assertTrue("The mode name must stay inside its card", titleBounds.left >= cardBounds.left &&
+                titleBounds.right <= cardBounds.right && titleBounds.top >= cardBounds.top && titleBounds.bottom <= cardBounds.bottom)
+            val cardText = compose.onAllNodes(hasAnyAncestor(hasTestTag(cardTag)) and
+                SemanticsMatcher.keyIsDefined(SemanticsActions.GetTextLayoutResult), useUnmergedTree = true)
+            val textCount = cardText.fetchSemanticsNodes().size
+            assertTrue("The real card must expose its mode, details and refresh text", textCount >=
+                if (layout == ThemeHomeLayout.Three) 7 else 4)
+            repeat(textCount) { index ->
+                val node = cardText[index]
+                node.performScrollTo().assertIsDisplayed()
+                val results = mutableListOf<TextLayoutResult>()
+                node.performSemanticsAction(SemanticsActions.GetTextLayoutResult) { it(results) }
+                results.forEach { result ->
+                    assertTrue("Every card label must fit at 200% font scale: ${result.layoutInput.text}", !result.hasVisualOverflow)
+                    repeat(result.lineCount) { line ->
+                        assertTrue("Card labels must stay complete: ${result.layoutInput.text}", !result.isLineEllipsized(line))
+                    }
+                }
+                val bounds = node.getUnclippedBoundsInRoot()
+                val currentCardBounds = compose.onNodeWithTag(cardTag).getUnclippedBoundsInRoot()
+                assertTrue("Every card label must stay inside the card", bounds.left >= currentCardBounds.left &&
+                    bounds.right <= currentCardBounds.right && bounds.top >= currentCardBounds.top && bounds.bottom <= currentCardBounds.bottom)
+            }
+            compose.onNodeWithTag(cardTag).performScrollTo()
+            if (layout == ThemeHomeLayout.Three) assertThreeCardGeometry(expectSquare = false)
+            capture("home-${layout.value}-320dp-font200")
+            val retry = compose.onNode(hasText(text(R.string.home_environment_check_retry)) and hasClickAction())
+            retry.performScrollTo().assertIsDisplayed()
+            val retryBounds = retry.getUnclippedBoundsInRoot()
+            assertTrue("Retry touch target must be at least 48dp high", retryBounds.bottom - retryBounds.top >= 48.dp)
+            retry.performClick()
+            compose.runOnIdle { org.junit.Assert.assertEquals(layout.ordinal + 1, environmentRetryClicks) }
+            capture("home-${layout.value}-320dp-font200-retry")
+            compose.onNodeWithText("Theme fixture device").performScrollTo().assertIsDisplayed()
+            capture("home-${layout.value}-320dp-font200-information")
+        }
+    }
+
+    private fun assertThreeCardGeometry(expectSquare: Boolean = true) {
         fun bounds(tag: String, unmerged: Boolean = false): androidx.compose.ui.geometry.Rect {
             val node = compose.onNodeWithTag(tag,useUnmergedTree=unmerged).fetchSemanticsNode()
             return androidx.compose.ui.geometry.Rect(node.positionInRoot,node.size.toSize())
@@ -423,12 +495,13 @@ class ThemePresentationDeviceTest(private val initialSkin: UiMode, private val d
         val hero = bounds("home-three-status",true)
         val top = bounds("home-counter-superuser")
         val bottom = bounds("home-counter-module")
-        File(evidenceDirectory(),"${initialSkin.name}-${if(dark) "dark" else "light"}-three-geometry-${skin.value.name}.json")
+        File(evidenceDirectory(),"${initialSkin.name}-${if(dark) "dark" else "light"}-three-geometry-${skin.value.name}${if (expectSquare) "" else "-font200"}.json")
             .writeText(org.json.JSONObject().put("mainWidthPx",hero.width).put("mainHeightPx",hero.height)
                 .put("topWidthPx",top.width).put("topHeightPx",top.height).put("bottomHeightPx",bottom.height)
                 .put("columnGapPx",top.left-hero.right).put("rowGapPx",bottom.top-top.bottom).toString(2))
         assertTrue(hero.left < top.left && top.bottom < bottom.top)
-        assertTrue("The main tile must be square: $hero",kotlin.math.abs(hero.width-hero.height) < 2f)
+        if (expectSquare) assertTrue("The main tile must be square: $hero",kotlin.math.abs(hero.width-hero.height) < 2f)
+        else assertTrue("Large text may grow the hero beyond its square minimum: $hero", hero.height >= hero.width - 2f)
         assertTrue(kotlin.math.abs(hero.width-top.width) < 2f)
         assertTrue(kotlin.math.abs(top.height-bottom.height) < 2f)
         assertTrue(kotlin.math.abs(hero.top-top.top) < 2f && kotlin.math.abs(hero.bottom-bottom.bottom) < 2f)
@@ -733,6 +806,8 @@ class ThemePresentationDeviceTest(private val initialSkin: UiMode, private val d
         lkmMode=true,isLkmBundled=true,isManager=true,isManagerPrBuild=false,isKernelPrBuild=false,
         requiresNewKernel=false,requiresNewManager=false,isRootAvailable=true,isSafeMode=false,isLateLoadMode=false,
         checkUpdateEnabled=false,latestVersionInfo=LatestVersionInfo(),currentManagerVersionCode=50008,
+        environmentMode=WorkMode.KSU,environmentRuntimeReady=true,
+        rootReadiness=dev.maplesu.manager.workmode.detect.SuReadiness.USABLE,
         systemInfo=SystemInfo("Theme fixture kernel","Theme fixture manager","Theme fixture device","fixture/device:1/test","Enforcing",2))
 
     private fun text(id: Int) = InstrumentationRegistry.getInstrumentation().targetContext.getString(id)
@@ -752,7 +827,9 @@ class ThemePresentationDeviceTest(private val initialSkin: UiMode, private val d
                 }
         }
         compose.setContent {
+            val density = LocalDensity.current
             CompositionLocalProvider(LocalUiMode provides skin.value,
+                LocalDensity provides Density(density.density, if (largeText.value) 2f else density.fontScale),
                 LocalColorMode provides if (dark) ColorMode.DARK.value else ColorMode.LIGHT.value,
                 LocalMainPagerState provides rememberMainPagerState(rememberPagerState(pageCount={4})),
                 LocalThemeHomeCounts provides counts.value,
@@ -792,9 +869,13 @@ class ThemePresentationDeviceTest(private val initialSkin: UiMode, private val d
                                 androidx.compose.runtime.SideEffect { mediaPhoto = photo }
                                 ThemePhotoImage(photo,Modifier.height(120.dp))
                             }
-                            "home" -> when (skin.value) {
-                                UiMode.Miuix -> HomePagerMiuix(homeState().copy(isRootAvailable=rootReady.value),HomeActions({},{}),0.dp)
-                                UiMode.Material -> HomePagerMaterial(homeState().copy(isRootAvailable=rootReady.value),HomeActions({},{}),0.dp)
+                            "home" -> Box((if (largeText.value) Modifier.widthIn(max = 320.dp).fillMaxSize() else Modifier.fillMaxSize())
+                                .testTag("home-test-viewport")) {
+                                val actions = HomeActions({}, {}, onEnvironmentRetry = { environmentRetryClicks++ })
+                                when (skin.value) {
+                                    UiMode.Miuix -> HomePagerMiuix(homeState().copy(isRootAvailable=rootReady.value),actions,0.dp)
+                                    UiMode.Material -> HomePagerMaterial(homeState().copy(isRootAvailable=rootReady.value),actions,0.dp)
+                                }
                             }
                             "about" -> when (skin.value) {
                                 UiMode.Miuix -> top.yukonga.miuix.kmp.basic.Scaffold { _ ->

@@ -26,6 +26,8 @@ object KsuNatives {
 
     // ── 版本 / 状态（JNI getter；7K jni.cc 的 getVersion/getKernelUAPIVersion/...）──
     external fun getVersion(): Int
+    /** One current GET_INFO receipt: status, version, flags, kernel UAPI. */
+    external fun getCurrentInfo(): IntArray?
     external fun isSafeMode(): Boolean
     external fun isLkmMode(): Boolean
     external fun isLkmBundled(): Boolean
@@ -133,6 +135,7 @@ object KsuNativeCalls {
     }
 
     val version: Int get() = call(-1) { KsuNatives.getVersion() }
+    fun currentInfo(): IntArray? = call<IntArray?>(null) { KsuNatives.getCurrentInfo() }
     val isSafeMode: Boolean get() = call(false) { KsuNatives.isSafeMode() }
     val isLkmMode: Boolean get() = call(false) { KsuNatives.isLkmMode() }
     val isLkmBundled: Boolean get() = call(false) { KsuNatives.isLkmBundled() }

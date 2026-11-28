@@ -92,6 +92,7 @@ internal class UltraBootAuthorizationRestore(private val pause: (Long) -> Unit =
                 onResult(result)
                 previous = diagnostic
             }
+            if (result.status == "MAPLESU_SDK_DEADLINE_EXCEEDED") return result.status
             try {
                 pause(5_000L)
             } catch (_: InterruptedException) {

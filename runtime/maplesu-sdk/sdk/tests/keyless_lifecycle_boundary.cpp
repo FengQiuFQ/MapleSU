@@ -17,10 +17,11 @@ std::string base, system_directory, kernel_directory;
 int root_error = 0, action_error = 0, launch_result = 0, removed_modules = 0;
 int publishes = 0, commits = 0, revoked = 0, closes = 0, launches = 0, deletes = 0;
 int channel_starts = 0, admission_error = 0;
-bool installed = false, existing_current = false, helper_role = false;
+bool installed = false, existing_current = false, helper_role = false, owner_mode = true;
+int refresh_error = 0, refresh_errno = 0, commit_error = 0, refresh_calls = 0;
 }
 namespace kernel_module {
-static bool maplesu_request_owner_mode() { return true; }
+static bool maplesu_request_owner_mode() { return owner_mode; }
 static uint64_t maplesu_request_auth_state() { return helper_role ? 3 : 1; }
 static bool maplesu_request_auth_usable(uint64_t auth) { return auth == 1 || auth == 3; }
 static bool maplesu_request_auth_helper(uint64_t auth) { return auth == 3; }
@@ -59,8 +60,8 @@ static err_t installer_webui(){++publishes;return action_error;}
 static err_t installer_prepare_bootstrap(){++publishes;return action_error;}
 static err_t installer_refresh_bootstrap(){++publishes;return action_error;}
 static err_t installer_resetprop(){++publishes;return action_error;}
-static err_t installer_refresh_authorization(){return action_error;}
-static err_t installer_commit_version(install::state::Mutation&){++commits;installed=true;return action_error;}
+static err_t installer_refresh_authorization(){++refresh_calls;if(refresh_error)errno=refresh_errno;return refresh_error ? refresh_error : action_error;}
+static err_t installer_commit_version(install::state::Mutation&){++commits;installed=true;return commit_error ? commit_error : action_error;}
 static err_t installer_prepare_bootstrap_state(){return action_error;}
 static err_t installer_reset_safe(){return action_error;}
 static err_t installer_reset_duplicate(){return action_error;}
@@ -121,7 +122,7 @@ static void reset(){
  std::ofstream(kernel_directory+"init")<<"fixture-helper";
  root_error=action_error=launch_result=removed_modules=publishes=commits=revoked=closes=launches=deletes=0;
  channel_starts=admission_error=0;
- installed=existing_current=helper_role=false;
+ installed=existing_current=helper_role=false;owner_mode=true;refresh_error=refresh_errno=commit_error=refresh_calls=0;errno=0;
 }
 template<typename F> static long long invoke(F f){try{return f();}catch(const maplesu::install::Completed& c){return c.error;}}
 int main(){
@@ -174,5 +175,40 @@ int main(){
  assert(invoke([&]{return uninstall_environment();})==action_error);
  assert(removed_modules==0&&deletes==0);++checks;
  std::filesystem::remove_all(base);
- std::printf("KEYLESS_LIFECYCLE_PASS checks=%u exact_install_uninstall=1 side_effect_endpoints=fixture device=0\n",checks);
+ unsigned failures=0;
+ const auto check = [&](bool ok,const char* name,long long code) {
+  ++checks;if(!ok)++failures;
+  std::printf("%s case=%s code=%lld refreshCalls=%d commits=%d launches=%d revoked=%d errno=%d\n",
+    ok?"PASS":"FAIL",name,code,refresh_calls,commits,launches,revoked,errno);
+ };
+ for (const bool owner : {false,true}) {
+  reset();installed=existing_current=true;owner_mode=owner;refresh_error=-19999;
+  const auto code=invoke([&]{return install_environment(DeploymentMode::HotLoad,{});});
+  check(code==0&&refresh_calls==0&&commits==0&&launches==1,
+    owner?"owner-hotload-current-no-pre-refresh":"legacy-hotload-current-no-pre-refresh",code);
+  std::filesystem::remove_all(base);
+ }
+ for (const int failure : {EAGAIN,ESTALE}) {
+  reset();installed=true;refresh_error=-19999;refresh_errno=failure;
+  const auto code=invoke([&]{return install_environment(DeploymentMode::Refresh,{});});
+  check(code==0&&refresh_calls==0&&commits==1&&launches==0&&revoked==1,
+    failure==EAGAIN?"owner-refresh-unstarted-factory":"owner-refresh-revoked-factory",code);
+  std::filesystem::remove_all(base);
+  reset();installed=true;owner_mode=false;refresh_error=-19999;refresh_errno=failure;
+  const auto legacy=invoke([&]{return install_environment(DeploymentMode::Refresh,{});});
+  check(legacy==-19999&&errno==failure&&refresh_calls==1&&commits==0&&launches==0&&revoked==1,
+    failure==EAGAIN?"legacy-refresh-retains-eagain":"legacy-refresh-retains-estale",legacy);
+  std::filesystem::remove_all(base);
+ }
+ reset();installed=true;owner_mode=false;
+ const auto legacy=invoke([&]{return install_environment(DeploymentMode::Refresh,{});});
+ check(legacy==0&&refresh_calls==1&&commits==1&&launches==0,"legacy-refresh-keeps-delivery",legacy);
+ std::filesystem::remove_all(base);
+ reset();installed=true;refresh_error=-19999;refresh_errno=EAGAIN;commit_error=-34567;
+ const auto commit=invoke([&]{return install_environment(DeploymentMode::Refresh,{});});
+ check(commit==commit_error&&refresh_calls==0&&commits==1&&launches==0,
+   "owner-refresh-keeps-original-commit-failure",commit);
+ std::filesystem::remove_all(base);
+ std::printf("KEYLESS_LIFECYCLE_RESULT checks=%u failures=%u exact_install_uninstall=1 side_effect_endpoints=fixture device=0\n",checks,failures);
+ return failures?1:0;
 }

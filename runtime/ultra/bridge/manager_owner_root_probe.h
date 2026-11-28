@@ -61,4 +61,9 @@ struct ManagerOwnerRootProbe {
 __attribute__((visibility("hidden")))
 ManagerOwnerRootProbe probe_manager_owner_root();
 
+// The caller's absolute CLOCK_MONOTONIC deadline can shorten the independent
+// 300 ms probe budget. Zero preserves the original standalone budget.
+__attribute__((visibility("hidden")))
+ManagerOwnerRootProbe probe_manager_owner_root(int64_t session_deadline_nanos);
+
 } // namespace maplesu

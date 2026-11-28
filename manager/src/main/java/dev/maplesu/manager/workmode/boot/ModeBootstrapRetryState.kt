@@ -17,7 +17,7 @@ internal class ModeBootstrapRetryState(
 
     @Synchronized
     fun tryStart(): Int? {
-        if (executing) return null
+        if (executing || attempts >= maxAttempts) return null
         executing = true
         if (completion?.isCompleted != false) completion = CompletableDeferred()
         return ++attempts

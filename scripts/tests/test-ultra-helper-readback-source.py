@@ -11,6 +11,10 @@ args = parser.parse_args()
 root = Path(__file__).resolve().parents[2]
 out = args.out.resolve()
 out.mkdir(parents=True, exist_ok=False)
+sources = ['runtime/ultra/bridge/installed_helper_readback.cpp', 'runtime/ultra/bridge/installed_helper_readback.h',
+           'runtime/ultra/bridge/manager_owner_identity.h', 'runtime/tests/ultra_helper_readback_source_test.cpp',
+           'scripts/tests/test-ultra-helper-readback-source.py']
+before = {path: hashlib.sha256((root / path).read_bytes()).hexdigest() for path in sources}
 (out / 'kernel_module_kit_umbrella.h').write_text('#pragma once\n#include "module_err_def.h"\n#include "module_base_kernel_mem.h"\nnamespace kernel_module { uint32_t get_page_size(); }\n')
 docker = ['docker', 'run', '--rm', '--pull', 'never', '--network', 'none', '--read-only',
           '--tmpfs', '/tmp:rw,size=64m', '--mount', f'type=bind,source={root},target=/repo,readonly',
@@ -28,10 +32,10 @@ for label, argv in [('compile', compile_argv), ('run', ['./source-test'])]:
     print(result.stdout + result.stderr, end='')
     if result.returncode:
         break
-sources = ['runtime/ultra/bridge/installed_helper_readback.cpp', 'runtime/ultra/bridge/manager_owner_identity.h',
-           'runtime/tests/ultra_helper_readback_source_test.cpp', 'scripts/tests/test-ultra-helper-readback-source.py']
-(out / 'RESULT.json').write_text(json.dumps(dict(commands=records,
-    inputs=[dict(path=p, sha256=hashlib.sha256((root / p).read_bytes()).hexdigest()) for p in sources],
-    scope='Actual complete-byte producer/framing, real temporary files, EOF and failure cleanup. fstat/lstat/close fault seams only. No SDK authentication, official artifact or device acceptance.',
+stable = all(hashlib.sha256((root / path).read_bytes()).hexdigest() == digest for path, digest in before.items())
+passed = len(records) == 2 and all(record['exitCode'] == 0 for record in records) and stable
+(out / 'RESULT.json').write_text(json.dumps(dict(passed=passed, sourcesStable=stable, commands=records,
+    inputs=before,
+    scope='Nine actual complete-byte producer/shared-ring/framing cases, real temporary files, EOF and failure cleanup, including uint32 counter wrap without allocating a large file. fstat/lstat/close fault seams only. No SDK authentication, official artifact or device acceptance.',
     formalArtifact=False, device=False), indent=2) + '\n')
-raise SystemExit(records[-1]['exitCode'])
+raise SystemExit(0 if passed else 1)

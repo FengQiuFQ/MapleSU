@@ -16,6 +16,12 @@ internal class UltraAuthorizationState(
                         val deliveryIncomplete: Boolean = false,
                         val profiles: Map<Int, SuUidProfile> = emptyMap(), val uidProfilesLoaded: Boolean = false)
 
+    data class RefreshResult(val error: String?, val readReceipt: NativeReceipt? = null) {
+        val succeeded: Boolean get() = error == null
+        val diagnosticSummary: String get() = "error=${error?.let(::suAuthLogCode) ?: "OK"}" +
+            (readReceipt?.let { " readReceipt=[${it.authorizationDiagnosticSummary()}]" } ?: "")
+    }
+
     private data class Observation(val snapshot: Snapshot, val current: () -> Boolean)
 
     private val unavailable = Snapshot()
@@ -25,21 +31,25 @@ internal class UltraAuthorizationState(
         get() = observation.let { if (it.current()) it.snapshot else unavailable }
 
     fun refresh(port: SuAuthPort, current: () -> Boolean = { true },
-                cacheCurrent: () -> Boolean = current): String? = synchronized(suAuthTransactionLock) {
-        if (!current()) return "SU_AUTH_SCOPE_CHANGED"
+                cacheCurrent: () -> Boolean = current): String? = refreshDetailed(port, current, cacheCurrent).error
+
+    fun refreshDetailed(port: SuAuthPort, current: () -> Boolean = { true },
+                        cacheCurrent: () -> Boolean = current): RefreshResult = synchronized(suAuthTransactionLock) {
+        if (!current()) return RefreshResult("SU_AUTH_SCOPE_CHANGED")
         if (port.supportsUidProfiles) {
             val profiles = port.uidProfiles()
-            if (!current()) return "SU_AUTH_SCOPE_CHANGED"
-            if (profiles == null) return port.uidProfileReadError() ?: "READ_FAILED"
+            val receipt = port.uidProfileReadReceipt()
+            if (!current()) return RefreshResult("SU_AUTH_SCOPE_CHANGED")
+            if (profiles == null) return RefreshResult(port.uidProfileReadError() ?: "READ_FAILED", receipt)
             // A list read verifies the stored decision, not native su delivery.
             updateProfiles(profiles, cacheCurrent, snapshot.deliveryIncomplete)
-            return null
+            return RefreshResult(null, receipt)
         }
         val packages = port.snapshot()
-        if (!current()) return "SU_AUTH_SCOPE_CHANGED"
-        if (packages == null) return "READ_FAILED"
+        if (!current()) return RefreshResult("SU_AUTH_SCOPE_CHANGED")
+        if (packages == null) return RefreshResult("READ_FAILED")
         update(packages.toSet(), cacheCurrent)
-        return null
+        return RefreshResult(null)
     }
 
     fun setGranted(port: SuAuthPort, packageName: String, allow: Boolean,
@@ -123,7 +133,9 @@ internal class UltraAuthorizationState(
                 // commit fact intact; it describes only this runtime synchronization.
             }
             val after = port.uidProfiles()
+            val readReceipt = port.uidProfileReadReceipt()
             if (!current()) return attempt.withReadback(false).withFailure("SU_AUTH_SCOPE_CHANGED")
+            attempt = attempt.withReadReceipt(readReceipt)
             if (after == null) {
                 // The write may have committed. An older grant list is no longer a current observation.
                 observation = Observation(snapshot.copy(loaded = false, uidProfilesLoaded = false,

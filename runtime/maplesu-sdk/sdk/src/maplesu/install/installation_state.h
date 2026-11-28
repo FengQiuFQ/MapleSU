@@ -258,14 +258,17 @@ public:
             for (auto& stage : next.stages) stage = {};
         }
         const auto observed = replace(next);
-        if (!observed.code || !authenticated_) return observed;
-        // Published bytes remain a fact even if the authenticated commit was
-        // lost. Retire the disk generation so cold helper cannot enroll it as
-        // a fresh success; preserve the original command receipt and error.
+        if (!observed.code || !authenticated_ || !observed.applied || !next.active) return observed;
+        if (observed.phase == Phase::Gateway) {
+            const auto reply = kernel_module::maplesu_request_management_reply();
+            // An unknown or applied COMMIT is reconciled through its original
+            // task. Retiring its disk generation could invalidate a live helper.
+            if (!reply.completed || (reply.effects & MAPLESU_EFFECT_COMMITTED)) return observed;
+        }
+        // Retire only this known failed publication, retaining its original
+        // command receipt, published-version fact and error.
         kernel_module::CleanupReceiptScope receipt;
-        auto inactive = next;
-        inactive.active = 0;
-        diagnose("commit-compensate", replace(inactive));
+        diagnose("commit-compensate", retire_publication(next));
         return observed;
     }
     Result replace(const Record& next) {
@@ -305,6 +308,34 @@ public:
         return {0, Phase::None, true};
     }
 private:
+    Result retire_publication(const Record& expected) {
+        ErrnoGuard restore;
+        // A failed gateway may invalidate the session. Cleanup owns only this
+        // still-locked inode and the exact record this Mutation just published.
+        if (!ready_ || directory_ < 0) return {EBADF, Phase::Open, false};
+        if (getpid() != process_ || !present_ || !expected.active ||
+            std::memcmp(&record_, &expected, sizeof(expected)))
+            return {ESTALE, Phase::Identity, false};
+        struct stat held{}, current{};
+        if (fstat(directory_, &held) != 0 || lstat(path_.c_str(), &current) != 0)
+            return {errno, Phase::Stat, false};
+        if (!S_ISDIR(held.st_mode) || held.st_uid != 0 ||
+            held.st_dev != device_ || held.st_ino != inode_ ||
+            !S_ISDIR(current.st_mode) || current.st_dev != device_ || current.st_ino != inode_)
+            return {ESTALE, Phase::Identity, false};
+        Record disk{};
+        const ssize_t size = fgetxattr(directory_, kAttribute, &disk, sizeof(disk));
+        if (size < 0) return {errno, Phase::Read, false};
+        if (size != sizeof(disk) || std::memcmp(&disk, &expected, sizeof(disk)))
+            return {ESTALE, Phase::Identity, false};
+        auto inactive = expected;
+        inactive.active = 0;
+        if (fsetxattr(directory_, kAttribute, &inactive, sizeof(inactive), XATTR_REPLACE) != 0)
+            return {errno, Phase::Write, false};
+        record_ = inactive;
+        if (fsync(directory_) != 0) return {errno, Phase::Sync, true};
+        return {0, Phase::None, true};
+    }
     Result fail(int error, Phase phase) { close(); return {error, phase, false}; }
     int directory_ = -1;
     bool present_ = false, ready_ = false;

@@ -71,6 +71,7 @@ CleanupReceiptScope::~CleanupReceiptScope() noexcept {}
 namespace maplesu {
 SdkCallScope::SdkCallScope(const char*) { acquired_ = true; }
 SdkCallScope::~SdkCallScope() = default;
+SdkCallCompletion SdkCallScope::finalize() noexcept { return {}; }
 namespace ultra { void retain_authorization_result_on_process_failure(cJSON*) {} }
 namespace sdk {
 KModErr run_root_cmd(const char*, std::string& output) {

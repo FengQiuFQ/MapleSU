@@ -6,9 +6,9 @@
 # 机械改名为 Java_dev_maplesu_manager_ksu_KsuNatives_*，CMake 直接 -I applied/ 根拿 uapi）。
 #
 # 两种接法：
-#   A) Gradle：manager/build.gradle.kts 的 externalNativeBuild（本子代理**未**接线，
-#      因为会给 assembleDebug 增加 NDK 构建面；集成轮再接）；
-#   B) 本脚本：手工 CMake + NDK，产物直接放 jniLibs（CI 用这条）。
+#   A) Gradle：manager/build.gradle.kts 的 externalNativeBuild 随 APK 构建当前源码；
+#      不会消费 jniLibs 中留存的 libmaplesu_ksu.so / libadbroot.so；
+#   B) 本脚本：维护/CI 的 CMake + NDK 导入入口，产物写入留存 jniLibs。
 #
 # 用法：
 #   bash third_party/kernelsu/scripts/build_jni.sh --dry-run

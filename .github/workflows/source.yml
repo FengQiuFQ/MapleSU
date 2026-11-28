@@ -9,9 +9,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   host:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
@@ -30,8 +35,10 @@ jobs:
         run: python jailbreak-providers/ghostlock/build_extractor.py --verify-only
       - name: Verify Normal patch definitions and exported module sources
         run: python -m unittest discover -s tools/tests -p "test_ksu_source.py" -v
-      - run: python tools/check_host.py
-      - run: python -m pip install -r requirements-native.txt
+      - name: Verify host tools and JVM contracts
+        run: python tools/check_host.py
+      - name: Install native test dependencies
+        run: python -m pip install -r requirements-native.txt
       - name: Prepare pinned host JVM dependencies
         shell: bash
         env:
@@ -43,15 +50,24 @@ jobs:
         run: python scripts/tests/test-normal-module-archive.py --out "${{ runner.temp }}/module-archive-tests"
       - name: Verify WIP SDK source checkpoint contract
         run: python tools/check_sdk_source_contract.py
-      - run: python -m unittest discover -s tools/tests -p "test_sdk_distribution.py" -v
-      - run: python tools/check_architecture.py
-      - run: python -m unittest discover -s tools/tests -p "test_check_architecture.py" -v
-      - run: python -m unittest discover -s tools/tests -p "test_release_audit.py" -v
-      - run: python -m unittest discover -s tools/tests -p "test_source_export.py" -v
-      - run: python tools/check_source_export.py
-      - run: python tools/prepare_native_inputs.py --check
-      - run: python -m unittest discover -s tools/tests -p "test_native_inputs.py" -v
-      - run: python tools/release_audit.py
+      - name: Test SDK source distribution contracts
+        run: python -m unittest discover -s tools/tests -p "test_sdk_distribution.py" -v
+      - name: Verify repository architecture
+        run: python tools/check_architecture.py
+      - name: Test repository architecture checks
+        run: python -m unittest discover -s tools/tests -p "test_check_architecture.py" -v
+      - name: Test release audit contracts
+        run: python -m unittest discover -s tools/tests -p "test_release_audit.py" -v
+      - name: Test source archive contracts
+        run: python -m unittest discover -s tools/tests -p "test_source_export.py" -v
+      - name: Verify committed source archive
+        run: python tools/check_source_export.py
+      - name: Verify native build input identities
+        run: python tools/prepare_native_inputs.py --check
+      - name: Test native build input contracts
+        run: python -m unittest discover -s tools/tests -p "test_native_inputs.py" -v
+      - name: Audit release source and input identities
+        run: python tools/release_audit.py
 
   sdk:
     runs-on: ubuntu-latest

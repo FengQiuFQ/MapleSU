@@ -27,6 +27,11 @@ class HomeReadinessDisplayContractTest {
         assertTrue(summary.contains("ultraVersionLabel?.trim()?.takeIf"))
         assertTrue(summary.contains("it.isNotEmpty() && it != ultraName"))
         assertTrue(summary.contains("R.string.home_environment_cached_title"))
+        for (skin in listOf("HomeMaterial", "HomeMiuix")) {
+            val code = source("com/maplesu/core/ui/screen/home/$skin.kt")
+            assertTrue(code.contains("ultraVersionLabel = if (state.ultraBrandVisible) ultraEnvironment?.version else null"))
+            assertFalse(code.contains("ultraEnvironmentLabel(ultraEnvironment?.version)"))
+        }
     }
 
     @Test fun bothSkinsKeepTheirTitleAndSummaryAsSeparateTextConsumers() {
@@ -128,12 +133,13 @@ class HomeReadinessDisplayContractTest {
         }
     }
 
-    @Test fun eachStatusLayoutKeepsOneConfirmationFooterInsideItsOwnFlow() {
+    @Test fun eachStatusLayoutKeepsConfirmationOutsideItsArtwork() {
         val material = source("com/maplesu/core/ui/screen/home/HomeMaterial.kt")
         val miuix = source("com/maplesu/core/ui/screen/home/HomeMiuix.kt")
         val shared = source("com/maplesu/core/ui/screen/home/HomeThemeLayouts.kt")
-        assertEquals(1, material.split("EnvironmentRefreshAction(").size - 1)
-        assertEquals(3, miuix.split("EnvironmentRefreshAction(").size - 1)
+        assertFalse(material.contains("EnvironmentRefreshAction("))
+        assertFalse(miuix.contains("EnvironmentRefreshAction("))
+        assertEquals(2, shared.split("EnvironmentRefreshAction(state.environmentChecking").size - 1)
         assertFalse(material.contains("private fun EnvironmentRefreshAction("))
         assertFalse(miuix.contains("private fun EnvironmentRefreshAction("))
         val footer = shared.substringAfter("internal fun EnvironmentRefreshAction(")
@@ -147,20 +153,37 @@ class HomeReadinessDisplayContractTest {
             val page = skin.substringBefore(signature)
             val card = skin.substringAfter(signature).substringBefore("\n@Composable")
             assertFalse(page.contains("EnvironmentRefreshAction("))
-            assertTrue(card.contains("EnvironmentRefreshAction(state.environmentChecking || state.manualEnvironmentChecking"))
+            assertFalse(card.contains("EnvironmentRefreshAction("))
             assertFalse(card.contains("onClick = actions.onEnvironmentRetry,"))
+            assertTrue(page.indexOf("if (state.showUltraObservationFailure)") > page.indexOf("ThemeHomeStatus(state, actions"))
         }
+        val original = shared.substringAfter("if (layout != ThemeHomeLayout.Three || !state.showInstalledStatus)")
+            .substringBefore("} else {")
+        assertTrue(original.contains("status()"))
+        assertTrue(original.indexOf("EnvironmentRefreshAction(") > original.indexOf("status()"))
     }
 
-    @Test fun footerAddsFlowHeightWithoutChangingArtworkOrTheThreeTileProportions() {
+    @Test fun footerAddsFlowHeightAndThreeTilesCanGrowForLargerText() {
         val miuix = source("com/maplesu/core/ui/screen/home/HomeMiuix.kt")
-        assertTrue(miuix.contains("Box(Modifier.fillMaxWidth().then(\n                            if (decorPrefs.largeCard) Modifier.aspectRatio(StatusDecoration.CARD_ASPECT_RATIO)"))
-        assertFalse(miuix.contains("modifier = Modifier.fillMaxWidth().then(\n                            if (decorPrefs.largeCard) Modifier.aspectRatio"))
+        assertTrue(miuix.contains("BoxWithConstraints(Modifier.fillMaxWidth())"))
+        assertTrue(miuix.contains("homeStatusCardMinHeight(maxWidth, decorPrefs.largeCard)"))
+        assertTrue(miuix.contains("Modifier.fillMaxWidth().heightIn(min = cardMinHeight)"))
+        assertFalse(miuix.contains("Modifier.aspectRatio(StatusDecoration.CARD_ASPECT_RATIO)"))
         assertTrue(miuix.contains("StatusThemeBackdrop(themeArt)"))
-        val three = source("com/maplesu/core/ui/screen/home/HomeThemeLayouts.kt")
+        val material = source("com/maplesu/core/ui/screen/home/HomeMaterial.kt")
+        assertTrue(material.contains("homeStatusCardMinHeight(maxWidth, decorationPrefs.homeLargeCard)"))
+        assertTrue(material.contains("modifier = Modifier.heightIn(min = cardMinHeight)"))
+        val shared = source("com/maplesu/core/ui/screen/home/HomeThemeLayouts.kt")
+        val height = shared.substringAfter("internal fun homeStatusCardMinHeight(").substringBefore("@Composable")
+        assertTrue(height.contains("width / com.maplesu.core.ui.util.StatusDecoration.CARD_ASPECT_RATIO"))
+        assertTrue(height.contains("else 112.dp"))
+        assertFalse(height.contains("coerceIn("))
+        val three = shared
             .substringAfter("BoxWithConstraints(modifier.fillMaxWidth().testTag(\"home-three\"))")
             .substringBefore("/** Confirmation belongs")
-        assertTrue(three.contains("Column {\n                Row(Modifier.fillMaxWidth().height((this@BoxWithConstraints.maxWidth-12.dp)/2)"))
+        assertTrue(three.contains("Row(Modifier.fillMaxWidth().heightIn(min=(this@BoxWithConstraints.maxWidth-12.dp)/2)"))
+        assertTrue(three.contains(".height(IntrinsicSize.Min)"))
+        assertFalse(three.contains(".height((this@BoxWithConstraints.maxWidth-12.dp)/2)"))
         assertTrue(three.contains("ThemeThreeStatus(state,actions,Modifier.weight(1f).fillMaxHeight())"))
         assertTrue(three.contains("Column(Modifier.weight(1f).fillMaxHeight()"))
         assertTrue(three.indexOf("EnvironmentRefreshAction(") > three.indexOf("home-counter-module"))

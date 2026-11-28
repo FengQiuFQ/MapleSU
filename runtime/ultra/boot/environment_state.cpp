@@ -1,4 +1,5 @@
 #include "module_err_def.h"
+#include "maplesu_operation_wait_private.h"
 #include "maplesu_storage_worker_private.h"
 #include <tuple>
 #include "maplesu_sdk/maplesu_installer.h"
@@ -17,6 +18,7 @@ namespace {
 using State = maplesu::sdk::MapleSUEnvState;
 
 int present(const std::string& path) {
+    if (!maplesu::deadline::available()) return -1;
     struct stat st;
     if (lstat(path.c_str(), &st) == 0) return S_ISREG(st.st_mode) ? 1 : -1;
     return errno == ENOENT ? 0 : -1;
@@ -27,6 +29,7 @@ bool space(char c) {
 }
 
 bool read_text(const std::string& path, std::string& text) {
+    if (!maplesu::deadline::available()) return false;
     int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) return false;
     struct stat st;
@@ -34,6 +37,7 @@ bool read_text(const std::string& path, std::string& text) {
     char bytes[65];
     size_t size = 0;
     while (ok && size < sizeof(bytes)) {
+        if (!maplesu::deadline::available()) { ok = false; break; }
         const auto count = read(fd, bytes + size, sizeof(bytes) - size);
         if (count < 0) { if (errno == EINTR) continue; ok = false; break; }
         if (!count) break;
@@ -61,6 +65,7 @@ bool uuid(const std::string& text) {
 
 extern "C" uint32_t maplesu_environment_state() noexcept {
     try {
+        if (!maplesu::deadline::available()) return static_cast<uint32_t>(State::Unknown);
         maplesu::storage::WorkerScope worker;
         if (is_failed(worker.root())) return static_cast<uint32_t>(State::Unknown);
         std::string helper, version;
@@ -97,8 +102,15 @@ extern "C" uint32_t maplesu_environment_state() noexcept {
 }
 
 extern "C" pid_t maplesu_wait_environment_child(pid_t child, int* status) {
-    if (child <= 0) { errno = ECHILD; return -1; }
-    pid_t result;
-    do { result = waitpid(child, status, 0); } while (result < 0 && errno == EINTR);
-    return result;
+    const pid_t waited = maplesu::deadline::wait_child(child, status);
+    if (waited >= 0 || !maplesu_request_operation_deadline_nanos()) return waited;
+    const int error = errno;
+    if (error == ETIMEDOUT) {
+        (void)kill(child, SIGKILL);
+        // Never extend the caller's budget for a grace period. A pending reap
+        // remains an unconfirmed cleanup; task exit still retires its lease.
+        if (waitpid(child, status, WNOHANG) == child) { errno = error; return child; }
+    }
+    errno = error;
+    return -1;
 }

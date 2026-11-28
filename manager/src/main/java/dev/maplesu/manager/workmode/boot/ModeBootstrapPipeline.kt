@@ -68,6 +68,7 @@ interface ModeRuntimePort {
     fun completeBootstrap(result: DetectionResult)
     fun activate(mode: WorkMode, bootId: String, source: ActivationSource): Boolean
     fun failBootstrap(code: String) {}
+    fun failBootstrap(code: String, detail: String?) = failBootstrap(code)
 }
 
 /** 生产实现：逐项转发 [ModeRuntime]（不包装任何策略，策略在 pipeline 内）。 */
@@ -77,6 +78,7 @@ object ProductionModeRuntimePort : ModeRuntimePort {
     override fun activate(mode: WorkMode, bootId: String, source: ActivationSource): Boolean =
         ModeRuntime.activate(mode, bootId, source)
     override fun failBootstrap(code: String) = ModeRuntime.failBootstrap(code)
+    override fun failBootstrap(code: String, detail: String?) = ModeRuntime.failBootstrap(code, detail)
 }
 
 class ModeBootstrapPipeline(
@@ -86,11 +88,10 @@ class ModeBootstrapPipeline(
     private val observer: (BootstrapStage, BootstrapOutcome?) -> Unit = { _, _ -> },
     private val probeRunner: EnvironmentProbeRunner = EnvironmentProbeRunner("maplesu-mode-detect"),
     /**
-     * T14 前置环境检查（继承 / 降级探测）；返回非 null 时**取代**本次三阶段探测。
+     * 当前环境检查；Normal 可解除互锁，未安装仍允许核对既有越狱通道。
      *
-     * 只用于两个终态：`ENV_KSU_NORMAL`（激活 KSU，解除互锁）与 `ENV_NOT_INSTALLED`
-     * （阶段一立即终态；阶段二仍核对已建立的通道）。LITE / ULTRA / UNKNOWN 一律返回 null，
-     * 交回既有两阶段判定（Ultra 行为零改动）。异常同样返回 null（绝不伪造结论）。
+     * 当前 Ultra owner 只确认身份，仍需既有 detector 取 Root / SDK 证据后才激活。
+     * 历史与 UNKNOWN 不覆盖本轮判定；异常同样返回 null。
      */
     private val environmentOverride: (suspend () -> DetectionResult?)? = null,
     private val environmentStore: EnvironmentStateStore? = null,
@@ -106,25 +107,35 @@ class ModeBootstrapPipeline(
                 null
             }
         } else null
-        // A quick SU failure can be cached while a Hook becomes ready. Phase two
-        // must still check the existing channel; it never starts a new attempt.
-        val checkExistingChannel = overridden?.state == ModeState.NOT_INSTALLED && request.allowJailbreakProbe
+        val currentUltraOwner = overridden?.takeIf {
+            it.state == ModeState.MODE_A_INSTALLED_UNBOUND &&
+                it.rule == DetectionRules.Rule.R6_A_ULTRA_OWNER_ONLY && it.bootId.isNotBlank()
+        }
+        // An owner proves Ultra identity, not usable Root. Keep the existing live
+        // detector reachable; a health failure does not erase that current identity.
+        val checkExistingChannel = currentUltraOwner != null ||
+            (overridden?.state == ModeState.NOT_INSTALLED && request.allowJailbreakProbe)
         val result = overridden?.takeUnless { checkExistingChannel } ?: run {
             val checked = probeRunner.run(request.timeoutMillis) {
                 runBlocking { detector.detect(request) }
             }
             when (checked) {
                 is EnvironmentProbeResult.Completed ->
-                    overridden?.takeIf {
-                        checkExistingChannel && checked.value.rule == DetectionRules.Rule.R12_INDETERMINATE
+                    currentUltraOwner?.takeIf {
+                        checked.value.bootId == it.bootId && checked.value.state.activeMode == null
+                    }?.let { owner ->
+                        owner.copy(trace = owner.trace + checked.value.trace, recovery = checked.value.recovery)
+                    } ?: overridden?.takeIf {
+                        it.state == ModeState.NOT_INSTALLED && checkExistingChannel &&
+                            checked.value.rule == DetectionRules.Rule.R12_INDETERMINATE
                     }?.let { fallback ->
                         // The state stays uninstalled until a live channel succeeds. Keep
                         // the completed S1 probe for pending boot-image setup and pairing.
                         fallback.copy(trace = fallback.trace + checked.value.trace)
                     } ?: checked.value
-                EnvironmentProbeResult.TimedOut -> return failed("MODE_DETECT_TIMEOUT", "environment probe timed out")
-                EnvironmentProbeResult.Busy -> return failed("MODE_DETECT_BUSY", "previous environment probe is still stopping")
-                is EnvironmentProbeResult.Failed -> return failed("MODE_DETECT_FAILED", checked.cause.message.orEmpty())
+                EnvironmentProbeResult.TimedOut -> return failed("MODE_DETECT_TIMEOUT", "environment probe timed out", currentUltraOwner)
+                EnvironmentProbeResult.Busy -> return failed("MODE_DETECT_BUSY", "previous environment probe is still stopping", currentUltraOwner)
+                is EnvironmentProbeResult.Failed -> return failed("MODE_DETECT_FAILED", checked.cause.message.orEmpty(), currentUltraOwner)
             }
         }
         currentCoroutineContext().ensureActive()
@@ -176,8 +187,14 @@ class ModeBootstrapPipeline(
         return outcome
     }
 
-    private fun failed(code: String, detail: String): BootstrapOutcome.Failed {
-        runtime.failBootstrap(code)
+    private fun failed(code: String, detail: String, currentIdentity: DetectionResult? = null): BootstrapOutcome.Failed {
+        if (currentIdentity != null) {
+            runtime.recordDetection(currentIdentity)
+            notify(BootstrapStage.RECORDED, null)
+            runtime.completeBootstrap(currentIdentity)
+            notify(BootstrapStage.BOOTSTRAP_COMPLETED, null)
+        }
+        runtime.failBootstrap(code, detail)
         notify(BootstrapStage.DETECT_FAILED, null)
         return BootstrapOutcome.Failed(code, detail)
     }

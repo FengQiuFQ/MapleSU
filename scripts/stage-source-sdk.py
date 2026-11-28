@@ -23,7 +23,7 @@ def copy_file(source, target):
 
 
 def stage(build_dir, output, base, backend_bundle=None, source_validation_review=None,
-          app_version=None, version_code=None):
+          app_version=None, version_code=None, gate_revalidation=None):
     assert (app_version is None) == (version_code is None), 'Product version requires both app version and version code'
     if app_version is not None:
         assert re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', app_version) and version_code > 0, 'Invalid product version'
@@ -34,8 +34,9 @@ def stage(build_dir, output, base, backend_bundle=None, source_validation_review
     output_identity = None
     try:
         output_identity = output.stat(follow_symlinks=False)
-        return _stage_candidate(build_dir, output, base, backend_bundle, source_validation_review,
-                                app_version, version_code)
+        arguments = (build_dir, output, base, backend_bundle, source_validation_review, app_version, version_code)
+        return (_stage_candidate(*arguments) if gate_revalidation is None else
+                _stage_candidate(*arguments, gate_revalidation=gate_revalidation))
     except BaseException:
         try:
             current = output.stat(follow_symlinks=False)
@@ -52,13 +53,15 @@ def stage(build_dir, output, base, backend_bundle=None, source_validation_review
 
 
 def _stage_candidate(build_dir, output, base, backend_bundle, source_validation_review=None,
-                     app_version=None, version_code=None):
+                     app_version=None, version_code=None, gate_revalidation=None):
     report_path = build_dir / 'report/build-report.json'
     report = json.loads(report_path.read_text(encoding='utf-8'))
     assert report.get('provenance', {}).get('schema') == 'maplesu-sdk-source-provenance/2', 'New candidates require current compile-boundary provenance'
-    inputs = source_inputs(report, ROOT, build_dir)
     validation = verify_source_build_status(report, report_path, ROOT, build_dir,
-        record(Path(source_validation_review), ROOT) if source_validation_review is not None else None)
+        record(Path(source_validation_review), ROOT) if source_validation_review is not None else None,
+        record(Path(gate_revalidation), ROOT) if gate_revalidation is not None else None)
+    inputs = source_inputs(report, ROOT, build_dir,
+                           allow_completed_gate_failure=gate_revalidation is not None)
     baseline_path = base / 'SDK-RELEASE.json'
     baseline = json.loads(baseline_path.read_text(encoding='utf-8-sig'))
     member_manifest = build_dir / 'manifest.jsonl'
@@ -130,6 +133,9 @@ def _stage_candidate(build_dir, output, base, backend_bundle, source_validation_
     if validation is not None:
         release['sourceBuild']['sourceValidation'] = validation
         release['statement'] = 'Isolated source validation candidate; original reference comparison failed. Behavior and device acceptance pending.'
+    if gate_revalidation is not None:
+        release['sourceBuild']['gateRevalidation'] = record(Path(gate_revalidation), ROOT)
+        release['statement'] = 'Development candidate: original compiled bytes with a separately revalidated ABI gate. Original full build failure retained; current full rebuild and device acceptance pending.'
     release['sourceBuild']['buildDirectory'] = build_dir.as_posix()
     if 'provenance' in report:
         release['sourceBuild']['provenanceSchema'] = report['provenance']['schema']
@@ -159,8 +165,10 @@ if __name__ == '__main__':
                         help='actual bundle manifest compiled into the source helper paired backend')
     parser.add_argument('--source-validation-review', type=Path,
                         help='independent full-generation source/provider/ABI review; original raw failure remains')
+    parser.add_argument('--gate-revalidation', type=Path,
+                        help='development-only independent real ABI gate on an unchanged completed source build')
     parser.add_argument('--app-version', help='product version paired with --version-code; SDK ABI version remains unchanged')
     parser.add_argument('--version-code', type=int)
     args = parser.parse_args()
     print(stage(args.build_dir, args.output, args.base, args.backend_bundle, args.source_validation_review,
-                args.app_version, args.version_code).relative_to(ROOT))
+                args.app_version, args.version_code, args.gate_revalidation).relative_to(ROOT))

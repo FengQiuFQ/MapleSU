@@ -1,0 +1,169 @@
+diff --git a/manager/app/src/main/cpp/jni.cc b/manager/app/src/main/cpp/jni.cc
+index 33dadca..9bd4b5b 100644
+--- a/manager/app/src/main/cpp/jni.cc
++++ b/manager/app/src/main/cpp/jni.cc
+@@ -8,10 +8,35 @@
+ 
+ #include <android/log.h>
+ #include <cstring>
++#include <cerrno>
+ 
+ #include "ksu.h"
+ #include "logging.h"
+ 
++extern "C"
++JNIEXPORT jintArray JNICALL
++Java_dev_maplesu_manager_ksu_KsuNatives_getCurrentInfo(JNIEnv *env, jobject) {
++    struct ksu_get_info_cmd info {};
++    jint status = get_current_info(info);
++    // Match the existing pre-driver getVersion()/is_manager() contract using
++    // one current legacy reply, without adding a fallback to the old getters.
++    if (status == -EBADF || status == -ENOTTY) {
++        const auto legacy = legacy_get_info();
++        if (legacy.first > 0) {
++            info.version = static_cast<uint32_t>(legacy.first);
++            info.flags = static_cast<uint32_t>(legacy.second) | KSU_GET_INFO_FLAG_MANAGER;
++            status = 0;
++        }
++    }
++    if (status < 0) errno = -status;
++    const jint values[] = {status, static_cast<jint>(info.version),
++                           static_cast<jint>(info.flags), static_cast<jint>(info.uapi_version)};
++    jintArray result = env->NewIntArray(4);
++    if (result == nullptr) return nullptr;
++    env->SetIntArrayRegion(result, 0, 4, values);
++    return env->ExceptionCheck() ? nullptr : result;
++}
++
+ extern "C"
+ JNIEXPORT jint JNICALL
+ Java_dev_maplesu_manager_ksu_KsuNatives_getVersion(JNIEnv *env, jobject) {
+@@ -291,7 +316,9 @@ Java_dev_maplesu_manager_ksu_KsuNatives_getAppProfile(JNIEnv *env, jobject, jstr
+     const bool keyOk = copy_string_into(env, pkg, profile.key, sizeof(profile.key));
+     profile.curr_uid = uid;
+ 
+-    bool useDefaultProfile = !keyOk || get_app_profile(&profile) != 0;
++    const int currentReadCode = keyOk ? get_app_profile(&profile) : -1;
++    const int currentReadErrno = !keyOk ? EINVAL : currentReadCode == 0 ? 0 : errno;
++    const bool useDefaultProfile = currentReadCode != 0;
+ 
+     auto cls = env->FindClass("com/maplesu/core/Natives$Profile");
+     if (jni_null(env, cls)) return nullptr;
+@@ -301,6 +328,8 @@ Java_dev_maplesu_manager_ksu_KsuNatives_getAppProfile(JNIEnv *env, jobject, jstr
+     if (jni_null(env, obj)) return nullptr;
+     auto keyField = env->GetFieldID(cls, "name", "Ljava/lang/String;");
+     auto currentUidField = env->GetFieldID(cls, "currentUid", "I");
++    auto currentReadCodeField = env->GetFieldID(cls, "currentReadCode", "I");
++    auto currentReadErrnoField = env->GetFieldID(cls, "currentReadErrno", "I");
+     auto allowSuField = env->GetFieldID(cls, "allowSu", "Z");
+ 
+     auto rootUseDefaultField = env->GetFieldID(cls, "rootUseDefault", "Z");
+@@ -319,7 +348,8 @@ Java_dev_maplesu_manager_ksu_KsuNatives_getAppProfile(JNIEnv *env, jobject, jstr
+ 
+     // 字段 ID 任一为 NULL（类被 R8 改过 / 类加载异常）→ 继续 Set*Field 就是 ART abort。
+     // 这种"结构性不匹配"宁可返回 null 让上层看到 null，也绝不能让进程 abort。
+-    if (jni_null(env, keyField) || jni_null(env, currentUidField) || jni_null(env, allowSuField) ||
++    if (jni_null(env, keyField) || jni_null(env, currentUidField) ||
++        jni_null(env, currentReadCodeField) || jni_null(env, currentReadErrnoField) || jni_null(env, allowSuField) ||
+         jni_null(env, rootUseDefaultField) || jni_null(env, rootTemplateField) ||
+         jni_null(env, uidField) || jni_null(env, gidField) || jni_null(env, groupsField) ||
+         jni_null(env, capabilitiesField) || jni_null(env, domainField) ||
+@@ -330,6 +360,8 @@ Java_dev_maplesu_manager_ksu_KsuNatives_getAppProfile(JNIEnv *env, jobject, jstr
+ 
+     env->SetObjectField(obj, keyField, env->NewStringUTF(profile.key));
+     env->SetIntField(obj, currentUidField, profile.curr_uid);
++    env->SetIntField(obj, currentReadCodeField, currentReadCode);
++    env->SetIntField(obj, currentReadErrnoField, currentReadErrno);
+ 
+     if (useDefaultProfile) {
+         // no profile found, so just use default profile:
+diff --git a/manager/app/src/main/cpp/ksu.cc b/manager/app/src/main/cpp/ksu.cc
+index 9acc5ec..ce567fb 100644
+--- a/manager/app/src/main/cpp/ksu.cc
++++ b/manager/app/src/main/cpp/ksu.cc
+@@ -57,8 +57,6 @@ static inline int64_t monotonic_now_ms() {
+     return static_cast<int64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
+ }
+ 
+-static struct ksu_get_info_cmd g_version {};
+-
+ /*
+  * 主动向内核申请驱动 fd（与 ksud 用的是同一个入口）。
+  * 🔴 注意：本函数**默认关闭**（KSU_ENABLE_INSTALL_DRIVER_FD = 0），原因见下方长注释。
+@@ -192,8 +190,6 @@ static inline void ensure_driver_fd() {
+     // 本进程没有 fd（启动那一刻内核还没认出管理器）—— 主动申请一次
+     fd = install_driver_fd();
+     if (fd >= 0) {
+-        // 拿到 fd 说明现在能通了，把之前可能缓存的"不是管理器"结论作废
+-        g_version = {};
+         __android_log_print(ANDROID_LOG_INFO, "7kkernel-ksu",
+                             "late install driver fd ok: %d", fd);
+     } else {
+@@ -212,21 +208,31 @@ static int ksuctl(unsigned long op, Args &&... args) {
+     return ioctl(fd, op, std::forward<Args>(args)...);
+ }
+ 
+-struct ksu_get_info_cmd get_info() {
+-    /*
+-     * 两边都别缓存"坏结论"：
+-     *   · version == 0        → 上一次根本没读成功，必须重试
+-     *   · MANAGER 标志为 0    → 可能是【隐身开着】或【appid 刚被作废还没重扫】，
+-     *     这两种都会自己恢复，缓存住就等于界面一直"未安装"。
+-     * 正常情况下（已认出、没隐身）才复用缓存，避免每次都 ioctl。
+-     */
+-    if (!g_version.version || !(g_version.flags & KSU_GET_INFO_FLAG_MANAGER)) {
+-        if (ksuctl(KSU_IOCTL_GET_INFO, &g_version) < 0) {
+-            ksuctl(KSU_IOCTL_GET_INFO_LEGACY, &g_version);
+-            g_version.uapi_version = 0;
++int get_current_info(struct ksu_get_info_cmd &info) {
++    info = {};
++    if (ksuctl(KSU_IOCTL_GET_INFO, &info) == 0) {
++        return 0;
++    }
++    // Only an unsupported ioctl selects the older ABI. Permission/transport
++    // failures are current failures, and partial copy-out bytes grant nothing.
++    int error = errno ? errno : EIO;
++    if (error == ENOTTY) {
++        info = {};
++        if (ksuctl(KSU_IOCTL_GET_INFO_LEGACY, &info) == 0) {
++            info.uapi_version = 0;
++            return 0;
+         }
++        error = errno ? errno : EIO;
+     }
+-    return g_version;
++    info = {};
++    errno = error;
++    return -error;
++}
++
++struct ksu_get_info_cmd get_info() {
++    struct ksu_get_info_cmd info {};
++    get_current_info(info);
++    return info;
+ }
+ 
+ uint32_t get_kernel_uapi_version() {
+@@ -469,8 +475,5 @@ bool stealth_set(bool enabled) {
+             return false;
+         }
+     }
+-    /* get_info() 的结果被缓存在 g_version 里,切换隐身状态后必须让它
+-     * 重新从内核读取 flags,否则 Natives.isManager 不会立刻变化。 */
+-    g_version = {};
+     return true;
+ }
+diff --git a/manager/app/src/main/cpp/ksu.h b/manager/app/src/main/cpp/ksu.h
+index 030c237..cd893a2 100644
+--- a/manager/app/src/main/cpp/ksu.h
++++ b/manager/app/src/main/cpp/ksu.h
+@@ -18,6 +18,9 @@ uint32_t get_manager_uapi_version();
+ 
+ uint32_t get_version();
+ 
++// One current response: 0 on success, -errno on failure with zeroed fields.
++int get_current_info(struct ksu_get_info_cmd &info);
++
+ bool uid_should_umount(int uid);
+ 
+ bool is_safe_mode();

@@ -14,6 +14,9 @@ public final class NativeBridge {
 
     private NativeBridge() {}
 
+    public static native String invokeWithDeadline(String operation, long deadlineNanos,
+        java.util.concurrent.Callable<String> callback);
+
     public static native String invokeWithLegacyCredential(String operation, String credential,
         java.util.concurrent.Callable<String> callback);
 
@@ -42,6 +45,7 @@ public final class NativeBridge {
     public static native String clearSuAuthList();
     public static native String setSuUidProfile(int uid, String packageName, boolean allow);
     public static native String getSuUidProfiles();
+    public static native String getSuRuntimeStatus();
 
     public static native String installModule(String zipFilePath, boolean isDevRunOnceMode);
     public static native String uninstallModule(String modUuid);

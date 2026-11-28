@@ -8,6 +8,16 @@ import org.junit.Test
 class ModeBootstrapRetryStateTest {
     private fun state() = ModeBootstrapRetryState(maxAttempts = 3, retryDelayMillis = 750)
 
+    @Test fun aLateFallbackTimerCannotRestartAnExhaustedAttemptWithoutARealRequest() {
+        val state = ModeBootstrapRetryState(maxAttempts = 1, retryDelayMillis = 0)
+        assertEquals(1, state.tryStart())
+        assertNull(state.finish(resolved = false))
+        assertNull(state.tryStart())
+        assertTrue(state.requestRetry().scheduleNow)
+        assertEquals(1, state.tryStart())
+        assertNull(state.finish(resolved = false))
+    }
+
     @Test fun warmupRetryAfterFinalDetectionSignalSurvivesUntilExecutionIsReleased() {
         val state = state()
         repeat(2) { state.tryStart(); state.finish(resolved = false) }

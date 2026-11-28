@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -86,7 +87,7 @@ def verify_source_helper_pair(manifest, source, build, helper, backend, root, bu
     return receipt
 
 
-def selected_policy_bundle_inputs(report, root, build_root):
+def selected_policy_bundle_inputs(report, root, build_root, *, allow_completed_gate_failure=False):
     """Qualify exact reused generator inputs, never their containing directory."""
     inputs = report['provenance']['inputs']
     if all((root / item['path']).resolve().is_relative_to(root) or
@@ -116,9 +117,12 @@ def selected_policy_bundle_inputs(report, root, build_root):
 
     proofs = [report['provenance'], generated['provenance']]
     indexes, snapshots = [], []
-    for proof in proofs:
-        assert (proof.get('schema') == 'maplesu-sdk-source-provenance/2' and proof.get('closure_complete') is True
-                and proof.get('incomplete_reasons') == [] and proof.get('runtime_acceptance') is False), 'SOURCE_SDK_BUNDLE_PROVENANCE'
+    for index, proof in enumerate(proofs):
+        incomplete = index == 0 and allow_completed_gate_failure
+        assert (proof.get('schema') == 'maplesu-sdk-source-provenance/2' and
+                proof.get('closure_complete') is (not incomplete) and
+                proof.get('incomplete_reasons') == (['build invocation failed; receipt covers only captured inputs'] if incomplete else []) and
+                proof.get('runtime_acceptance') is False), 'SOURCE_SDK_BUNDLE_PROVENANCE'
         index = {item['path']: item for item in proof['inputs']}
         assert len(index) == len(proof['inputs']) and proof.get('input_snapshots'), 'SOURCE_SDK_BUNDLE_PROVENANCE'
         saved = {}
@@ -162,14 +166,37 @@ def selected_policy_bundle_inputs(report, root, build_root):
     return allowed
 
 
-def verify_build_provenance(report, root, build_root=None):
+def completed_keyless_gate_failure(report):
+    """Identify a finished source build whose only recorded failure is its ABI gate."""
+    failure, gate = report.get('failure', {}), report.get('gate', {})
+    public = report.get('keyless_public_abi', {})
+    assert (failure.get('exit_code') == 7 and
+            failure.get('message', '').startswith('keyless delivery gate failed: ') and
+            gate.get('schema') == 'maplesu-sdk-keyless-delivery-gate/1' and
+            gate.get('status') == 'FAIL' and gate.get('exit_code') == 7 and
+            public.get('status') == 'FAIL' and public.get('problems') and
+            gate.get('problems') == public['problems']), 'SOURCE_SDK_REVALIDATION_ORIGINAL_FAILURE'
+    assert (report['compile']['members'] == report['compose']['members'] ==
+            report['pack']['members'] == 260 and not report['compile']['failures'] and
+            not report['pack']['problems'] and report['final_archive_stability']['passed'] is True), 'SOURCE_SDK_REVALIDATION_ORIGINAL_BUILD'
+    assert {'manifest', 'payloads', 'compile', 'compose', 'pack', 'assets', 'gate'} <= set(
+        report['stages_run']), 'SOURCE_SDK_REVALIDATION_ORIGINAL_STAGES'
+
+
+def verify_build_provenance(report, root, build_root=None, *, allow_completed_gate_failure=False):
     proof = report['provenance']
     assert isinstance(proof, dict) and proof.get('schema') in ('maplesu-sdk-source-provenance/1', 'maplesu-sdk-source-provenance/2'), 'SOURCE_SDK_PROVENANCE_SCHEMA'
     current_contract = proof['schema'] == 'maplesu-sdk-source-provenance/2'
-    assert proof.get('closure_complete') is True and proof.get('incomplete_reasons') == [], 'SOURCE_SDK_PROVENANCE_INCOMPLETE'
+    if allow_completed_gate_failure:
+        completed_keyless_gate_failure(report)
+        assert (proof.get('closure_complete') is False and proof.get('incomplete_reasons') ==
+                ['build invocation failed; receipt covers only captured inputs']), 'SOURCE_SDK_REVALIDATION_INCOMPLETE'
+    else:
+        assert proof.get('closure_complete') is True and proof.get('incomplete_reasons') == [], 'SOURCE_SDK_PROVENANCE_INCOMPLETE'
     assert proof.get('runtime_acceptance') is False, 'SOURCE_SDK_PROVENANCE_SCOPE'
     inputs = proof['inputs']
-    bundle_inputs = selected_policy_bundle_inputs(report, root, build_root)
+    bundle_inputs = selected_policy_bundle_inputs(report, root, build_root,
+        allow_completed_gate_failure=allow_completed_gate_failure)
     by_path = {item['path']: item for item in inputs}
     assert inputs and len(by_path) == len(inputs), 'SOURCE_SDK_PROVENANCE_INPUTS'
     for item in inputs:
@@ -229,7 +256,7 @@ def verify_build_provenance(report, root, build_root=None):
     assert units and len(by_object) == len(units), 'SOURCE_SDK_PROVENANCE_UNITS'
     for unit in units:
         assert unit.get('dependency_kind') in ('compiler-mmd', 'ir-source'), 'SOURCE_SDK_DEPENDENCY_KIND'
-        assert unit['stage'] in ('compile', 'compose', 'payload', 'source-helper', 'source-backend', 'experimental-helper', 'link-sample', 'public-abi'), 'SOURCE_SDK_PROVENANCE_STAGE'
+        assert unit['stage'] in ('compile', 'compose', 'payload', 'source-helper', 'source-backend', 'experimental-helper', 'link-sample', 'public-abi', 'explicit-legacy-abi'), 'SOURCE_SDK_PROVENANCE_STAGE'
         assert unit.get('dependencies') and len(set(unit['dependencies'])) == len(unit['dependencies']), 'SOURCE_SDK_DEPENDENCIES'
         sources = {unit['source'], unit.get('build_source', unit['source'])}
         for name in unit['dependencies'] + list(sources):
@@ -313,14 +340,23 @@ def verify_build_provenance(report, root, build_root=None):
                       'precompile', 'precompile_complete', 'precompile_errors', 'dependency_kind'):
             assert unit[field] == output[field], 'SOURCE_SDK_PUBLIC_ABI_UNIT'
         assert unit['dependencies'] == [item['path'] for item in output['dependencies']], 'SOURCE_SDK_PUBLIC_ABI_DEPENDENCIES'
+    explicit_units = [unit for unit in units if unit['stage'] == 'explicit-legacy-abi']
+    expected_explicit = (public or {}).get('explicit_legacy_abi', {}).get('units', [])
+    assert len(explicit_units) == len(expected_explicit), 'SOURCE_SDK_EXPLICIT_ABI_COVERAGE'
+    for unit, output in zip(explicit_units, expected_explicit):
+        for field in ('source', 'build_source', 'object', 'bytes', 'sha256', 'stage',
+                      'precompile', 'precompile_complete', 'precompile_errors', 'dependency_kind'):
+            assert unit[field] == output[field], 'SOURCE_SDK_EXPLICIT_ABI_UNIT'
+        assert unit['dependencies'] == [item['path'] for item in output['dependencies']], 'SOURCE_SDK_EXPLICIT_ABI_DEPENDENCIES'
     toolchain = proof.get('toolchain') or {}
     assert toolchain.get('ndk_root') and toolchain.get('ndk_version') and toolchain.get('target'), 'SOURCE_SDK_TOOLCHAIN'
     assert all(toolchain.get('versions', {}).get(name) not in (None, '', 'unavailable') for name in ('clang', 'llvm-ar', 'ld.lld')), 'SOURCE_SDK_TOOLCHAIN_VERSIONS'
     return inputs
 
 
-def source_inputs(report, root, build_root=None):
-    provenance_inputs = verify_build_provenance(report, root, build_root) if 'provenance' in report else None
+def source_inputs(report, root, build_root=None, *, allow_completed_gate_failure=False):
+    provenance_inputs = verify_build_provenance(report, root, build_root,
+        allow_completed_gate_failure=allow_completed_gate_failure) if 'provenance' in report else None
     inputs = {}
     for row in report['compile']['rows']:
         hashes = row.get('source_sha256', {})
@@ -639,7 +675,144 @@ def verify_source_validation(build, report_path, review_item, root, build_root):
                 review=record(review_path, root), rawGate=validation['raw_gate'])
 
 
-def verify_keyless_source_gate(build, root, build_root):
+def external_elf_rows(data, machine):
+    from elftools.elf.elffile import ELFFile
+    elf = ELFFile(io.BytesIO(data))
+    assert elf.little_endian and elf['e_machine'] == machine, 'SOURCE_SDK_EXPLICIT_ABI_ELF'
+    result = []
+    table = elf.get_section_by_name('.symtab')
+    assert table is not None, 'SOURCE_SDK_EXPLICIT_ABI_SYMBOLS'
+    for symbol in table.iter_symbols():
+        bind, section = symbol['st_info']['bind'], symbol['st_shndx']
+        if not symbol.name or bind not in ('STB_GLOBAL', 'STB_WEAK'):
+            continue
+        if section == 'SHN_UNDEF':
+            kind = ('v' if symbol['st_info']['type'] == 'STT_OBJECT' else 'w') if bind == 'STB_WEAK' else 'U'
+        elif bind == 'STB_WEAK':
+            kind = 'V' if symbol['st_info']['type'] == 'STT_OBJECT' else 'W'
+        elif section == 'SHN_ABS':
+            kind = 'A'
+        elif section == 'SHN_COMMON':
+            kind = 'C'
+        elif isinstance(section, int) and elf.get_section(section)['sh_flags'] & 4:
+            kind = 'T'
+        elif isinstance(section, int) and elf.get_section(section)['sh_type'] == 'SHT_NOBITS':
+            kind = 'B'
+        else:
+            kind = 'D' if isinstance(section, int) and elf.get_section(section)['sh_flags'] & 1 else 'R'
+        result.append(dict(symbol=symbol.name, kind=kind))
+    return result
+
+
+def verify_explicit_legacy_abi(public, build, root, build_root, tools, archive, members,
+                               keyless, raw_symbols, tool_input):
+    proof = public['explicit_legacy_abi']
+    assert (proof.get('schema') == 'maplesu-sdk-explicit-legacy-abi/1' and proof.get('status') == 'PASS' and
+            proof.get('problems') == [] and proof.get('runtime_acceptance') is False), 'SOURCE_SDK_EXPLICIT_ABI_SCOPE'
+    contract_path = checked(proof['contract'], root)
+    assert contract_path == tools / 'explicit_legacy_abi.json', 'SOURCE_SDK_EXPLICIT_ABI_CONTRACT'
+    contract = json.loads(contract_path.read_text(encoding='utf-8'))
+    sdk_root = root / 'runtime/maplesu-sdk'
+    source = checked(proof['source'], root)
+    assert source == sdk_root / keyless.EXPLICIT_LEGACY_SOURCE, 'SOURCE_SDK_EXPLICIT_ABI_SOURCE'
+    assert checked(proof['manifest'], root, build_root) == build_root / 'manifest.jsonl', 'SOURCE_SDK_EXPLICIT_ABI_MANIFEST'
+    units = [unit for row in build['compile']['rows'] if row['idx'] == 53 for unit in row['outputs']
+             if (root / unit['source']).resolve() == source]
+    composed = [row for row in build['compose']['rows'] if row['idx'] == 53]
+    assert len(units) == len(composed) == 1 and proof['compile_unit'] == units[0] and proof['compose'] == composed[0], 'SOURCE_SDK_EXPLICIT_ABI_ORIGINAL'
+    unit, compose, member = units[0], composed[0], members[53]
+    original_object = checked(dict(path=unit['object'], size=unit['bytes'], sha256=unit['sha256']), root, build_root)
+    assert (root / unit['build_source']).resolve() == source and unit['source_sha256'] == unit['build_source_sha256'] == sha(source), 'SOURCE_SDK_EXPLICIT_ABI_ORIGINAL_SOURCE'
+    assert unit['dependency_complete'] and unit['precompile_complete'] and not unit['dependency_errors'] and not unit['precompile_errors'], 'SOURCE_SDK_EXPLICIT_ABI_ORIGINAL_DEPS'
+    assert proof['source'] in unit['dependencies'], 'SOURCE_SDK_EXPLICIT_ABI_ORIGINAL_DEPS'
+    for item in unit['dependencies']:
+        checked(item, root, build_root)
+    assert (dict(path=unit['object'], size=unit['bytes'], sha256=unit['sha256']) in compose['object_inputs'] and
+            proof['archive_member'] == dict(idx=53, name=member['name'], size=member['size'], sha256=member['sha256']) and
+            member['name'] == keyless.EXPLICIT_LEGACY_MEMBER['name'] and
+            (member['size'], member['sha256']) == (compose['bytes'], compose['sha256'])), 'SOURCE_SDK_EXPLICIT_ABI_MEMBER'
+    checked(dict(path=compose['object'], size=compose['bytes'], sha256=compose['sha256']), root, build_root)
+    nm_tool = tool_input(public['tools_before'][2])
+
+    def nm_capture(capture, target, flags):
+        assert capture['argv'] == [str(nm_tool), *flags, str(target)], 'SOURCE_SDK_EXPLICIT_ABI_NM_COMMAND'
+        return checked(capture['output'], root, build_root).read_text(encoding='utf-8')
+
+    captured_text = nm_capture(proof['archive_nm'], archive,
+        ['-A', '--defined-only', '--extern-only', '--format=posix'])
+    captured = keyless.archive_legacy_providers(captured_text, contract)
+    expected_symbols = {row['symbol'] for row in contract['symbols']}
+    # LLVM archives contain both ELF and source-built bitcode members. Replay
+    # the bound reader so every format and duplicate provider is measured.
+    replay = subprocess.run(proof['archive_nm']['argv'], capture_output=True, text=True, encoding='utf-8')
+    assert replay.returncode == 0 and replay.stdout == captured_text, 'SOURCE_SDK_EXPLICIT_ABI_ARCHIVE_NM'
+    actual = keyless.archive_legacy_providers(replay.stdout, contract)
+    assert actual == captured == proof['archive_providers'], 'SOURCE_SDK_EXPLICIT_ABI_PROVIDERS'
+    measured_definitions, measured_references, pairs = {}, {'arm64': {}, 'armv7': {}}, set()
+    assert len(proof['probes']) == len(proof['units']) == 6, 'SOURCE_SDK_EXPLICIT_ABI_PROBE_COVERAGE'
+    for probe, probe_unit in zip(proof['probes'], proof['units']):
+        abi, kind = probe['abi'], probe['kind']
+        assert (abi, kind) not in pairs and abi in ('arm64', 'armv7') and kind in ('adapter', 'original', 'current'), 'SOURCE_SDK_EXPLICIT_ABI_PROBE'
+        pairs.add((abi, kind))
+        selected = checked(probe['source'], root)
+        assert selected == (source if kind == 'adapter' else tools / 'explicit_legacy_public_abi.cpp'), 'SOURCE_SDK_EXPLICIT_ABI_PROBE_SOURCE'
+        obj = checked(probe['object'], root, build_root)
+        assert probe['unit'] == probe_unit and probe_unit['object'] == probe['object']['path'] and probe_unit['stage'] == 'explicit-legacy-abi', 'SOURCE_SDK_EXPLICIT_ABI_PROBE_UNIT'
+        assert probe_unit['sha256'] == probe['object']['sha256'] and probe_unit['bytes'] == probe['object']['size'], 'SOURCE_SDK_EXPLICIT_ABI_PROBE_OBJECT'
+        assert probe_unit['dependency_complete'] and probe_unit['precompile_complete'] and not probe_unit['dependency_errors'] and not probe_unit['precompile_errors'], 'SOURCE_SDK_EXPLICIT_ABI_PROBE_DEPS'
+        pre = probe_unit['precompile']
+        assert pre['complete'] and not pre['errors'] and pre['object'] == probe_unit['object'] and pre['source'] == probe['source']['path'], 'SOURCE_SDK_EXPLICIT_ABI_PROBE_PRECOMPILE'
+        assert pre['inputs'] == probe_unit['dependencies'], 'SOURCE_SDK_EXPLICIT_ABI_PROBE_PRECOMPILE'
+        for item in probe_unit['dependencies']:
+            checked(item, root, build_root)
+        command = probe['compile_argv']
+        target = 'aarch64-linux-android21' if abi == 'arm64' else 'armv7a-linux-androideabi23'
+        assert (Path(command[0]).resolve() == tool_input(public['tools_before'][0]) and '--target=' + target in command and
+                Path(command[command.index('-c') + 1]).resolve() == selected and
+                Path(command[command.index('-o') + 1]).resolve() == obj), 'SOURCE_SDK_EXPLICIT_ABI_PROBE_COMMAND'
+        include = sdk_root / keyless.EXPLICIT_LEGACY_INCLUDE if kind == 'original' else sdk_root / 'include'
+        assert any(command[index:index + 2] == ['-I', str(include)] for index in range(len(command))), 'SOURCE_SDK_EXPLICIT_ABI_PROBE_INCLUDE'
+        rows = [dict(symbol=parts[0], kind=parts[1]) for line in nm_capture(probe['nm'], obj,
+                ['--extern-only', '--format=posix']).splitlines() if (parts := line.split())]
+        actual_rows = external_elf_rows(obj.read_bytes(), 'EM_AARCH64' if abi == 'arm64' else 'EM_ARM')
+        assert sorted(rows, key=lambda row: row['symbol']) == sorted(actual_rows, key=lambda row: row['symbol']), 'SOURCE_SDK_EXPLICIT_ABI_PROBE_NM'
+        if kind == 'adapter':
+            measured_definitions[abi] = [row for row in rows if row['kind'] not in ('U', 'w', 'W', 'V')]
+        else:
+            measured_references[abi][kind] = sorted(row['symbol'] for row in rows if row['kind'] in ('U', 'w', 'v') and
+                row['symbol'].startswith(('_ZN10skroot_env', '_ZN7maplesu', '_ZN11kernel_root')))
+        assert ('link' in probe) == (abi == 'arm64' and kind != 'adapter'), 'SOURCE_SDK_EXPLICIT_ABI_LINK_COVERAGE'
+        if 'link' in probe:
+            command = probe['link']['argv']
+            output = checked(probe['link']['output'], root, build_root)
+            assert (Path(command[0]).resolve() == tool_input(public['tools_before'][0]) and
+                    all(flag in command for flag in ('-shared', '-Wl,--no-undefined', '-Wl,--no-gc-sections')) and
+                    '-Wl,--gc-sections' not in command and str(obj) in command and str(archive) in command and
+                    Path(command[command.index('-o') + 1]).resolve() == output), 'SOURCE_SDK_EXPLICIT_ABI_LINK'
+            assert expected_symbols <= elf_symbol_sets(output)[0], 'SOURCE_SDK_EXPLICIT_ABI_LINK_EXPORTS'
+    original_rows = [dict(symbol=parts[0], kind=parts[1]) for line in nm_capture(proof['archive_input_nm'], original_object,
+        ['--extern-only', '--defined-only', '--format=posix']).splitlines() if (parts := line.split())]
+    original_strong = [row for row in original_rows if row['kind'] not in ('U', 'w', 'W', 'V')]
+    assert sorted(original_strong, key=lambda row: row['symbol']) == sorted(measured_definitions['arm64'], key=lambda row: row['symbol']), 'SOURCE_SDK_EXPLICIT_ABI_ORIGINAL_EXPORTS'
+    assert measured_definitions == proof['adapter_definitions'] and measured_references == proof['consumer_references'], 'SOURCE_SDK_EXPLICIT_ABI_MEASUREMENTS'
+    tool_input(public['signature_tool'])
+    raw = checked(public['signature_input'], root, build_root).read_text(encoding='utf-8').splitlines()
+    demangled = checked(public['signature_output'], root, build_root).read_text(encoding='utf-8').splitlines()
+    assert raw == list(dict.fromkeys([*sorted(raw_symbols), *sorted(public['required_symbols'])])) and len(raw) == len(demangled), 'SOURCE_SDK_EXPLICIT_ABI_SIGNATURE_CAPTURE'
+    signatures = dict(zip(raw, demangled))
+    assert public['required_symbols'] == {name: signatures[name] for name in public['required_symbols']}, 'SOURCE_SDK_EXPLICIT_ABI_REQUIRED_SIGNATURES'
+    assert proof['symbol_signatures'] == {name: signatures.get(name) for name in expected_symbols}, 'SOURCE_SDK_EXPLICIT_ABI_SIGNATURES'
+    assert not keyless.explicit_legacy_abi_problems(contract, archive_providers=actual,
+        adapter_definitions=measured_definitions, consumer_references=measured_references,
+        symbol_signatures=signatures, keyless_required=public['required_symbols']), 'SOURCE_SDK_EXPLICIT_ABI_CONTRACT_FAILED'
+    approved = {row['symbol']: row['signature'] for row in contract['symbols']}
+    assert not keyless.retired_api_problems(sorted(raw_symbols), [signatures[name] for name in sorted(raw_symbols)],
+        list(public['required_symbols'].values()), explicit_legacy=approved), 'SOURCE_SDK_KEYLESS_RETIRED_API'
+    checked(proof['contract'], root)
+    checked(proof['source'], root)
+
+
+def verify_keyless_source_gate(build, root, build_root, *, gate_root=None, gate_tools=None):
     """Verify the current ABI and real links without requiring old epoch equivalence."""
     assert build_root is not None and build.get('source_selection'), 'SOURCE_SDK_KEYLESS_SELECTION'
     gate = build['gate']
@@ -647,7 +820,7 @@ def verify_keyless_source_gate(build, root, build_root):
             and gate['reference_equivalence'] is False and gate['runtime_acceptance'] is False), 'SOURCE_SDK_KEYLESS_GATE'
     assert build['final_archive_stability']['passed'] is True, 'SOURCE_SDK_KEYLESS_PAIRING'
     assert 'link_sample' not in build['stages_run'] and 'verify' not in build['stages_run'], 'SOURCE_SDK_KEYLESS_REFERENCE_RESIDUAL'
-    tools = root / 'runtime/maplesu-sdk/sdk/tools'
+    tools = gate_tools or root / 'runtime/maplesu-sdk/sdk/tools'
     spec = importlib.util.spec_from_file_location('source_sdk_keyless_gate', tools / 'keyless_gate.py')
     keyless = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(keyless)
@@ -690,11 +863,15 @@ def verify_keyless_source_gate(build, root, build_root):
     assert actual == providers and providers, 'SOURCE_SDK_KEYLESS_LINK_PROVIDERS'
     symbols = json.loads(checked(validation['symbols'], root, build_root).read_text(encoding='utf-8'))
     raw_symbols = set().union(*(set(symbols[field]) for field in ('defined', 'undefined', 'weak_defined', 'weak_undefined')))
-    assert not raw_symbols.intersection(keyless.RETIRED_SYMBOLS), 'SOURCE_SDK_KEYLESS_RETIRED_API'
     public_path = (root / gate['public_abi']).resolve()
-    assert public_path == build_root / 'report/keyless-public-abi.json', 'SOURCE_SDK_KEYLESS_PUBLIC_PATH'
+    assert public_path == (gate_root or build_root) / 'report/keyless-public-abi.json', 'SOURCE_SDK_KEYLESS_PUBLIC_PATH'
     public = json.loads(public_path.read_text(encoding='utf-8'))
     assert public == build['keyless_public_abi'] and public['schema'] == 'maplesu-sdk-keyless-public-abi/1', 'SOURCE_SDK_KEYLESS_PUBLIC_RECEIPT'
+    if 'explicit_legacy_abi' in public:
+        verify_explicit_legacy_abi(public, build, root, build_root, tools, archive, members,
+                                   keyless, raw_symbols, tool_input)
+    else:
+        assert not raw_symbols.intersection(keyless.RETIRED_SYMBOLS), 'SOURCE_SDK_KEYLESS_RETIRED_API'
     assert public['status'] == 'PASS' and public['problems'] == [] and public['runtime_acceptance'] is False, 'SOURCE_SDK_KEYLESS_PUBLIC_STATUS'
     assert not keyless.legacy_credential_problems(public['required_symbols']), 'SOURCE_SDK_KEYLESS_PUBLIC_CREDENTIAL'
     assert public['legacy_credential_symbols'] == sorted(raw_symbols.intersection(keyless.LEGACY_CREDENTIAL_SYMBOLS)), 'SOURCE_SDK_LEGACY_CREDENTIAL_RECEIPT'
@@ -715,8 +892,56 @@ def verify_keyless_source_gate(build, root, build_root):
     assert all(name.removesuffix('_keyless_v1') not in raw_symbols for name in expected if name.endswith('_keyless_v1')), 'SOURCE_SDK_KEYLESS_RETIRED_MODULE'
 
 
-def verify_source_build_status(build, report_path, root, build_root, validation_review=None):
+def verify_gate_revalidation(build, report_path, revalidation, root, build_root):
+    """Check a new real ABI gate without rewriting the original failed full build."""
+    completed_keyless_gate_failure(build)
+    receipt_path = checked(revalidation, root, build_root)
+    proof = json.loads(receipt_path.read_text(encoding='utf-8'))
+    assert (proof.get('schema') == 'maplesu-sdk-gate-revalidation/1' and proof.get('status') == 'PASS' and
+            proof.get('scope') == 'original-compiled-bytes-new-gate-development-only' and
+            all(proof.get(key) is False for key in ('formalRelease', 'cleanReproducibility', 'freshClaim'))), 'SOURCE_SDK_REVALIDATION_SCOPE'
+    assert proof['originalBuildReport'] == record(report_path, root), 'SOURCE_SDK_REVALIDATION_ORIGINAL_REPORT'
+    assert proof['originalSourceSelection'] == build['source_selection']['manifest'], 'SOURCE_SDK_REVALIDATION_SELECTION'
+    assert proof['archive'] == dict(path=build['pack']['archive'], size=build['pack']['bytes'],
+                                    sha256=build['pack']['sha256']), 'SOURCE_SDK_REVALIDATION_ARCHIVE'
+    checked(proof['archive'], root, build_root)
+    gate_root, tool_root = [(root / proof[key]).resolve() for key in ('gateRoot', 'toolRoot')]
+    assert (gate_root.is_relative_to(root) and tool_root.is_relative_to(root) and
+            gate_root != tool_root and not gate_root.is_relative_to(build_root) and
+            receipt_path == gate_root / 'GATE-REVALIDATION.json'), 'SOURCE_SDK_REVALIDATION_PATH'
+    required_tools = {'build.py', 'tools/keyless_gate.py', 'tools/explicit_legacy_abi.json',
+                      'tools/explicit_legacy_public_abi.cpp', 'tools/keyless_public_abi.cpp'}
+    observed_tools = {}
+    for item in proof['toolFiles']:
+        path = checked(item, root)
+        assert path.is_relative_to(tool_root), 'SOURCE_SDK_REVALIDATION_TOOL_PATH'
+        name = path.relative_to(tool_root).as_posix()
+        assert name not in observed_tools, 'SOURCE_SDK_REVALIDATION_TOOL_DUPLICATE'
+        observed_tools[name] = item
+    assert set(observed_tools) == required_tools, 'SOURCE_SDK_REVALIDATION_TOOL_SET'
+    for field, name in (('runner', 'scripts/revalidate-source-sdk-gate.py'),
+                        ('validator', 'scripts/source_sdk_delivery.py')):
+        assert checked(proof[field], root) == root / name, 'SOURCE_SDK_REVALIDATION_RUNNER'
+    stage_path = checked(proof['gateResult'], root)
+    assert stage_path == gate_root / 'report/gate-result.json', 'SOURCE_SDK_REVALIDATION_RESULT_PATH'
+    stage = json.loads(stage_path.read_text(encoding='utf-8'))
+    assert stage.get('schema') == 'maplesu-sdk-gate-revalidation-stage/1', 'SOURCE_SDK_REVALIDATION_RESULT_SCHEMA'
+    assert set(stage) == {'schema', 'gate', 'keyless_public_abi', 'source_validation'}, 'SOURCE_SDK_REVALIDATION_RESULT_FIELDS'
+    verify_build_provenance(build, root, build_root, allow_completed_gate_failure=True)
+    current = dict(build, **{key: stage[key] for key in ('gate', 'keyless_public_abi', 'source_validation')})
+    verify_keyless_source_gate(current, root, build_root, gate_root=gate_root, gate_tools=tool_root / 'tools')
+    assert (proof.get('originalReportUnchanged') is True and proof.get('archiveUnchanged') is True and
+            proof.get('sourceInputsUnchanged') is True), 'SOURCE_SDK_REVALIDATION_STABILITY'
+    return proof
+
+
+def verify_source_build_status(build, report_path, root, build_root, validation_review=None,
+                               gate_revalidation=None):
     assert not build['compile']['failures'], 'SOURCE_SDK_BUILD_FAILED'
+    if gate_revalidation is not None:
+        assert validation_review is None, 'SOURCE_SDK_REVALIDATION_REVIEW_CONFLICT'
+        verify_gate_revalidation(build, report_path, gate_revalidation, root, build_root)
+        return None
     if validation_review is not None:
         return verify_source_validation(build, report_path, validation_review, root, build_root)
     assert 'failure' not in build, 'SOURCE_SDK_BUILD_FAILED'
@@ -741,8 +966,9 @@ def verify_source_delivery(manifest, root):
     if 'provenanceSchema' in source:
         assert build.get('provenance', {}).get('schema') == source['provenanceSchema'], 'SOURCE_SDK_PROVENANCE_REQUIRED'
     validation = source.get('sourceValidation')
+    revalidation = source.get('gateRevalidation')
     outcome = verify_source_build_status(build, report_path, root, build_root,
-        validation['review'] if validation is not None else None)
+        validation['review'] if validation is not None else None, revalidation)
     assert outcome == validation, 'SOURCE_SDK_VALIDATION_RELEASE_RECEIPT'
     packed = build['pack']
     assert packed['sha256'] == sha(archive) and packed['bytes'] == archive.stat().st_size, 'SOURCE_SDK_PACK_STALE'
@@ -769,7 +995,7 @@ def verify_source_delivery(manifest, root):
         assert composition['idx'] == entry['idx'] and composition['sha256'] == member['sha256'], 'SOURCE_SDK_COMPOSE_OBJECT'
         assert composition['inputs'] == entry['sources'], 'SOURCE_SDK_COMPOSE_INPUTS'
         checked(dict(path=entry['object'], size=member['size'], sha256=entry['object_sha256']), root, build_root)
-    assert source_inputs(build, root, build_root) == source['inputs'], 'SOURCE_SDK_SOURCE_RECEIPT'
+    assert source_inputs(build, root, build_root, allow_completed_gate_failure=revalidation is not None) == source['inputs'], 'SOURCE_SDK_SOURCE_RECEIPT'
     input_headers = root / build['compile']['include_dirs'][0]
     archive_root = archive.parents[2]
     assert source['headers'] and {item['input']['path'] for item in source['headers']} == {

@@ -10,6 +10,46 @@ import org.junit.Test
 class UltraColdStartDetectorTest {
     private val request = DetectionRequest(DetectionOrigin.AFTER_ROOT_GRANTED, true, true)
 
+    @Test fun ourReadOnlyCompatibilityReceiptStillAllowsACurrentUltraOwnerQuery() = runBlocking {
+        val calls = mutableListOf<String>()
+        val result = DefaultModeDetector(
+            ksuProbe = KsuKernelProbe { KsuFacts(true, 10940, 0, false) },
+            ultraPort = object : UltraEnvironmentPort {
+                override fun state() = UltraState.UNKNOWN
+                override fun observe(allowRefresh: Boolean, allowOwnerQuery: Boolean): UltraEnvironmentObservation {
+                    assertTrue("The compatibility receipt is not an exclusive foreign identity", allowOwnerQuery)
+                    assertEquals(false, allowRefresh)
+                    calls += "currentOwner"
+                    return UltraEnvironmentObservation(UltraState.UNKNOWN, managerOwnerBound = true)
+                }
+            },
+            liteProbe = LiteCredentialProbe { error("An ambiguous legacy ABI does not permit a credential probe") },
+            liteHandshakeProbe = LiteHandshakeProbe { error("An owner query must not grant a Root handshake") },
+            jailbreakLease = JailbreakLeaseProbe { error("An owner query must not start a Hook lease") },
+            rootEvidenceReader = object : RootEvidenceReader {
+                override fun open(channel: RootChannelKind): RootEvidenceSession? = error("Owner identity grants no Root")
+            },
+            bootIdSource = BootIdSource { "boot" },
+        ).detect(request.copy(allowJailbreakProbe = true))
+        assertEquals(listOf("currentOwner"), calls)
+        assertEquals(DetectionRules.Rule.R6_A_ULTRA_OWNER_ONLY, result.rule)
+        assertEquals(ModeState.MODE_A_INSTALLED_UNBOUND, result.state)
+        assertEquals(RecoveryReadiness.NONE, result.recovery)
+        assertNull(result.rootChannel)
+        assertEquals(true, result.trace.single { it.id == "S1" }.ok)
+    }
+
+    @Test fun anAmbiguousLegacyAbiWithNoCurrentOwnerDoesNotInventAForeignIdentity() = runBlocking {
+        val result = DefaultModeDetector(
+            ksuProbe = KsuKernelProbe { KsuFacts(true, 10940, 0, false) },
+            ultraPort = UltraEnvironmentPort { UltraState.UNKNOWN },
+            bootIdSource = BootIdSource { "boot" },
+        ).detect(request)
+        assertEquals(ModeState.INDETERMINATE, result.state)
+        assertEquals(DetectionRules.Rule.R12_INDETERMINATE, result.rule)
+        assertNull(result.rootChannel)
+    }
+
     @Test fun verifiedUltraKernelWithUnconfirmedUserspaceSelectsUltraWithoutLegacyOrHook() = runBlocking {
         var refreshed = false
         val result = DefaultModeDetector(

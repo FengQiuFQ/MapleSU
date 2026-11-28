@@ -31,6 +31,12 @@ public final class IdentityProbeService extends Service {
         return new Binder() {
             @Override
             protected boolean onTransact(int code, Parcel data, Parcel reply, int flags) throws RemoteException {
+                if (code == FIRST_CALL_TRANSACTION + 11) {
+                    data.enforceInterface(DESCRIPTOR);
+                    if (reply == null) throw new IllegalArgumentException("Missing fixture reply");
+                    NativeSuProbe.suCompatBefore(IdentityProbeService.this, data.readLong(), reply);
+                    return true;
+                }
                 if (code == FIRST_CALL_TRANSACTION + 10) {
                     data.enforceInterface(DESCRIPTOR);
                     if (reply == null) throw new IllegalArgumentException("Missing fixture reply");

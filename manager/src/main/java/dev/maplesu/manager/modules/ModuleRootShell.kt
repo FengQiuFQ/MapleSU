@@ -6,6 +6,7 @@ import dev.maplesu.manager.runtime.RootExec
 import dev.maplesu.manager.runtime.RootExecResult
 import dev.maplesu.manager.runtime.RootManagement
 import dev.maplesu.manager.runtime.UltraRootCommandReceipt
+import dev.maplesu.manager.runtime.ultra.UltraRuntimeClient
 import dev.maplesu.manager.runtime.ultra.UltraSdkCredentials
 import dev.maplesu.manager.workmode.ModeRuntime
 import dev.maplesu.manager.workmode.WorkMode
@@ -104,18 +105,18 @@ internal class ManagementModuleScriptRunner(context: Context) : ModuleScriptRunn
             // A bounded inventory needs only one authenticated SDK request, not a cold
             // streaming service. SDK write admission and the shell exit receipt remain.
             val client = UltraSdkCredentials.client(app)
-            val frame = UltraRootCommandReceipt(script)
-            val receipt = client.runRootCommand(frame.command)
-            if (!receipt.succeeded) {
-                ModuleScriptOutput(-1, err = "MODULE_SNAPSHOT_SDK:${receipt.sdkError}")
-            } else {
-                val result = frame.decode(client.decodeText(receipt.string("result")).orEmpty())
-                ModuleScriptOutput(result.code, result.output, result.detail)
-            }
+            readSdkSnapshot(script, client)
         } catch (error: Exception) {
             if (error is InterruptedException) Thread.currentThread().interrupt()
             ModuleScriptOutput(-1, err = "MODULE_ROOT_TRANSPORT:${error.javaClass.simpleName}")
         }
+    }
+
+    internal fun readSdkSnapshot(script: String, client: UltraRuntimeClient): ModuleScriptOutput {
+        val frame = UltraRootCommandReceipt(script)
+        val receipt = client.runRootCommand(frame.command)
+        val result = frame.decodeSdk(receipt, client::decodeText)
+        return ModuleScriptOutput(result.code, result.output, result.detail)
     }
 
     private fun isQuiescing() = LiteImplantQuiesceGate.isBlocked() ||

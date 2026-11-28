@@ -408,7 +408,12 @@ class KernelSUApplication : Application(), ViewModelStoreOwner {
         val recoveryContext = kotlinx.coroutines.currentCoroutineContext()
         val passStarted = android.os.SystemClock.elapsedRealtime()
         val requestedAt = ultraRecoveryRequestedAt.getAndSet(0L).takeIf { it > 0L } ?: passStarted
+        val remainingMillis = (10_000L - (passStarted - requestedAt).coerceAtLeast(0L)).coerceAtLeast(0L)
+        kotlinx.coroutines.withContext(dev.maplesu.manager.runtime.PageReadDeadline.context(remainingMillis)) {
         fun <T> stage(name: String, action: () -> T): T {
+            recoveryContext.ensureActive()
+            if (dev.maplesu.manager.runtime.PageReadDeadline.currentNanos()?.let { System.nanoTime() >= it } == true)
+                throw java.util.concurrent.TimeoutException("ULTRA_STARTUP_DEADLINE_EXCEEDED")
             val started = android.os.SystemClock.elapsedRealtime()
             return try { action() } finally {
                 val now = android.os.SystemClock.elapsedRealtime()
@@ -436,19 +441,19 @@ class KernelSUApplication : Application(), ViewModelStoreOwner {
         var startupKind = "unconfirmed"
         try {
         ensureActive()
-        // Detection consumes this same live SDK evidence. Waiting for its completion
+        // Detection consumes this@KernelSUApplication same live SDK evidence. Waiting for its completion
         // here makes the identity/Root handshake depend on its own consumer.
         stage("live-observation") {
-            runCatching { dev.maplesu.manager.runtime.ultra.UltraEnvironmentProbe.refresh(this, force = false) }
+            runCatching { dev.maplesu.manager.runtime.ultra.UltraEnvironmentProbe.refresh(this@KernelSUApplication, force = false) }
                 .onFailure { failed("Ultra live observation pending", it) }
         }
-        val live = dev.maplesu.manager.runtime.ultra.UltraEnvironmentProbe.currentSnapshot(this)
+        val live = dev.maplesu.manager.runtime.ultra.UltraEnvironmentProbe.currentSnapshot(this@KernelSUApplication)
         val detection = ModeRuntime.latestDetection
         var bootReadiness: Boolean? = null
         var managerReason: String? = null
         var setupReason: String? = null
-        val pendingInstall = dev.maplesu.manager.installer.InstallerServiceClient.lastTaskId(this)?.let { taskId ->
-            dev.maplesu.manager.installer.InstallerServiceClient.installTargetOf(this, taskId) ==
+        val pendingInstall = dev.maplesu.manager.installer.InstallerServiceClient.lastTaskId(this@KernelSUApplication)?.let { taskId ->
+            dev.maplesu.manager.installer.InstallerServiceClient.installTargetOf(this@KernelSUApplication, taskId) ==
                 dev.maplesu.manager.installer.InstallTargetMode.ULTRA
         } == true
         startupKind = if (live.rootAvailable && live.state == dev.maplesu.manager.runtime.ultra.UltraEnvironmentProbe.State.Running)
@@ -459,25 +464,25 @@ class KernelSUApplication : Application(), ViewModelStoreOwner {
                 detectionSettled = ModeRuntime.detectionComplete && ModeRuntime.detectionFailure == null,
                 ksuResponded = detection?.trace?.firstOrNull { it.id == "S1" }?.ok,
                 pendingInstall = pendingInstall,
-                suspended = dev.maplesu.manager.runtime.ultra.UltraSdkCredentials.suspended(this),
+                suspended = dev.maplesu.manager.runtime.ultra.UltraSdkCredentials.suspended(this@KernelSUApplication),
                 quiescing = dev.maplesu.manager.workmode.superuser.LiteImplantQuiesceGate.isBlocked(),
                 switchPending = dev.maplesu.manager.workmode.ui.WorkModeSwitchSession.executing,
                 postBootUltraSwitchRecovery = dev.maplesu.manager.runtime.ultra.UltraEnvironmentAutoSetup
-                    .hasPostBootUltraSwitchRecovery(this),
+                    .hasPostBootUltraSwitchRecovery(this@KernelSUApplication),
                 verifiedUltraIdentity = dev.maplesu.manager.runtime.ultra.UltraEnvironmentAutoSetup
-                    .hasVerifiedUltraIdentity(this),
+                    .hasVerifiedUltraIdentity(this@KernelSUApplication),
                 liveEnvironmentReady = live.rootAvailable &&
                     live.state == dev.maplesu.manager.runtime.ultra.UltraEnvironmentProbe.State.Running &&
-                    dev.maplesu.manager.runtime.ultra.UltraSdkSession.current(this) == null,
+                    dev.maplesu.manager.runtime.ultra.UltraSdkSession.current(this@KernelSUApplication) == null,
                 conflictingRoot = detection?.state == dev.maplesu.manager.workmode.detect.ModeState.FOREIGN_SU,
             ),
             setupEnvironment = {
                 ensureActive()
-                stage("environment") { runCatching { dev.maplesu.manager.runtime.ultra.UltraEnvironmentAutoSetup.ensure(this) }
+                stage("environment") { runCatching { dev.maplesu.manager.runtime.ultra.UltraEnvironmentAutoSetup.ensure(this@KernelSUApplication) }
                     .onSuccess { result ->
                         setupReason = result.reason
                         if (result.installationFailed ||
-                            dev.maplesu.manager.runtime.ultra.UltraSdkSession.current(this) != null) {
+                            dev.maplesu.manager.runtime.ultra.UltraSdkSession.current(this@KernelSUApplication) != null) {
                             bootReadiness = result.installed
                         }
                         Log.i(TAG, "Ultra 环境自动配置: $result")
@@ -486,10 +491,12 @@ class KernelSUApplication : Application(), ViewModelStoreOwner {
             },
             pairEnvironment = {
                 ensureActive()
-                stage("manager-su") { runCatching { dev.maplesu.manager.runtime.ultra.UltraAutoPair.ensure(this, maintenance = false) }
+                stage("manager-su") { runCatching { dev.maplesu.manager.runtime.ultra.UltraAutoPair.ensure(this@KernelSUApplication, maintenance = false) }
                     .onSuccess { result ->
                         managerReason = result.reason
-                        Log.i(TAG, "Ultra 自动就绪: paired=${result.paired} state=${result.state} reason=${result.reason}")
+                        Log.i(TAG, dev.maplesu.manager.runtime.ultra.UltraSdkLogging.redact(
+                            "Ultra 自动就绪: paired=${result.paired} state=${result.state} reason=${result.reason} " +
+                                "detail=${result.detail.orEmpty()}"))
                     }
                     .onFailure { failed("系统环境预热/自动就绪失败(忽略,不影响启动): ", it) }
                     .getOrNull()?.paired == true }
@@ -501,15 +508,15 @@ class KernelSUApplication : Application(), ViewModelStoreOwner {
             recoverIdentity = {
                 ensureActive()
                 stage("identity") { runCatching {
-                    val result = dev.maplesu.manager.runtime.ultra.UltraIdentityRecovery.recover(this)
+                    val result = dev.maplesu.manager.runtime.ultra.UltraIdentityRecovery.recover(this@KernelSUApplication)
                     dev.maplesu.manager.runtime.ultra.UltraStartupWarmup.identityRecovered(result)
                 }.onFailure { failed("Ultra startup identity recovery pending", it) }
                     .getOrDefault(false) }
             },
             bootSessionReady = {
                 ensureActive()
-                bootReadiness ?: stage("boot-session") { dev.maplesu.manager.runtime.ultra.UltraSdkSession.current(this)?.let {
-                    dev.maplesu.manager.runtime.ultra.UltraSdkSession.ensure(this).ready
+                bootReadiness ?: stage("boot-session") { dev.maplesu.manager.runtime.ultra.UltraSdkSession.current(this@KernelSUApplication)?.let {
+                    dev.maplesu.manager.runtime.ultra.UltraSdkSession.ensure(this@KernelSUApplication).ready
                 } }
             },
         )
@@ -522,10 +529,10 @@ class KernelSUApplication : Application(), ViewModelStoreOwner {
             ensureActive()
             val activation = ModeRuntime.activation
             val bootId = dev.maplesu.manager.runtime.ultra.UltraEnvironmentAutoSetup.currentBootId()
-            val rootCurrent = dev.maplesu.manager.runtime.ultra.UltraSdkCredentials.captureOwnerMarker(this)
-            val sessionCurrent = dev.maplesu.manager.runtime.ultra.UltraSdkSession.captureOwnerMarker(this)
-            val owner = dev.maplesu.manager.runtime.ultra.UltraEnvironmentProbe.currentSnapshot(this).managerOwnerIdentity
-            val client = dev.maplesu.manager.runtime.ultra.UltraSdkCredentials.client(this)
+            val rootCurrent = dev.maplesu.manager.runtime.ultra.UltraSdkCredentials.captureOwnerMarker(this@KernelSUApplication)
+            val sessionCurrent = dev.maplesu.manager.runtime.ultra.UltraSdkSession.captureOwnerMarker(this@KernelSUApplication)
+            val owner = dev.maplesu.manager.runtime.ultra.UltraEnvironmentProbe.currentSnapshot(this@KernelSUApplication).managerOwnerIdentity
+            val client = dev.maplesu.manager.runtime.ultra.UltraSdkCredentials.client(this@KernelSUApplication)
             val modules = client.moduleList()
             val version = client.installedEnvironmentVersion()
             val authorization = client.suUidProfiles()
@@ -545,12 +552,12 @@ class KernelSUApplication : Application(), ViewModelStoreOwner {
                 "requestElapsedMs=${android.os.SystemClock.elapsedRealtime() - requestedAt} " +
                 "startupElapsedMs=${android.os.SystemClock.elapsedRealtime() - ultraStartupTriggeredAt.get()}")
         }
-        if (warmup.paired && dev.maplesu.manager.runtime.ultra.UltraSdkSession.current(this) == null) {
-            dev.maplesu.manager.runtime.ultra.UltraPairingMaintenance.request(this)
+        if (warmup.paired && dev.maplesu.manager.runtime.ultra.UltraSdkSession.current(this@KernelSUApplication) == null) {
+            dev.maplesu.manager.runtime.ultra.UltraPairingMaintenance.request(this@KernelSUApplication)
         }
-        if (warmup.ran && dev.maplesu.manager.runtime.ultra.UltraSdkSession.current(this) != null) {
+        if (warmup.ran && dev.maplesu.manager.runtime.ultra.UltraSdkSession.current(this@KernelSUApplication) != null) {
             ensureActive()
-            dev.maplesu.manager.runtime.RuntimeDeployment.resumeBootSdk(this)
+            dev.maplesu.manager.runtime.RuntimeDeployment.resumeBootSdk(this@KernelSUApplication)
         }
         if (warmup.ran) {
             ModeGate.allow(ModeComponentIds.APP_ULTRA_AUTOPAIR)
@@ -566,6 +573,7 @@ class KernelSUApplication : Application(), ViewModelStoreOwner {
             Log.i(TAG, "Ultra startup terminal ready=$startupReady kind=$startupKind reason=$terminalReason " +
                 "passMs=${ended - passStarted} requestElapsedMs=${ended - requestedAt} " +
                 "startupElapsedMs=${ended - ultraStartupTriggeredAt.get()}")
+        }
         }
     }
 

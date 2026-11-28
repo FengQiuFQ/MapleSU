@@ -520,9 +520,10 @@ core::err_t install_environment(DeploymentMode mode,
                         return compat::kInstallerSetLabel;
                     }
                 }
-            } else {
-                // Reload current durable fullUID policy and rebuild its copies under
-                // the existing authorization transaction; never replay a saved list.
+            } else if (!kernel_module::maplesu_request_owner_mode()) {
+                // Legacy refresh rebuilds its current durable policy copies. Owner
+                // publication has retired the old factory; its unchanged durable
+                // authority is loaded by the next real helper initialization.
                 err = compat::installer_refresh_authorization();
                 if (failed(err)) return err;
             }

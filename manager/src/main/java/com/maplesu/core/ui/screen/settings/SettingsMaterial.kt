@@ -48,6 +48,7 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.TopAppBarScrollBehavior
 import androidx.compose.material3.TopAppBarState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -113,6 +114,11 @@ fun SettingPagerMaterial(
         if (appearanceOnly || fullUltraPanel != null) null else uiState.ultraComponentDiagnostic,
     )
     val ultraPanel = fullUltraPanel ?: diagnosticPanel
+    val homeDiagnostic = rememberHomeUltraComponentDiagnostic(
+        enabled = !appearanceOnly && !uiState.hiddenMasked,
+    )
+    LaunchedEffect(ultraPanel, homeDiagnostic) { ultraPanel?.updateHomeDiagnostic(homeDiagnostic) }
+    val standaloneDiagnostic = homeDiagnostic.takeIf { ultraPanel == null }
     val savedInstallFailure = rememberSavedUltraInstallFailureDiagnostic(
         enabled = !appearanceOnly && ultraPanel == null && modePolicy.mode == null && !uiState.hiddenMasked,
     )
@@ -183,7 +189,7 @@ fun SettingPagerMaterial(
 
                 // Ultra 专属：MapleSU_Ultra工作环境（panel 为 null 时说明未获许可，连组合都不发生）。
                 AnimatedVisibility(
-                    visible = ultraPanel != null || savedInstallFailure != null || uiState.installedKernelUpdateRequired,
+                    visible = ultraPanel != null || standaloneDiagnostic != null || savedInstallFailure != null || uiState.installedKernelUpdateRequired,
                     enter = expandVertically(tween(160), expandFrom = Alignment.Top) + fadeIn(tween(120)),
                     exit = ExitTransition.None,
                 ) {
@@ -193,6 +199,7 @@ fun SettingPagerMaterial(
                             ultraPanel?.let { panel ->
                                 add { UltraEnvironmentRowMaterial(panel) }
                             }
+                            standaloneDiagnostic?.let { detail -> add { HomeUltraComponentDiagnosticMaterial(detail) } }
                             savedInstallFailure?.let { detail -> add { SavedUltraInstallFailureDiagnosticMaterial(detail) } }
                             if (uiState.installedKernelUpdateRequired) add { InstalledUltraUpgradeRowMaterial() }
                         },

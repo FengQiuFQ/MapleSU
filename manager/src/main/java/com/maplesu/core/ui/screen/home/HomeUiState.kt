@@ -7,9 +7,35 @@ import dev.maplesu.manager.runtime.ultra.UltraEnvironmentProbe
 import dev.maplesu.manager.runtime.ultra.UltraRuntimeClient
 import dev.maplesu.manager.workmode.detect.ModeState
 import dev.maplesu.manager.workmode.detect.SuReadiness
+import dev.maplesu.manager.workmode.ModeActivation
 import dev.maplesu.manager.workmode.WorkMode
 
 enum class HomeEnvironmentFailure { TIMED_OUT, FAILED, UNCONFIRMED, BUSY }
+
+/** Display input from one completed Home session; it contains no Root or readiness proof. */
+@Immutable
+data class HomeUltraComponentDiagnostic(
+    val modeActivation: ModeActivation,
+    val detectionRevision: Long,
+    val bootId: String,
+    val managerOwnerIdentity: UltraRuntimeClient.ManagerOwnerIdentity?,
+    val legacyCredentialFingerprint: String?,
+    val failureCode: String?,
+    val detail: String,
+) {
+    /** Missing health fields do not prove that the diagnostic's identity changed. */
+    internal fun isSupersededBy(
+        activation: ModeActivation,
+        revision: Long,
+        bootId: String?,
+        observation: UltraEnvironmentProbe.Snapshot,
+    ): Boolean = modeActivation !== activation || detectionRevision != revision ||
+        !bootId.isNullOrBlank() && this.bootId != bootId ||
+        observation.modeActivation !== modeActivation ||
+        observation.managerOwnerIdentity != null && observation.managerOwnerIdentity != managerOwnerIdentity ||
+        observation.legacyCredentialFingerprint != null &&
+            observation.legacyCredentialFingerprint != legacyCredentialFingerprint
+}
 
 @Immutable
 data class HomeUiState(
@@ -73,6 +99,9 @@ data class HomeUiState(
     /** A current Ultra component observation failure does not revoke its installation identity. */
     val ultraObservationFailure: HomeEnvironmentFailure? = null,
     val ultraObservationDetail: String? = null,
+    /** Original bootstrap code retained with this round's diagnostic, never a capability proof. */
+    val ultraObservationCode: String? = null,
+    val ultraComponentDiagnostic: HomeUltraComponentDiagnostic? = null,
     /** Root proof from this session's fresh SDK health read; ordinary SU stays independent. */
     val sdkRootAvailable: Boolean = false,
 ) {
@@ -206,6 +235,8 @@ internal fun HomeUiState.afterEnvironmentCheck(
         ultraObservationFailure = if (knownUltra) failure else ultraObservationFailure,
         ultraObservationDetail = if (knownUltra) (failureDetail ?: detectionFailure).takeIf { failure != null }
             else ultraObservationDetail,
+        ultraObservationCode = if (knownUltra) detectionFailure.takeIf { failure != null } else ultraObservationCode,
+        ultraComponentDiagnostic = null,
     )
     return if (confirmedAbsent) {
         settled.copy(environmentMode = null, previousEnvironmentMode = null,
@@ -213,7 +244,8 @@ internal fun HomeUiState.afterEnvironmentCheck(
             sdkRootAvailable = false,
             cachedEnvironmentReady = false,
             ultraBrandVisible = false, ksuVersion = null, liteInstalled = false,
-            ultraObservationFailure = null, ultraObservationDetail = null,
+            ultraObservationFailure = null, ultraObservationDetail = null, ultraObservationCode = null,
+            ultraComponentDiagnostic = null,
             isManager = false, environmentConfirmedAbsent = true,
             isRootAvailable = isRootAvailable && detectedState == ModeState.FOREIGN_SU,
             rootReadiness = rootReadiness.takeIf { detectedState == ModeState.FOREIGN_SU })
@@ -246,6 +278,8 @@ internal fun HomeUiState.afterEnvironmentProbeFailure(
         litePending = identityPending,
         ultraObservationFailure = failure.takeIf { knownUltra },
         ultraObservationDetail = failureDetail.takeIf { knownUltra },
+        ultraObservationCode = null,
+        ultraComponentDiagnostic = null,
     )
 }
 
@@ -258,10 +292,11 @@ internal fun HomeUiState.afterUltraEnvironmentHealth(
     val sameIdentity = if (expectedOwner != null) observation.managerOwnerIdentity == expectedOwner else
         observation.managerOwnerIdentity == null && observation.legacyCredentialFingerprint != null
     val scopeChanged = !scopeCurrent || observation.managerOwnerIdentity != null && !sameIdentity
+    val managerSuDetail = observation.managerSuFailureDetail?.takeIf { it.isNotBlank() }
     val detail = observation.rootProbeDetail?.takeIf { it.isNotBlank() }
-        ?: if (scopeChanged) "SDK_IDENTITY_SCOPE_CHANGED" else observation.detail
+        ?: if (scopeChanged) "SDK_IDENTITY_SCOPE_CHANGED" else managerSuDetail ?: observation.detail
     val sdkError = detail?.substringAfter("sdkError=", "")?.substringBefore(';')
-    val explicitFailure = detail != null && (observation.rootProbeDetail != null ||
+    val explicitFailure = detail != null && (observation.rootProbeDetail != null || managerSuDetail != null ||
         !detail.contains("sdkError=") || sdkError !in setOf("", "NONE", "OK"))
     val failure = when {
         detail?.contains("TIMEOUT", ignoreCase = true) == true -> HomeEnvironmentFailure.TIMED_OUT
@@ -272,6 +307,20 @@ internal fun HomeUiState.afterUltraEnvironmentHealth(
         else -> null
     }
     val healthy = failure == null && !hiddenConfirming && !isSafeMode
+    val firstDetail = ultraObservationDetail?.takeIf {
+        ultraObservationFailure != null && it.isNotBlank() && it != "home_health_pending" && !scopeChanged
+    }
+    val environmentDetail = observation.detail?.takeIf { raw ->
+        raw.isNotBlank() && (!raw.contains("sdkError=") ||
+            raw.substringAfter("sdkError=").substringBefore(';') !in setOf("", "NONE", "OK"))
+    }
+    val currentDetails = listOfNotNull(
+        "SDK_IDENTITY_SCOPE_CHANGED".takeIf { scopeChanged },
+        observation.rootProbeDetail?.takeIf { it.isNotBlank() },
+        managerSuDetail,
+        environmentDetail,
+    ).ifEmpty { listOfNotNull(detail) }
+    val completeDetail = (listOfNotNull(firstDetail) + currentDetails).distinct().joinToString("\n")
     return copy(
         environmentMode = WorkMode.LITE, liteInstalled = true, environmentConfirmedAbsent = false,
         environmentChecking = false, litePending = false, environmentFailure = null,
@@ -280,8 +329,44 @@ internal fun HomeUiState.afterUltraEnvironmentHealth(
         cachedEnvironmentReady = false,
         isSafeMode = isSafeMode || observation.state == UltraEnvironmentProbe.State.Fault,
         ultraObservationFailure = failure,
-        ultraObservationDetail = detail.takeIf { failure != null },
+        ultraObservationDetail = completeDetail.takeIf { failure != null && it.isNotBlank() },
+        ultraObservationCode = ultraObservationCode.takeIf { failure != null && firstDetail != null },
+        ultraComponentDiagnostic = null,
     )
+}
+
+/** The single final publication rechecks the source scope without another identity probe. */
+internal fun HomeUiState.afterFinalEnvironmentScopeCheck(
+    observedActivation: ModeActivation?,
+    observedRevision: Long?,
+    currentActivation: ModeActivation,
+    currentRevision: Long,
+    currentBootId: String? = null,
+    currentObservation: UltraEnvironmentProbe.Snapshot? = null,
+    observedBootId: String? = null,
+): HomeUiState {
+    if (observedActivation == null || observedActivation !== currentActivation || observedRevision != currentRevision ||
+        !observedBootId.isNullOrBlank() && !currentBootId.isNullOrBlank() && observedBootId != currentBootId) {
+        return copy(
+            environmentMode = null, environmentConfirmedAbsent = false, ultraBrandVisible = false,
+            ksuVersion = null, kernelUAPIVersion = null, liteInstalled = false,
+            environmentRuntimeReady = false, sdkRootAvailable = false,
+            isManager = false, isRootAvailable = false, rootReadiness = null,
+            liteRootFailure = false, ultraObservationFailure = null, ultraObservationDetail = null,
+            ultraObservationCode = null, ultraComponentDiagnostic = null, isLateLoadMode = false,
+            environmentChecking = false, litePending = false, environmentFailure = null,
+            previousEnvironmentMode = null, cachedEnvironmentReady = false,
+        )
+    }
+    val diagnostic = ultraComponentDiagnostic
+    return if (diagnostic != null && currentObservation != null && diagnostic.isSupersededBy(
+            currentActivation, currentRevision, currentBootId, currentObservation,
+        )) copy(
+            sdkRootAvailable = false, environmentRuntimeReady = false, cachedEnvironmentReady = false,
+            ultraObservationFailure = HomeEnvironmentFailure.UNCONFIRMED,
+            ultraObservationDetail = "SDK_IDENTITY_SCOPE_CHANGED",
+            ultraObservationCode = null, ultraComponentDiagnostic = null,
+        ) else this
 }
 
 /**
@@ -320,6 +405,8 @@ fun HomeUiState.mergedOver(previous: HomeUiState): HomeUiState {
             ultraObservationFailure == null && !keepUltraObservation,
         ultraObservationFailure = if (keepUltraObservation) previous.ultraObservationFailure else ultraObservationFailure,
         ultraObservationDetail = if (keepUltraObservation) previous.ultraObservationDetail else ultraObservationDetail,
+        ultraObservationCode = if (keepUltraObservation) previous.ultraObservationCode else ultraObservationCode,
+        ultraComponentDiagnostic = if (keepUltraObservation) previous.ultraComponentDiagnostic else ultraComponentDiagnostic,
         manualEnvironmentChecking = previous.manualEnvironmentChecking,
         manualEnvironmentFailure = previous.manualEnvironmentFailure.takeUnless { observationSettled },
     )
@@ -327,7 +414,9 @@ fun HomeUiState.mergedOver(previous: HomeUiState): HomeUiState {
 
 /** SDK safety may revoke capabilities; recovery still needs a fresh successful Root probe. */
 internal fun HomeUiState.withUltraSafety(safeMode: Boolean, mode: WorkMode?): HomeUiState =
-    if (mode == WorkMode.KSU) copy(sdkRootAvailable = false) else copy(
+    if (mode == WorkMode.KSU) copy(sdkRootAvailable = false,
+        ultraObservationFailure = null, ultraObservationDetail = null,
+        ultraObservationCode = null, ultraComponentDiagnostic = null) else copy(
         isSafeMode = safeMode,
         isRootAvailable = isRootAvailable && !safeMode,
         sdkRootAvailable = sdkRootAvailable && !safeMode,
@@ -396,6 +485,8 @@ fun HomeUiState.asStealthKernelNotReady(): HomeUiState = copy(
     cachedEnvironmentReady = false,
     ultraObservationFailure = null,
     ultraObservationDetail = null,
+    ultraObservationCode = null,
+    ultraComponentDiagnostic = null,
 )
 
 /**

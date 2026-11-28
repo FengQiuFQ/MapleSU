@@ -8,7 +8,17 @@
     "src/maplesu_core/maplesu_su_auth.cpp"
   ],
   "privateHeaders": [
-    "src/maplesu/compat/su_auth_legacy_abi.h"
+    "src/maplesu/compat/su_auth_legacy_abi.h",
+    "src/module/su_redirect_tu/su_auth_result_private.h",
+    "src/module/su_redirect_tu/su_uid_profile_private.h",
+    "src/module/su_redirect_tu/su_uid_read_result_private.h",
+    "include/maplesu_request_private.h",
+    "include/maplesu_storage_worker_private.h",
+    "include/maplesu_storage_private.h",
+    "include/maplesu_operation_wait_private.h",
+    "include/maplesu_deadline_private.h",
+    "src/maplesu_core/closure_fork_pipe.h",
+    "src/maplesu_core/fixed_transfer_io.h"
   ],
   "flagsProfile": "core-oz-bitcode-fexceptions",
   "extraFlags": [

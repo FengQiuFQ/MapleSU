@@ -71,6 +71,18 @@ class RootFileHiddenStateTest {
         }
     }
 
+    @Test fun expiredAdmissionNeverReplaysAReadOrWrite() {
+        for (write in listOf(true, false)) {
+            var calls = 0
+            val state = RootFileHiddenState(
+                HiddenRootRunner { calls++; RecoveryCommandResult(-1007, "ULTRA_ROOT_FAILED:MAPLESU_SDK_DEADLINE_EXCEEDED") },
+                pause = { fail("An expired request must not back off or replay") },
+            )
+            if (write) assertFalse(state.write(true)) else assertNull(state.read())
+            assertEquals(1, calls)
+        }
+    }
+
     @Test fun cancellationDuringBackoffDoesNotSubmitAnotherWrite() {
         var calls = 0
         val state = RootFileHiddenState(

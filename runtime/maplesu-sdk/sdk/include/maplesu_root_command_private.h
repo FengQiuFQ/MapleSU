@@ -33,8 +33,10 @@ enum class RootCommandPhase : int {
  * retains this task's session for subsequent SDK operations and explicit close.
  * The Owner-only close tail never overwrites credential/task commit receipts;
  * a missing tail leaves cleanup unknown. No failed/unknown Root or shell replay.
- * There is no cancellation handle in this API: transport failure closes the
- * pipes and waits; it does not assert command rollback or kill a completed shell.
+ * There is no public cancellation handle. A private observation deadline bounds
+ * pipe and child waits and can cancel its still-live worker/shell process group.
+ * A pending reap or missing receipt remains unconfirmed; cancellation never
+ * proves rollback. Deadline zero retains the original popen/pclose lifecycle.
  * Same thread/process only; a fork child sees an empty result until its call. */
 struct RootCommandResult {
     KModErr error = KModErr::OK;

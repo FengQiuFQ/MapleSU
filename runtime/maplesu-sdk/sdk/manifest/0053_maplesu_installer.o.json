@@ -8,7 +8,8 @@
     "src/maplesu/install/lifecycle.cpp",
     "src/maplesu/compat/installer_legacy.cpp",
     "src/maplesu/install/launch_guard.c",
-    "src/maplesu/install/result_channel.c"
+    "src/maplesu/install/result_channel.c",
+    "src/maplesu/compat/keyed_exports_legacy_abi.cpp"
   ],
   "flagsProfile": "core-oz-elf-fexceptions",
   "extraFlags": [

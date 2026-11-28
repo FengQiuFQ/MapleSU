@@ -6,5 +6,17 @@
         <!-- Presentation tests do not bootstrap root; avoid the installed manager's fixed authority. -->
         <provider android:name="dev.maplesu.manager.soter.SoterTargetProvider"
             tools:node="remove" />
+        <!-- This isolated package has no boot/update Root entrypoints outside instrumentation. -->
+        <receiver android:name=".ui.security.StealthBootReceiver" tools:node="remove" />
+        <receiver android:name=".magica.BootCompletedReceiver" tools:node="remove" />
+        <receiver android:name="dev.maplesu.manager.modules.LiteModuleBootReceiver" tools:node="remove" />
+        <receiver android:name="dev.maplesu.manager.workmode.boot.ModeBootReceiver" tools:node="remove" />
+        <receiver android:name="dev.maplesu.manager.runtime.RuntimeBootReceiver" tools:node="remove" />
+        <provider android:name="dev.maplesu.manager.runtime.NativeSuDirectoryProvider" tools:node="remove" />
+        <service android:name=".magica.MagicaService" tools:node="remove" />
+        <service android:name="dev.maplesu.manager.modules.ModuleOperationService" tools:node="remove" />
+        <service android:name="dev.maplesu.manager.modules.LiteModuleBootService" tools:node="remove" />
+        <service android:name="dev.maplesu.manager.runtime.HookSuKeeperService" tools:node="remove" />
+        <service android:name="dev.maplesu.manager.runtime.NativeSuBrokerService" tools:node="remove" />
     </application>
 </manifest>

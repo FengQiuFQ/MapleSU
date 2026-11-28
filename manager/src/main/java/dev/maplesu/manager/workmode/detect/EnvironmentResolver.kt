@@ -57,8 +57,8 @@ interface EnvironmentProbes {
      *
      * 与 [ksuNormal] 的区别是问题更弱、但不能被 JNI 加载状态影响：`ksuNormal()` 答 null
      * （JNI 没加载 / 内核不认本管理器）时，本端口用 APK 自带 ksud 的 `debug info` 回答
-     * "内核在不在"。true ⇒ 已确定「有 root 内核，但不是 MapleSU_Normal」，
-     * 足以给出终态（未安装），不必停在未确认。
+     * 当前内核是否明确属于本项目以外的分支。true 必须有版本、认主与内核 UAPI
+     * 的配对回执；同分支未认主、legacy / 缺读都保持未知。
      *
      * null = 这次读不到（起不来/被拦/超时），调用方仍走 UNKNOWN。
      */
@@ -106,8 +106,8 @@ object EnvironmentCheckDetail {
     const val KSU_PROBE_NEGATIVE = "KSU_PROBE_NEGATIVE"
     const val KSU_PROBE_UNAVAILABLE = "KSU_PROBE_UNAVAILABLE"
     /**
-     * 有一个在响应的 KSU 内核，但它没认本管理器做主（第三方 KernelSU / 未装 MapleSU）。
-     * 这是**终态**（未安装），不是"读不到"。
+     * 当前 KernelSU 回执已确认是本项目以外的分支。
+     * 配合本轮独立的 Ultra 排除证据使用，未认主本身不作排除证据。
      */
     const val KSU_PROBE_FOREIGN = "KSU_PROBE_FOREIGN"
     /** 真探针起不来/超时 → UNKNOWN；保留上次状态，不落盘。 */
@@ -351,10 +351,8 @@ class EnvironmentResolver(
                 calls = calls,
             )
         }
-        // e) KSU 探针答 null（JNI 未加载 / 内核不认主）不等于"没有内核"。
-        //    用只读的 `ksud debug info` 再问一次"内核在不在"：在、但没认主 ⇒ 明确未安装。
-        //    这解开"装了第三方 KernelSU 的机器永远停在环境检查未完成"的互锁
-        //    （只问内核在不在，不读凭据、不起 root、不冒充认主）。
+        // e) 当前 Normal 归属未确认时，独立检查是否有明确外来分支回执。
+        //    同分支未认主与 legacy 兼容信息不够排除本项目，保持 UNKNOWN。
         if (ksu == null) {
             calls += PROBE_FOREIGN_KSU
             val foreign = probeResult { probes.foreignKsuKernel() }.getOrNull()

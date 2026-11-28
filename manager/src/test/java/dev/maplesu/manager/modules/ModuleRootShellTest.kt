@@ -5,6 +5,11 @@ import dev.maplesu.manager.runtime.RootExec
 import dev.maplesu.manager.runtime.RootExecResult
 import dev.maplesu.manager.runtime.RootExecutionRouter
 import dev.maplesu.manager.runtime.RootExecutor
+import dev.maplesu.manager.runtime.PageReadDeadline
+import dev.maplesu.manager.runtime.ultra.RootScriptRunner
+import dev.maplesu.manager.runtime.ultra.SuExecResult
+import dev.maplesu.manager.runtime.ultra.UltraRuntimeClient
+import kotlinx.coroutines.runBlocking
 import dev.maplesu.manager.workmode.WorkMode
 import dev.maplesu.manager.workmode.service.SwitchOutcome
 import dev.maplesu.manager.workmode.superuser.LiteImplantQuiesceGate
@@ -52,6 +57,57 @@ class ModuleRootShellTest {
         val runner = unsafe.allocateInstance(ManagementModuleScriptRunner::class.java)
         return ManagementModuleScriptRunner::class.java.getDeclaredMethod("isQuiescing")
             .apply { isAccessible = true }.invoke(runner) as Boolean
+    }
+
+    private fun sdkSnapshot(script: String, run: (String) -> SuExecResult?): ModuleScriptOutput {
+        val unsafe = sun.misc.Unsafe::class.java.getDeclaredField("theUnsafe").apply { isAccessible = true }
+            .get(null) as sun.misc.Unsafe
+        val client = unsafe.allocateInstance(UltraRuntimeClient::class.java) as UltraRuntimeClient
+        for ((name, value) in mapOf("rootCommands" to RootScriptRunner(run), "lock" to Any(), "identityCurrent" to { true })) {
+            UltraRuntimeClient::class.java.getDeclaredField(name).apply { isAccessible = true }.set(client, value)
+        }
+        val runner = unsafe.allocateInstance(ManagementModuleScriptRunner::class.java) as ManagementModuleScriptRunner
+        return runner.readSdkSnapshot(script, client)
+    }
+
+    @Test
+    fun failedSdkSnapshotKeepsItsNumericStatusAndPartialOutput() {
+        var calls = 0
+        val result = sdkSnapshot("inventory") {
+            calls++
+            SuExecResult(-1, "partial inventory\n\n", timedOut = true)
+        }
+        assertFalse(result.isSuccess)
+        assertEquals(-1001, result.code)
+        assertEquals("partial inventory\n\n", result.out)
+        assertEquals("ULTRA_ROOT_FAILED:MAPLESU_ROOT_COMMAND_TIMEOUT;sdkCode=-1001", result.err)
+        assertEquals(1, calls)
+    }
+
+    @Test
+    fun sdkSnapshotRetainsTheOriginalShellExitAndAllOutputLines() {
+        var calls = 0
+        val result = sdkSnapshot("inventory") { command ->
+            calls++
+            val nonce = Regex("MAPLESU_ROOT_EXIT:([a-zA-Z0-9-]+):").find(command)!!.groupValues[1]
+            SuExecResult(0, "first\n\nthird\n\nMAPLESU_ROOT_EXIT:$nonce:7\n")
+        }
+        assertEquals(7, result.code)
+        assertEquals("first\n\nthird\n", result.out)
+        assertEquals("ULTRA_ROOT_COMMAND_EXIT:7", result.err)
+        assertEquals(1, calls)
+    }
+
+    @Test
+    fun expiredSdkSnapshotKeepsTheExactUnsubmittedResultWithoutCallingTheSdk() {
+        var calls = 0
+        val result = runBlocking(PageReadDeadline.context(0)) {
+            sdkSnapshot("inventory") { calls++; error("An expired request must not be submitted") }
+        }
+        assertEquals(-1007, result.code)
+        assertEquals("", result.out)
+        assertEquals("ULTRA_ROOT_FAILED:MAPLESU_SDK_DEADLINE_EXCEEDED", result.err)
+        assertEquals(0, calls)
     }
 
     @Test

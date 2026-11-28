@@ -1,5 +1,6 @@
 package dev.maplesu.manager.workmode.service
 
+import dev.maplesu.manager.runtime.PageReadDeadline
 import dev.maplesu.manager.runtime.RootBackend
 import dev.maplesu.manager.runtime.RootExec
 import dev.maplesu.manager.runtime.RootExecResult
@@ -31,6 +32,8 @@ class UltraRootModeSwitchClient(
     private val requireBaselineForCommit: Boolean = false,
     /** Recover a copy of the installed carrier; PRE remains the rollback image. */
     private val sourceRecovery: ((WorkMode, String, File, File, Boolean) -> CandidateResult)? = null,
+    /** Status observations may use the bounded ordinary reader before a transaction is pinned. */
+    private val statusRunner: (String) -> RootExecResult = runner,
 ) : ModeSwitchClient {
 
     // ------------------------------------------------------------------ 公开状态
@@ -92,32 +95,32 @@ class UltraRootModeSwitchClient(
         guarded { abortInternal(switchId) }
     }
 
-    override fun status(switchId: String): ClientStatus? {
-        return runCatching {
+    override fun status(switchId: String): ClientStatus? = PageReadDeadline.onWorker(PageReadDeadline.limitNanos(1_500L)) {
+        runCatching {
             if (switchId.isNotEmpty() && !SWITCH_ID.matches(switchId)) return@runCatching null
-            val id = if (switchId.isEmpty()) latestSwitchId() ?: return@runCatching null else switchId
-            val state = readStateFile(id)
+            val id = if (switchId.isEmpty()) latestSwitchId(statusRunner) ?: return@runCatching null else switchId
+            val state = readStateFile(id, statusRunner)
             if (state != null) {
                 statusOf(state)
             } else {
                 // state.json 丢失时按 journal 末行重建"最近已知状态"（只读呈现，不据此写分区）。
-                journalHead(id)
+                journalHead(id, statusRunner)
             }
         }.getOrNull()
     }
 
-    override fun statusExact(switchId: String): ClientStatus? {
-        if (switchId.isEmpty()) return latestStatusExact()
+    override fun statusExact(switchId: String): ClientStatus? = PageReadDeadline.onWorker(PageReadDeadline.limitNanos(1_500L)) {
+        if (switchId.isEmpty()) return@onWorker latestStatusExact()
         require(SWITCH_ID.matches(switchId)) { "SWITCH_STATUS_TASK_INVALID" }
         val raw = readTextExact(stateFile(switchId), Mark.STATE_READ)
         if (raw != null) {
             val state = ControlJsonCodec.decodeOrNull<UltraSwitchStateFile>(raw)
                 ?: error("SWITCH_STATUS_RECORD_INVALID")
             check(state.switchId == switchId) { "SWITCH_STATUS_TASK_MISMATCH" }
-            return statusOf(state)
+            return@onWorker statusOf(state)
         }
-        val journal = readTextExact(journalFile(switchId), Mark.JOURNAL_READ) ?: return null
-        return journalHead(switchId, journal) ?: error("SWITCH_STATUS_RECORD_INVALID")
+        val journal = readTextExact(journalFile(switchId), Mark.JOURNAL_READ) ?: return@onWorker null
+        journalHead(switchId, journal) ?: error("SWITCH_STATUS_RECORD_INVALID")
     }
 
     override suspend fun verify(switchId: String): ClientResult = io {
@@ -1431,21 +1434,21 @@ class UltraRootModeSwitchClient(
     }
 
     /** 只读磁盘（本地可读则直接读；否则 root `cat`；主线程不发起 root 调用）。 */
-    private fun readStateFile(switchId: String): UltraSwitchStateFile? {
-        val raw = readTextQuietly(stateFile(switchId), Mark.STATE_READ) ?: return null
+    private fun readStateFile(switchId: String, read: (String) -> RootExecResult = runner): UltraSwitchStateFile? {
+        val raw = readTextQuietly(stateFile(switchId), Mark.STATE_READ, read) ?: return null
         return ControlJsonCodec.decodeOrNull<UltraSwitchStateFile>(raw)
     }
 
-    private fun readTextQuietly(file: File, marker: String): String? {
+    private fun readTextQuietly(file: File, marker: String, read: (String) -> RootExecResult = runner): String? {
         val local = runCatching { file.takeIf { it.isFile }?.readText() }.getOrNull()
         if (local != null) return local
         if (Thread.currentThread().name.contains("main")) return null
-        val result = runScript(script(marker, "cat ${q(file.absolutePath)} 2>/dev/null"))
+        val result = runScript(script(marker, "cat ${q(file.absolutePath)} 2>/dev/null"), read)
         return if (ok(result) && result.output.isNotBlank()) result.output else null
     }
 
-    private fun journalHead(switchId: String): ClientStatus? {
-        val raw = readTextQuietly(journalFile(switchId), Mark.JOURNAL_READ) ?: return null
+    private fun journalHead(switchId: String, read: (String) -> RootExecResult): ClientStatus? {
+        val raw = readTextQuietly(journalFile(switchId), Mark.JOURNAL_READ, read) ?: return null
         return journalHead(switchId, raw)
     }
 
@@ -1456,8 +1459,8 @@ class UltraRootModeSwitchClient(
         val missing = "MAPLESU_SWITCH_RECORD_ABSENT"
         val path = q(file.absolutePath)
         val result = runScript(script(marker,
-            "if [ -e $path ]; then [ -f $path ] && cat $path; else echo $missing; fi"))
-        check(ok(result)) { "SWITCH_STATUS_READ_FAILED" }
+            "if [ -e $path ]; then [ -f $path ] && cat $path; else echo $missing; fi"), statusRunner)
+        check(ok(result)) { result.detail.ifBlank { "SWITCH_STATUS_READ_FAILED" } }
         return if (result.output.trim() == missing) null else result.output
     }
 
@@ -1496,7 +1499,7 @@ class UltraRootModeSwitchClient(
         val path = q(txRoot.absolutePath)
         val complete = "MAPLESU_SWITCH_LIST_COMPLETE"
         val result = runScript(script(Mark.LIST_TX,
-            "if [ -e $path ]; then [ -d $path ] && ls -1t $path; else :; fi && printf '\\n$complete\\n'"))
+            "if [ -e $path ]; then [ -d $path ] && ls -1t $path; else :; fi && printf '\\n$complete\\n'"), statusRunner)
         check(ok(result)) { result.detail.ifBlank { "SWITCH_STATUS_READ_FAILED" } }
         val entries = result.output.trim().lineSequence().map(String::trim).toList()
         check(entries.lastOrNull() == complete) { "SWITCH_STATUS_READ_FAILED" }
@@ -1506,7 +1509,7 @@ class UltraRootModeSwitchClient(
         return null
     }
 
-    private fun latestSwitchId(): String? {
+    private fun latestSwitchId(read: (String) -> RootExecResult = runner): String? {
         val local = runCatching {
             txRoot.listFiles { file -> file.isDirectory }?.toList()
         }.getOrNull()
@@ -1517,7 +1520,7 @@ class UltraRootModeSwitchClient(
                 ?.takeIf { SWITCH_ID.matches(it) }
         }
         if (Thread.currentThread().name.contains("main")) return null
-        val result = runScript(script(Mark.LIST_TX, "ls -1t ${q(txRoot.absolutePath)} 2>/dev/null | head -n 1"))
+        val result = runScript(script(Mark.LIST_TX, "ls -1t ${q(txRoot.absolutePath)} 2>/dev/null | head -n 1"), read)
         if (!ok(result)) return null
         return result.output.trim().takeIf { SWITCH_ID.matches(it) }
     }
@@ -1719,7 +1722,7 @@ class UltraRootModeSwitchClient(
         )
     }
 
-    private fun runScript(script: String): RootExecResult = runCatching { runner(script) }.getOrElse { error ->
+    private fun runScript(script: String, execute: (String) -> RootExecResult = runner): RootExecResult = runCatching { execute(script) }.getOrElse { error ->
         RootExecResult(RootBackend.NONE, -1, "", "ULTRA_RUNNER_EXCEPTION:${error.javaClass.simpleName}")
     }
 

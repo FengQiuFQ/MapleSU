@@ -66,6 +66,19 @@ class UltraAutoPairReadinessTest {
         assertEquals("MANAGER_SU_UNVERIFIED", result.reason)
     }
 
+    @Test fun managerSuExceptionRetainsItsTypeAndErrnoWithoutPrivateCommandText() {
+        val result = UltraAutoPair.complete(
+            UltraEnvironmentProbe.Snapshot(UltraEnvironmentProbe.State.Running, kernelRootVerified = true),
+            current = { true },
+            verifyManagerSu = { throw java.io.IOException("error=13 private-command") },
+            maintain = { fail("failed SU must not schedule maintenance") })
+        assertFalse(result.paired)
+        assertEquals("MANAGER_SU_UNVERIFIED", result.reason)
+        assertTrue(result.detail.orEmpty().contains("IOException"))
+        assertTrue(result.detail.orEmpty().contains("13"))
+        assertFalse(result.detail.orEmpty().contains("private-command"))
+    }
+
     @Test fun managerSuCancellationPropagatesWithoutMaintenance() {
         val cancelled = CancellationException("cancelled")
         val observed = assertThrows(CancellationException::class.java) {

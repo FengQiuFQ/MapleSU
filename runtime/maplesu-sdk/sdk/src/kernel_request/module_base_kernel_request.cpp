@@ -19,6 +19,7 @@
 #include "module_base_kernel_mem.h"
 #include "maplesu_request_private.h"
 #include "maplesu_request_identity.h"
+#include "maplesu_operation_wait_private.h"
 #include "../../../../ultra/authorization/kernel_read_metadata.h"
 #include "../../../../ultra/authorization/legacy_hook_private.h"
 
@@ -63,6 +64,7 @@ bool valid_memory_range(uint64_t kaddr, const void* buffer, uint32_t size) {
 // 返回: 0 成功；负值为 KModErr
 static int64_t dispatch_kernel_request(KernelCmdFlag flag, uint8_t sub, uint64_t addr,
                                        uint32_t v0, uint32_t v1, const char* key_snapshot = nullptr) {
+    if (!maplesu::deadline::available()) return to_num(KModErr::ERR_MODULE_TEST_CHANNEL);
     std::array<uint8_t, kFrameSize> request{};
     std::array<uint8_t, kMaskSize> mask{};
 
@@ -111,6 +113,7 @@ static int64_t dispatch_kernel_request(KernelCmdFlag flag, uint8_t sub, uint64_t
         std::memcpy(base + key_len, mask.data(), kMaskSize);
         std::memcpy(base + key_len + kMaskSize, request.data(), kFrameSize);
 
+        if (!maplesu::deadline::available()) return to_num(KModErr::ERR_MODULE_TEST_CHANNEL);
         ::syscall(kKernelRequestSyscall, base, nullptr, nullptr);
     } catch (const std::bad_alloc&) {
         return to_num(KModErr::ERR_NO_MEM);
@@ -282,8 +285,15 @@ thread_local std::vector<ManagedAddressRange> legacy_address_ranges;
 pthread_mutex_t managed_address_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_once_t managed_address_once = PTHREAD_ONCE_INIT;
 int managed_address_fork_error = 0;
-void managed_address_before_fork() { pthread_mutex_lock(&managed_address_mutex); }
-void managed_address_after_fork() { pthread_mutex_unlock(&managed_address_mutex); }
+thread_local unsigned managed_address_fork_depth = 0;
+void managed_address_before_fork() {
+    if (!managed_address_fork_depth) pthread_mutex_lock(&managed_address_mutex);
+    ++managed_address_fork_depth;
+}
+void managed_address_after_fork() {
+    if (managed_address_fork_depth && !--managed_address_fork_depth)
+        pthread_mutex_unlock(&managed_address_mutex);
+}
 void managed_address_initialize() {
     managed_address_fork_error = pthread_atfork(managed_address_before_fork,
         managed_address_after_fork, managed_address_after_fork);
@@ -342,6 +352,7 @@ struct HelperChannel {
 };
 thread_local HelperChannel helper_channel;
 thread_local RequestManagementReply management_reply;
+thread_local RequestUidReadbackDiagnostic uid_readback_diagnostic;
 thread_local pid_t management_process = 0;
 void management_reset_after_fork() {
     const pid_t process = getpid();
@@ -355,6 +366,7 @@ void management_reset_after_fork() {
         owner_channel = {};
         helper_channel = {};
         management_reply = {};
+        uid_readback_diagnostic = {};
         management_process = process;
     }
 }
@@ -557,6 +569,24 @@ KModErr helper_management_channel(maplesu_metadata_owner_v3& metadata,
 // request storage before fork; this performs no request and transfers no session.
 extern "C" __attribute__((visibility("hidden"))) void maplesu_request_fork_prepare() noexcept {
     management_reset_after_fork();
+}
+
+extern "C" __attribute__((visibility("hidden"))) bool maplesu_request_try_fork_prepare() noexcept {
+    if (!maplesu::deadline::available()) return false;
+    if (!managed_address_fork_depth) {
+        const int error = pthread_mutex_trylock(&managed_address_mutex);
+        if (error) { errno = error == EBUSY ? EAGAIN : error; return false; }
+    }
+    ++managed_address_fork_depth;
+    if (maplesu::deadline::available()) return true;
+    const int error = errno;
+    managed_address_after_fork();
+    errno = error;
+    return false;
+}
+
+extern "C" __attribute__((visibility("hidden"))) void maplesu_request_fork_complete() noexcept {
+    managed_address_after_fork();
 }
 
 bool maplesu_request_owner_binding_matches(const RequestOwnerBinding& binding) {
@@ -1468,6 +1498,10 @@ RequestManagementReply maplesu_request_management_reply() {
     management_reset_after_fork();
     return management_reply;
 }
+RequestUidReadbackDiagnostic maplesu_request_uid_readback_diagnostic() {
+    management_reset_after_fork();
+    return uid_readback_diagnostic;
+}
 KModErr maplesu_request_helper_open() {
     management_reset_after_fork();
     management_reply = {};
@@ -1688,7 +1722,7 @@ KModErr maplesu_request_helper_vendor(uint64_t action, unsigned index,
     request.request_id = request_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
     request.response_user = reinterpret_cast<uintptr_t>(&response);
     request.arg1 = reinterpret_cast<uintptr_t>(&operation);
-    const auto pointer = reinterpret_cast<uintptr_t>(&request);
+    const auto pointer = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&request));
     if (!identity.matches()) {
         helper_channel.uncertain = true;
         errno = ESTALE;
@@ -2106,6 +2140,26 @@ bool uid_readback_output_valid(const maplesu_uid_record_v3* records, uint32_t ca
     return capacity <= MAPLESU_UID_SNAPSHOT_MAX_RECORDS && (!capacity || (records &&
         reinterpret_cast<uintptr_t>(records) <= UINTPTR_MAX - (capacity * sizeof(*records) - 1)));
 }
+KModErr uid_readback_finish(KModErr error, RequestUidReadbackPhase phase) {
+    uid_readback_diagnostic.phase = phase;
+    uid_readback_diagnostic.errorCode = to_num(error);
+    uid_readback_diagnostic.systemErrno = is_failed(error) ? errno : 0;
+    uid_readback_diagnostic.reply = management_reply;
+    return error;
+}
+KModErr uid_readback_capability() {
+    maplesu_metadata_owner_v3 metadata{};
+    RequestOwnerBinding binding{};
+    uint64_t descriptor = 0;
+    const auto error = maplesu_request_owner_channel(metadata, descriptor, binding);
+    if (is_failed(error)) return uid_readback_finish(error, RequestUidReadbackPhase::CapabilityQuery);
+    uid_readback_diagnostic.capabilities = metadata.common.capabilities;
+    if (!(metadata.common.capabilities & MAPLESU_CAP_UID_SNAPSHOT)) {
+        errno = EOPNOTSUPP;
+        return uid_readback_finish(KModErr::ERR_MODULE_TEST_CHANNEL, RequestUidReadbackPhase::CapabilityMissing);
+    }
+    return KModErr::OK;
+}
 KModErr uid_readback_current(uint64_t controller_id, const maplesu_host_instance& host,
     uint64_t expected_revision, maplesu_uid_metadata_v3& metadata,
     maplesu_uid_record_v3* records, uint32_t capacity) {
@@ -2119,16 +2173,21 @@ KModErr uid_readback_current(uint64_t controller_id, const maplesu_host_instance
         error = owner_manage(MAPLESU_REQUEST_UID_READBACK, controller_id, 0, &readback, sizeof(readback));
         if (is_failed(error)) {
             if (management_reply.completed && management_reply.status < 0) errno = -management_reply.status;
-            return error;
+            return uid_readback_finish(error, RequestUidReadbackPhase::Exchange);
         }
         const auto binding = owner_management.binding;
         maplesu_uid_metadata_v3 actual{};
         std::memcpy(&actual, storage.data(), sizeof(actual));
+        uid_readback_diagnostic.revision = actual.content_revision;
+        uid_readback_diagnostic.count = actual.count;
+        uid_readback_diagnostic.schema = actual.schema;
         if (actual.schema != MAPLESU_UID_SNAPSHOT_SCHEMA || actual.reserved || actual.count > capacity ||
             actual.record_bytes != sizeof(*records) || !actual.content_revision ||
             actual.content_revision != management_reply.result ||
             (expected_revision && actual.content_revision != expected_revision) ||
             actual.host.low != host.low || actual.host.high != host.high) {
+            errno = EPROTO;
+            uid_readback_finish(KModErr::ERR_MODULE_TEST_CHANNEL, RequestUidReadbackPhase::Metadata);
             management_reply = {};
             owner_management.uncertain = true;
             return KModErr::ERR_MODULE_TEST_CHANNEL;
@@ -2138,27 +2197,43 @@ KModErr uid_readback_current(uint64_t controller_id, const maplesu_host_instance
         if (actual.count) std::memcpy(rows.data(), reinterpret_cast<const uint8_t*>(storage.data()) +
             sizeof(actual), actual.count * sizeof(*records));
         if (!uid_records_valid(rows.data(), actual.count)) {
+            errno = EBADMSG;
+            uid_readback_finish(KModErr::ERR_MODULE_TEST_CHANNEL, RequestUidReadbackPhase::Records);
             management_reply = {};
             owner_management.uncertain = true;
             return KModErr::ERR_MODULE_TEST_CHANNEL;
         }
         if (!maplesu_request_owner_binding_matches(binding)) {
             errno = ESTALE;
+            uid_readback_finish(KModErr::ERR_MODULE_ROOT_KEY, RequestUidReadbackPhase::Binding);
             return owner_failed(KModErr::ERR_MODULE_ROOT_KEY, binding.auth_state);
         }
         if (actual.count) std::memcpy(records, rows.data(), actual.count * sizeof(*records));
         metadata = actual;
-        return KModErr::OK;
-    } catch (const std::bad_alloc&) { return KModErr::ERR_NO_MEM; }
+        return uid_readback_finish(KModErr::OK, RequestUidReadbackPhase::Complete);
+    } catch (const std::bad_alloc&) {
+        errno = ENOMEM;
+        return uid_readback_finish(KModErr::ERR_NO_MEM, RequestUidReadbackPhase::Allocation);
+    }
 }
 }
 KModErr maplesu_request_owner_uid_readback(const RequestUidController& controller,
     uint64_t expected_revision, maplesu_uid_metadata_v3& metadata,
     maplesu_uid_record_v3* records, uint32_t capacity) {
+    management_reset_after_fork();
+    uid_readback_diagnostic = {};
     management_reply = {};
-    if (!uid_readback_output_valid(records, capacity)) return KModErr::ERR_MODULE_PARAM;
-    const auto error = uid_controller_ready(controller);
+    if (!uid_readback_output_valid(records, capacity) || !controller.id ||
+        !(controller.host.low || controller.host.high)) {
+        errno = EINVAL;
+        return uid_readback_finish(KModErr::ERR_MODULE_PARAM, RequestUidReadbackPhase::Output);
+    }
+    const auto error = uid_readback_capability();
     if (is_failed(error)) return error;
+    if (controller.host.low != owner_channel.binding.host.low || controller.host.high != owner_channel.binding.host.high) {
+        errno = ESTALE;
+        return uid_readback_finish(KModErr::ERR_MODULE_ROOT_KEY, RequestUidReadbackPhase::Binding);
+    }
     return uid_readback_current(controller.id, controller.host, expected_revision, metadata, records, capacity);
 }
 KModErr maplesu_request_owner_runtime_uid_sync(uint32_t full_uid) {
@@ -2176,13 +2251,18 @@ KModErr maplesu_request_owner_runtime_uid_sync(uint32_t full_uid) {
 }
 KModErr maplesu_request_owner_runtime_uid_readback(uint64_t expected_revision,
     maplesu_uid_metadata_v3& metadata, maplesu_uid_record_v3* records, uint32_t capacity) {
+    management_reset_after_fork();
+    uid_readback_diagnostic = {};
     management_reply = {};
-    if (!uid_readback_output_valid(records, capacity)) return KModErr::ERR_MODULE_PARAM;
+    if (!uid_readback_output_valid(records, capacity)) {
+        errno = EINVAL;
+        return uid_readback_finish(KModErr::ERR_MODULE_PARAM, RequestUidReadbackPhase::Output);
+    }
     if (!maplesu_request_manager_mode()) {
         errno = EPERM;
-        return KModErr::ERR_MODULE_ROOT_KEY;
+        return uid_readback_finish(KModErr::ERR_MODULE_ROOT_KEY, RequestUidReadbackPhase::Identity);
     }
-    const auto error = owner_require_capability(MAPLESU_CAP_UID_SNAPSHOT);
+    const auto error = uid_readback_capability();
     if (is_failed(error)) return error;
     const auto host = owner_channel.binding.host;
     return uid_readback_current(0, host, expected_revision, metadata, records, capacity);

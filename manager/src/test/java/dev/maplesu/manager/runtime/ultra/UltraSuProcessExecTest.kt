@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package dev.maplesu.manager.runtime.ultra
 
+import dev.maplesu.manager.runtime.PageReadDeadline
 import java.io.File
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -16,6 +20,136 @@ import org.junit.rules.TemporaryFolder
 
 class UltraSuProcessExecTest {
     @get:Rule val temporary = TemporaryFolder()
+
+    @Test fun anExpiredSharedDeadlineDoesNotStartAProbe() {
+        val calls = AtomicInteger()
+        val channel = UltraSuChannel(exec = { _, _, _ -> calls.incrementAndGet(); SuExecResult(0, "0\n") })
+        val uid = PageReadDeadline.onWorker(System.nanoTime() - 1L) { channel.rootUid() }
+        assertNull(uid)
+        assertEquals(0, calls.get())
+        assertEquals("SU_TIMEOUT", channel.lastFailure)
+    }
+
+    @Test fun anExpiredSharedDeadlineDoesNotSubmitACommandThroughADiscoveredPath() {
+        val calls = AtomicInteger()
+        val channel = UltraSuChannel(exec = { _, _, _ -> calls.incrementAndGet(); SuExecResult(0, "0\n") })
+        assertEquals(0, channel.rootUid())
+        val result = PageReadDeadline.onWorker(System.nanoTime() - 1L) { channel.runRoot("change-once") }
+        assertTrue(result.toString(), result?.timedOut == true)
+        assertEquals(1, calls.get())
+    }
+
+    @Test fun anExpiredSharedDeadlineDoesNotCreateARealProcess() {
+        val pid = temporary.newFile("expired.pid")
+        try {
+            val result = PageReadDeadline.onWorker(System.nanoTime() - 1L) {
+                ProcessSuExec.exec(fixtureArgs("record-only", pid), 2_000L, null)
+            }
+            assertTrue(result.toString(), result.timedOut)
+            assertEquals(0L, pid.length())
+        } finally { killFixture(pid) }
+    }
+
+    @Test fun aProbeWaiterUsesItsOwnSharedDeadline() {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val worker = Executors.newFixedThreadPool(2)
+        val channel = UltraSuChannel(exec = { _, _, _ ->
+            entered.countDown()
+            release.await()
+            SuExecResult(0, "0\n")
+        })
+        try {
+            val owner = worker.submit<Int?> { channel.rootUid() }
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            val waiter = worker.submit<Int?> {
+                PageReadDeadline.onWorker(System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(20)) { channel.rootUid() }
+            }
+            assertNull(waiter.get(400, TimeUnit.MILLISECONDS))
+            release.countDown()
+            assertEquals(0, owner.get(2, TimeUnit.SECONDS))
+        } finally { release.countDown(); worker.shutdownNow() }
+    }
+
+    @Test fun cleanupFactsNeverCountAsSuccessfulRootEvidence() {
+        for (result in listOf(SuExecResult(0, "0\n", cleanupPending = true),
+            SuExecResult(0, "0\n", cleanupFailure = "CLOSE_FAILED:IOException"))) {
+            val channel = UltraSuChannel(exec = { _, _, _ -> result })
+            assertNull(channel.rootUid())
+        }
+    }
+
+    @Test fun inheritedOutputKeepsCleanupOwnershipWithinTheSharedDeadline() {
+        val pid = temporary.newFile("inherited-parent.pid")
+        val descendantPid = temporary.newFile("inherited-child.pid")
+        val inherited = fixtureArgs("spawn-descendant", pid, *fixtureArgs("hold-output", descendantPid).toTypedArray())
+        val started = System.nanoTime()
+        try {
+            val result = PageReadDeadline.onWorker(started + TimeUnit.MILLISECONDS.toNanos(600)) {
+                ProcessSuExec.exec(inherited, 4_000L, null)
+            }
+            val elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)
+            val failures = buildList {
+                if (elapsed >= 1_200L) add("shared600ms elapsed=${elapsed}ms")
+                if (result.ok) add("cleanup reported successful SU")
+            }
+            assertTrue(failures.joinToString("; "), failures.isEmpty())
+        } finally {
+            awaitPidIfStarted(descendantPid)
+            killFixture(descendantPid)
+            killFixture(pid)
+            awaitCleanupWorkers()
+        }
+    }
+
+    @Test fun pendingCleanupKeepsAdmissionUntilItsOwnedPipeHasClosed() {
+        val release = CountDownLatch(1)
+        val closed = CountDownLatch(1)
+        val starts = AtomicInteger()
+        val process = object : Process() {
+            private val output = ByteArrayOutputStream()
+            private val input = object : InputStream() {
+                private var index = 0
+                override fun read(): Int = if (index < 2) "0\n"[index++].code else { release.await(); -1 }
+                override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                    if (length == 0) return 0
+                    if (index == 2) { release.await(); return -1 }
+                    val count = minOf(length, 2 - index)
+                    "0\n".toByteArray().copyInto(buffer, offset, index, index + count)
+                    index += count
+                    return count
+                }
+                override fun close() { release.await(); closed.countDown() }
+            }
+            override fun getOutputStream() = output
+            override fun getInputStream() = input
+            override fun getErrorStream() = ByteArrayInputStream(ByteArray(0))
+            override fun waitFor(): Int = 0
+            override fun waitFor(timeout: Long, unit: TimeUnit): Boolean = true
+            override fun exitValue(): Int = 0
+            override fun destroy() = Unit
+        }
+        try {
+            val started = System.nanoTime()
+            val result = PageReadDeadline.onWorker(started + TimeUnit.MILLISECONDS.toNanos(20)) {
+                ProcessSuExec.exec(listOf("owned-fixture"), 4_000L, null) { starts.incrementAndGet(); process }
+            }
+            val elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)
+            val queued = ProcessSuExec.exec(listOf("queued-fixture"), 50, null) { starts.incrementAndGet(); process }
+            val failures = buildList {
+                if (elapsed >= 1_000L) add("shared20ms elapsed=${elapsed}ms")
+                if (!result.cleanupPending) add("pending pipe close was not retained")
+                if (result.ok) add("pending cleanup reported successful SU")
+                if (!queued.timedOut || starts.get() != 1) add("pending cleanup released admission")
+                if (result.exitCode != 0 || result.output != "0\n") add("primary command facts changed")
+            }
+            assertTrue(failures.joinToString("; "), failures.isEmpty())
+        } finally { release.countDown(); assertTrue(closed.await(2, TimeUnit.SECONDS)); awaitCleanupWorkers() }
+        val freshPid = temporary.newFile("fresh-after-cleanup.pid")
+        val fresh = executeFixture("record-only", freshPid, stdin = null)
+        assertTrue("A fresh command must be admitted after the owned pipe closes: $fresh", fresh.ok)
+        assertTrue(freshPid.length() > 0L)
+    }
 
     @Test fun startupFailureIncludesErrnoWithoutTheCommandOrPath() {
         val path = File(temporary.root, "private-helper-absent").absolutePath
@@ -147,7 +281,8 @@ class UltraSuProcessExecTest {
             assertTrue(entered.await(2, TimeUnit.SECONDS))
             second.start()
             val until = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
-            while (second.state != Thread.State.BLOCKED && calls.get() < 2 && System.nanoTime() < until) {
+            while (second.state !in setOf(Thread.State.BLOCKED, Thread.State.WAITING, Thread.State.TIMED_WAITING) &&
+                calls.get() < 2 && System.nanoTime() < until) {
                 Thread.yield()
             }
         } finally {
@@ -225,6 +360,18 @@ class UltraSuProcessExecTest {
         while (pid.length() == 0L && System.nanoTime() < until) Thread.sleep(5)
         assertTrue("The host fixture did not start", pid.length() > 0L)
     }
+
+    private fun awaitPidIfStarted(pid: File) {
+        val until = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+        while (pid.length() == 0L && System.nanoTime() < until) Thread.sleep(5)
+    }
+
+    private fun awaitCleanupWorkers() {
+        val until = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+        while (System.nanoTime() < until && Thread.getAllStackTraces().keys.any {
+                it.isAlive && it.name in setOf("maplesu-ultra-su-cleanup", "maplesu-ultra-su-reader", "maplesu-ultra-su-writer")
+            }) Thread.sleep(5)
+    }
 }
 
 /** Host-only child process; it never invokes su or touches an Android device. */
@@ -233,6 +380,8 @@ object UltraSuChildFixture {
     fun main(args: Array<String>) {
         File(args[1]).writeText(ProcessHandle.current().pid().toString())
         when (args[0]) {
+            "spawn-descendant" -> ProcessBuilder(args.drop(2)).inheritIO().start()
+            "hold-output" -> { System.out.print("0\n"); System.out.flush(); Thread.sleep(30_000) }
             "blocked-input" -> Thread.sleep(30_000)
             "output-first" -> {
                 System.out.print("o".repeat(256 * 1024))

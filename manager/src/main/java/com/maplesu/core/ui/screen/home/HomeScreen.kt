@@ -21,6 +21,7 @@ import com.maplesu.core.ui.UiMode
 import com.maplesu.core.R
 import com.maplesu.core.ui.component.dialog.rememberInfoDialog
 import com.maplesu.core.ui.screen.settings.rememberUltraEnvironmentPanel
+import com.maplesu.core.ui.screen.settings.UltraComponentDiagnosticRequests
 import com.maplesu.core.ui.navigation3.Navigator
 import com.maplesu.core.ui.navigation3.Route
 import com.maplesu.core.ui.viewmodel.HomeViewModel
@@ -106,6 +107,11 @@ fun HomePager(
     val statusState = remember(displayState, ultraVisible) {
         displayState.copy(ultraBrandVisible = ultraVisible)
     }
+    LaunchedEffect(statusState.environmentChecking, statusState.showEnvironmentReady) {
+        if (!statusState.environmentChecking && statusState.showEnvironmentReady) {
+            UltraComponentDiagnosticRequests.clear()
+        }
+    }
     // 环境版本与「发现 Ultra 环境更新」：同一份 §2.1 裁决，不可见时不读任何事实。
     val ultraEnvironment = rememberUltraEnvironmentPanel(
         visible = ultraVisible && displayState.environmentMode == dev.maplesu.manager.workmode.WorkMode.LITE,
@@ -129,6 +135,7 @@ fun HomePager(
         onJailbreakClick = { showJailbreakSelection = true },
         onEnvironmentRetry = viewModel::checkEnvironmentManually,
         onOpenEnvironmentSettings = {
+            UltraComponentDiagnosticRequests.open(displayState.ultraComponentDiagnostic)
             if (Route.Settings in navigator.backStack) navigator.popUntil { it == Route.Settings }
             else navigator.push(Route.Settings)
         },

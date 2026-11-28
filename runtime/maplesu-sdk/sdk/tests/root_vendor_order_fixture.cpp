@@ -20,6 +20,9 @@ static_assert(std::is_same_v<decltype(&maplesu::sdk::run_root_cmd), KModErr (*)(
 #include <sys/wait.h>
 #include <unistd.h>
 
+extern "C" int __real_pipe2(int*, int);
+extern "C" int64_t maplesu_request_operation_deadline_nanos() noexcept { return 0; }
+
 namespace fixture {
 struct Shared {
     int root_calls, vendor_calls[3], flag_ios, io_before_root, shells, closes, sequence, shell_reads;
@@ -39,7 +42,7 @@ thread_local default_modules::module_root::RootTransitionResult root_report;
 kernel_module::RequestManagementReply current_reply{};
 int pipe2(int* descriptors, int flags) {
     if (fail_command_pipe) { errno = EMFILE; return -1; }
-    return ::pipe2(descriptors, flags);
+    return __real_pipe2(descriptors, flags);
 }
 FILE* popen(const char* command, const char* mode) {
     ++shared->shells;
@@ -71,6 +74,8 @@ KModErr vendor(int index) {
     return KModErr::OK;
 }
 }
+
+extern "C" int __wrap_pipe2(int* descriptors, int flags) { return fixture::pipe2(descriptors, flags); }
 
 namespace kernel_module {
 uint64_t maplesu_request_auth_state() { return fixture::auth_state; }
@@ -150,11 +155,6 @@ KModErr set_current_root(bool bypass_selinux) {
 }
 }
 
-namespace maplesu::sdk {
-#define pipe2 fixture::pipe2
-// EXACT_FORK_FUNCTIONS
-#undef pipe2
-}
 #define popen fixture::popen
 #define read fixture::shell_read
 #define read_string_from_child fixture::output_frame

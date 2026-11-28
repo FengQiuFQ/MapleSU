@@ -3,20 +3,20 @@ package dev.maplesu.manager.workmode.detect.probes
 
 import android.content.Context
 import android.util.Log
+import dev.maplesu.manager.runtime.PageReadDeadline
 import java.io.File
 import java.util.concurrent.CancellationException
 import java.util.concurrent.TimeUnit
 
 /**
- * 只读探针：这台机器上是否存在**正在响应的** KernelSU 内核（不管它认谁做主）。
+ * 只读探针：当前回执是否明确属于本项目模式以外的 KernelSU 分支。
  *
  * 为什么需要它：环境检查的 [dev.maplesu.manager.workmode.detect.EnvironmentProbes.ksuNormal]
  * 走 JNI 快照，只有「内核认本管理器为主」时才会答 true，JNI 读不到时答 null。于是
- * 「装过第三方 KernelSU、但没装 MapleSU」的设备落在 null 上，被 resolver 当成 UNKNOWN，
- * 首页永远显示「环境检查未完成」——这正是 T14 注释里写的互锁。
+ * 只有正版本、未认主及明确不同的内核 UAPI 才能补充外来分支证据。
  *
- * 本探针回答一个更弱、但足以给出终态的问题：**内核在不在**。
- * 在但没认主 ⇒ 结论是「未安装（MapleSU）」，而不是「读不到」。
+ * 同分支未认主、缺失 UAPI 与 Ultra 自身的 UAPI 0 兼容接口均保持未知；
+ * 版本响应本身不排除本项目，userspace UAPI 也不代表当前内核。
  *
  * 约束（与 [SuReadinessProbeAdapter] 同规格）：
  * - 只执行 APK 自带的 `<nativeLibraryDir>/libksud_ksu.so debug info`，不写文件、不碰分区；
@@ -37,7 +37,7 @@ internal class ForeignKsuProbe(
     @Volatile
     private var cached: Boolean? = null
 
-    /** true = 有内核在响应；false = 明确没有；null = 这次读不到。 */
+    /** true = 当前明确外来分支；null = 未确认归属或本次读不到。 */
     fun kernelResponds(fresh: Boolean = false): Boolean? {
         if (Thread.currentThread().isInterrupted) throw InterruptedException("FOREIGN_KSU_PROBE_INTERRUPTED")
         val now = nanoTime()
@@ -65,6 +65,8 @@ internal class ForeignKsuProbe(
     }
 
     private fun probe(): Boolean? {
+        val deadline = PageReadDeadline.limitNanos(timeoutMillis)
+        if (deadline - System.nanoTime() <= 0) return null
         if (!daemon.isFile) {
             Log.i(TAG, "foreign ksu probe missing daemon=${daemon.absolutePath}")
             return null
@@ -78,9 +80,11 @@ internal class ForeignKsuProbe(
             val output = StringBuilder()
             val reader = Thread {
                 runCatching {
-                    process.inputStream.bufferedReader().forEachLine { line ->
-                        synchronized(output) {
-                            if (output.length < MAX_OUTPUT_CHARS) output.append(line).append('\n')
+                    process.inputStream.bufferedReader().use { stream ->
+                        stream.forEachLine { line ->
+                            synchronized(output) {
+                                if (output.length < MAX_OUTPUT_CHARS) output.append(line).append('\n')
+                            }
                         }
                     }
                 }
@@ -89,21 +93,24 @@ internal class ForeignKsuProbe(
                 name = "MapleSUForeignKsuProbe"
                 start()
             }
-            if (!process.waitFor(timeoutMillis, TimeUnit.MILLISECONDS)) {
+            val remaining = deadline - System.nanoTime()
+            if (remaining <= 0 || !process.waitFor(remaining, TimeUnit.NANOSECONDS)) {
                 process.destroyForcibly()
                 Log.i(TAG, "foreign ksu probe timeout after ${timeoutMillis}ms")
                 return null
             }
-            reader.join(READER_JOIN_MILLIS)
+            val readerBudget = minOf(deadline - System.nanoTime(),
+                TimeUnit.MILLISECONDS.toNanos(READER_JOIN_MILLIS))
+            if (readerBudget > 0) TimeUnit.NANOSECONDS.timedJoin(reader, readerBudget)
             val code = process.exitValue()
             if (code != 0) {
                 Log.i(TAG, "foreign ksu probe exit=$code")
                 return null
             }
-            if (reader.isAlive) return null
+            if (reader.isAlive || deadline - System.nanoTime() <= 0) return null
             return synchronized(output) { parseResponse(output.toString()) }
         } finally {
-            runCatching { process.destroy() }
+            runCatching { if (process.isAlive) process.destroyForcibly() else process.destroy() }
         }
     }
 
@@ -122,14 +129,16 @@ internal class ForeignKsuProbe(
          */
         private val VERSION_LINE = Regex("(?m)^\\s*version:\\s*(\\d+)\\s*$")
         private val FLAGS_LINE = Regex("(?m)^\\s*flags:\\s*0x([0-9a-fA-F]+)\\s*$")
+        private val UAPI_LINE = Regex("(?m)^\\s*uapi_version:\\s*(\\d+)\\s*$")
 
         internal fun parseResponse(output: String): Boolean? {
             val version = VERSION_LINE.find(output)?.groupValues?.get(1)?.toLongOrNull() ?: return null
-            if (version <= 0L) return false
+            if (version <= 0L) return null
             val flags = FLAGS_LINE.find(output)?.groupValues?.get(1)?.toLongOrNull(16) ?: return null
+            val uapi = UAPI_LINE.find(output)?.groupValues?.get(1)?.toLongOrNull() ?: return null
             // Fixed KernelSU UAPI: KSU_GET_INFO_FLAG_MANAGER = (1U << 1).
             // A version alone does not exclude this app being the recognized manager.
-            return if (flags and 2L == 0L) true else null
+            return if (flags and 2L == 0L && uapi > 0L && uapi != 7L) true else null
         }
     }
 }

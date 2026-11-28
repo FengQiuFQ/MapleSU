@@ -1,0 +1,327 @@
+{
+  "schema": "maplesu-sdk-explicit-legacy-contract/1",
+  "provider_member": {
+    "idx": 53,
+    "name": "maplesu_installer.o"
+  },
+  "provider_source": "sdk/src/maplesu/compat/keyed_exports_legacy_abi.cpp",
+  "consumer_source": "sdk/tools/explicit_legacy_public_abi.cpp",
+  "historical_include": "maintenance/freeze/freeze-maplesu-pro-5.2.0-su-uid-isolation-20261114-20261114/include",
+  "symbols": [
+    {
+      "symbol": "_ZN10skroot_env16restart_zygote64EPKc",
+      "signature": "skroot_env::restart_zygote64(char const*)",
+      "original_member": 45,
+      "original_migration_id": {
+        "ordinal": 27,
+        "line": 35
+      }
+    },
+    {
+      "symbol": "_ZN10skroot_env22get_root_status_reportEPKc",
+      "signature": "skroot_env::get_root_status_report(char const*)",
+      "original_member": 45,
+      "original_migration_id": {
+        "ordinal": 24,
+        "line": 32
+      }
+    },
+    {
+      "symbol": "_ZN10skroot_env22is_adb_forced_disabledEPKc",
+      "signature": "skroot_env::is_adb_forced_disabled(char const*)",
+      "original_member": 45,
+      "original_migration_id": {
+        "ordinal": 23,
+        "line": 31
+      }
+    },
+    {
+      "symbol": "_ZN10skroot_env23set_adb_forced_disabledEPKcb",
+      "signature": "skroot_env::set_adb_forced_disabled(char const*, bool)",
+      "original_member": 45,
+      "original_migration_id": {
+        "ordinal": 22,
+        "line": 30
+      }
+    },
+    {
+      "symbol": "_ZN10skroot_env26test_skroot_basics_with_cbEPKcNS_9BasicItemEPFvS1_E",
+      "signature": "skroot_env::test_skroot_basics_with_cb(char const*, skroot_env::BasicItem, void (*)(char const*))",
+      "original_member": 45,
+      "original_migration_id": {
+        "ordinal": 25,
+        "line": 33
+      }
+    },
+    {
+      "symbol": "_ZN10skroot_env28is_boot_fail_protect_enabledEPKc",
+      "signature": "skroot_env::is_boot_fail_protect_enabled(char const*)",
+      "original_member": 45,
+      "original_migration_id": {
+        "ordinal": 21,
+        "line": 29
+      }
+    },
+    {
+      "symbol": "_ZN10skroot_env29set_boot_fail_protect_enabledEPKcb",
+      "signature": "skroot_env::set_boot_fail_protect_enabled(char const*, bool)",
+      "original_member": 45,
+      "original_migration_id": {
+        "ordinal": 20,
+        "line": 28
+      }
+    },
+    {
+      "symbol": "_ZN10skroot_env34test_skroot_deafult_module_with_cbEPKcNS_17DeafultModuleNameEPFvS1_E",
+      "signature": "skroot_env::test_skroot_deafult_module_with_cb(char const*, skroot_env::DeafultModuleName, void (*)(char const*))",
+      "original_member": 45,
+      "original_migration_id": {
+        "ordinal": 26,
+        "line": 34
+      }
+    },
+    {
+      "symbol": "_ZN10skroot_env26install_skroot_environmentEPKcNS_11InstallModeERKNS_13InstallConfigE",
+      "signature": "skroot_env::install_skroot_environment(char const*, skroot_env::InstallMode, skroot_env::InstallConfig const&)",
+      "original_member": 53,
+      "original_migration_id": {
+        "ordinal": 2,
+        "line": 10
+      }
+    },
+    {
+      "symbol": "_ZN10skroot_env28get_skroot_environment_stateEPKc",
+      "signature": "skroot_env::get_skroot_environment_state(char const*)",
+      "original_member": 53,
+      "original_migration_id": {
+        "ordinal": 34,
+        "line": 42
+      }
+    },
+    {
+      "symbol": "_ZN10skroot_env28uninstall_skroot_environmentEPKc",
+      "signature": "skroot_env::uninstall_skroot_environment(char const*)",
+      "original_member": 53,
+      "original_migration_id": {
+        "ordinal": 3,
+        "line": 11
+      }
+    },
+    {
+      "symbol": "_ZN10skroot_env40get_installed_skroot_environment_versionEPKcRNS_16SkrootSdkVersionE",
+      "signature": "skroot_env::get_installed_skroot_environment_version(char const*, skroot_env::SkrootSdkVersion&)",
+      "original_member": 53,
+      "original_migration_id": {
+        "ordinal": 4,
+        "line": 12
+      }
+    },
+    {
+      "symbol": "_ZN10skroot_env16uninstall_moduleEPKcS1_",
+      "signature": "skroot_env::uninstall_module(char const*, char const*)",
+      "original_member": 58,
+      "original_migration_id": {
+        "ordinal": 13,
+        "line": 21
+      }
+    },
+    {
+      "symbol": "_ZN10skroot_env22install_module_with_cbEPKcS1_PFvS1_E",
+      "signature": "skroot_env::install_module_with_cb(char const*, char const*, void (*)(char const*))",
+      "original_member": 58,
+      "original_migration_id": {
+        "ordinal": 11,
+        "line": 19
+      }
+    },
+    {
+      "symbol": "_ZN10skroot_env23get_all_modules_with_cbEPKcPFvPKNS_13module_recordEE",
+      "signature": "skroot_env::get_all_modules_with_cb(char const*, void (*)(skroot_env::module_record const*))",
+      "original_member": 58,
+      "original_migration_id": {
+        "ordinal": 9,
+        "line": 17
+      }
+    },
+    {
+      "symbol": "_ZN10skroot_env31parse_module_desc_from_zip_fileEPKcS1_RNS_11module_descE",
+      "signature": "skroot_env::parse_module_desc_from_zip_file(char const*, char const*, skroot_env::module_desc&)",
+      "original_member": 58,
+      "original_migration_id": {
+        "ordinal": 10,
+        "line": 18
+      }
+    },
+    {
+      "symbol": "_ZN10skroot_env35install_module_dev_run_once_with_cbEPKcS1_PFvS1_E",
+      "signature": "skroot_env::install_module_dev_run_once_with_cb(char const*, char const*, void (*)(char const*))",
+      "original_member": 58,
+      "original_migration_id": {
+        "ordinal": 12,
+        "line": 20
+      }
+    },
+    {
+      "symbol": "_ZN10skroot_env16clear_skroot_logEPKc",
+      "signature": "skroot_env::clear_skroot_log(char const*)",
+      "original_member": 59,
+      "original_migration_id": {
+        "ordinal": 8,
+        "line": 16
+      }
+    },
+    {
+      "symbol": "_ZN10skroot_env18read_skroot_log_cbEPKcPFvS1_E",
+      "signature": "skroot_env::read_skroot_log_cb(char const*, void (*)(char const*))",
+      "original_member": 59,
+      "original_migration_id": {
+        "ordinal": 5,
+        "line": 13
+      }
+    },
+    {
+      "symbol": "_ZN10skroot_env21is_skroot_log_enabledEPKc",
+      "signature": "skroot_env::is_skroot_log_enabled(char const*)",
+      "original_member": 59,
+      "original_migration_id": {
+        "ordinal": 7,
+        "line": 15
+      }
+    },
+    {
+      "symbol": "_ZN10skroot_env22set_skroot_log_enabledEPKcb",
+      "signature": "skroot_env::set_skroot_log_enabled(char const*, bool)",
+      "original_member": 59,
+      "original_migration_id": {
+        "ordinal": 6,
+        "line": 14
+      }
+    },
+    {
+      "symbol": "_ZN10skroot_env12run_root_cmdEPKcS1_RNSt6__ndk112basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEE",
+      "signature": "skroot_env::run_root_cmd(char const*, char const*, std::__ndk1::basic_string<char, std::__ndk1::char_traits<char>, std::__ndk1::allocator<char>>&)",
+      "original_member": 60,
+      "original_migration_id": {
+        "ordinal": 15,
+        "line": 23
+      }
+    },
+    {
+      "symbol": "_ZN10skroot_env8get_rootEPKc",
+      "signature": "skroot_env::get_root(char const*)",
+      "original_member": 60,
+      "original_migration_id": {
+        "ordinal": 14,
+        "line": 22
+      }
+    },
+    {
+      "symbol": "_ZN10skroot_env16add_su_auth_listEPKcS1_",
+      "signature": "skroot_env::add_su_auth_list(char const*, char const*)",
+      "original_member": 61,
+      "original_migration_id": {
+        "ordinal": 17,
+        "line": 25
+      }
+    },
+    {
+      "symbol": "_ZN10skroot_env18clear_su_auth_listEPKc",
+      "signature": "skroot_env::clear_su_auth_list(char const*)",
+      "original_member": 61,
+      "original_migration_id": {
+        "ordinal": 19,
+        "line": 27
+      }
+    },
+    {
+      "symbol": "_ZN10skroot_env19remove_su_auth_listEPKcS1_",
+      "signature": "skroot_env::remove_su_auth_list(char const*, char const*)",
+      "original_member": 61,
+      "original_migration_id": {
+        "ordinal": 18,
+        "line": 26
+      }
+    },
+    {
+      "symbol": "_ZN10skroot_env24get_su_auth_list_with_cbEPKcPFvPKNS_12su_auth_itemEE",
+      "signature": "skroot_env::get_su_auth_list_with_cb(char const*, void (*)(skroot_env::su_auth_item const*))",
+      "original_member": 61,
+      "original_migration_id": {
+        "ordinal": 16,
+        "line": 24
+      }
+    },
+    {
+      "symbol": "_ZN10skroot_env8features6web_ui32start_module_web_ui_server_asyncEPKcS3_Ri",
+      "signature": "skroot_env::features::web_ui::start_module_web_ui_server_async(char const*, char const*, int&)",
+      "original_member": 62,
+      "original_migration_id": {
+        "ordinal": 1,
+        "line": 9
+      }
+    },
+    {
+      "symbol": "_ZN7maplesu18get_module_controlEPKcS1_RNS_18ModuleControlStateE",
+      "signature": "maplesu::get_module_control(char const*, char const*, maplesu::ModuleControlState&)",
+      "original_member": 255,
+      "original_migration_id": {
+        "ordinal": 36,
+        "line": 44
+      }
+    },
+    {
+      "symbol": "_ZN7maplesu18set_module_enabledEPKcS1_bRNS_18ModuleControlStateE",
+      "signature": "maplesu::set_module_enabled(char const*, char const*, bool, maplesu::ModuleControlState&)",
+      "original_member": 255,
+      "original_migration_id": {
+        "ordinal": 38,
+        "line": 46
+      }
+    },
+    {
+      "symbol": "_ZN7maplesu19get_module_controlsEPKcRKNSt6__ndk16vectorIN10skroot_env13module_recordENS2_9allocatorIS5_EEEE",
+      "signature": "maplesu::get_module_controls(char const*, std::__ndk1::vector<skroot_env::module_record, std::__ndk1::allocator<skroot_env::module_record>> const&)",
+      "original_member": 255,
+      "original_migration_id": {
+        "ordinal": 37,
+        "line": 45
+      }
+    },
+    {
+      "symbol": "_ZN7maplesu25module_control_capabilityEPKcRb",
+      "signature": "maplesu::module_control_capability(char const*, bool&)",
+      "original_member": 255,
+      "original_migration_id": {
+        "ordinal": 35,
+        "line": 43
+      }
+    },
+    {
+      "symbol": "_ZN11kernel_root20parasite_implant_appEPKcS1_S1_",
+      "signature": "kernel_root::parasite_implant_app(char const*, char const*, char const*)",
+      "original_member": 256,
+      "original_migration_id": {
+        "ordinal": 29,
+        "line": 37
+      }
+    },
+    {
+      "symbol": "_ZN11kernel_root23parasite_implant_su_envEPKcS1_S1_S1_",
+      "signature": "kernel_root::parasite_implant_su_env(char const*, char const*, char const*, char const*)",
+      "original_member": 256,
+      "original_migration_id": {
+        "ordinal": 30,
+        "line": 38
+      }
+    },
+    {
+      "symbol": "_ZN11kernel_root29parasite_precheck_app_with_cbEPKcS1_PFvS1_NS_15AppDynlibStatusEE",
+      "signature": "kernel_root::parasite_precheck_app_with_cb(char const*, char const*, void (*)(char const*, kernel_root::AppDynlibStatus))",
+      "original_member": 256,
+      "original_migration_id": {
+        "ordinal": 28,
+        "line": 36
+      }
+    }
+  ]
+}

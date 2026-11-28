@@ -78,7 +78,7 @@ object DetectionRules {
                 reasons = listOf(Reason.KSU_BRANCH_UNTRUSTED)
             }
 
-            ksu.responded && !ksu.isManager -> {
+            ksu.responded && !ksu.isManager && ksu.uapi > 0 -> {
                 state = ModeState.FOREIGN_SU
                 rule = Rule.R4_FOREIGN_KSU
                 reasons = listOf(Reason.FOREIGN_KSU_KERNEL)

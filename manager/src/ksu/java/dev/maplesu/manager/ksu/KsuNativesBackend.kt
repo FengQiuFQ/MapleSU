@@ -24,6 +24,7 @@ class KsuNativesBackend private constructor(
 
     // ── 只读状态 ─────────────────────────────────────────────────────────
     val version: Int get() = if (availableFlag) calls.version else -1
+    fun currentInfo(): IntArray? = if (availableFlag) calls.currentInfo() else null
     val isSafeMode: Boolean get() = availableFlag && calls.isSafeMode
     val isLkmMode: Boolean get() = availableFlag && calls.isLkmMode
     val isLkmBundled: Boolean get() = availableFlag && calls.isLkmBundled

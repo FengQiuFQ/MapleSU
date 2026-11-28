@@ -328,6 +328,25 @@ class RootExecutionRouterTest {
         assertEquals(2, commands)
     }
 
+    @Test fun deadlineRejectionKeepsCurrentRootObservationAndItsOriginalFailure() {
+        var calls = 0
+        var invalidations = 0
+        val detail = "ULTRA_ROOT_FAILED:MAPLESU_SDK_DEADLINE_EXCEEDED"
+        val ultra = UltraEnvRootExecutor(
+            runner = { calls++; UltraRootCommandResult(false, -1007, "", detail) },
+            running = { true },
+            onFailure = { invalidations++ },
+        )
+        val router = RootExecutionRouter(ultra, modeProvider = { WorkMode.LITE }, ultraIdentity = { true })
+        val result = router.execute("write-once")
+        assertFalse(result.ok)
+        assertEquals(-1007, result.code)
+        assertEquals(detail, result.detail)
+        assertEquals(1, calls)
+        assertEquals(0, invalidations)
+        assertTrue(ultra.available())
+    }
+
     @Test fun rootCommandsShareOneExecutionSlotAndReleaseItAfterFailure() {
         val started = CountDownLatch(1)
         val release = CountDownLatch(1)

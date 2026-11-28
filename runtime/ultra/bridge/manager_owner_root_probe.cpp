@@ -1,4 +1,5 @@
 #include "manager_owner_root_probe.h"
+#include "sdk_call_scope.h"
 #include "manager_owner_identity.h"
 #include "../../maplesu-sdk/sdk/include/maplesu_request_private.h"
 #include "../../maplesu-sdk/sdk/include/maplesu_caps_private.h"
@@ -9,10 +10,13 @@
 #include <climits>
 #include <csignal>
 #include <cstdlib>
+#include <cstring>
 #include <fcntl.h>
+#include <new>
 #include <poll.h>
 #include <pthread.h>
 #include <sys/prctl.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <type_traits>
@@ -25,7 +29,36 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using namespace kernel_module;
 static_assert(std::is_trivially_copyable_v<ManagerOwnerRootProbe>);
-static_assert(2 * sizeof(ManagerOwnerRootProbe) <= PIPE_BUF);
+static_assert(std::atomic<uint32_t>::is_always_lock_free);
+
+// A credential transition can revoke writes to an inherited app-labelled pipe.
+// Keep fixed same-image receipts in this fork's anonymous mapping; the existing
+// pipe only signals EOF and never needs a write from the elevated child.
+struct RootProbeReceipt {
+    uint32_t magic = 0x4d535250, version = 1;
+    std::atomic<uint32_t> committed{0};
+    ManagerOwnerRootProbe checkpoint, final;
+};
+static_assert(sizeof(RootProbeReceipt) <= 4096);
+
+struct ReceiptMapping {
+    RootProbeReceipt* value = nullptr;
+    bool child_reaped = false;
+    ReceiptMapping() {
+        void* memory = mmap(nullptr, sizeof(RootProbeReceipt), PROT_READ | PROT_WRITE,
+            MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if (memory != MAP_FAILED) value = new (memory) RootProbeReceipt{};
+    }
+    ~ReceiptMapping() {
+        if (!value) return;
+        // A still-running child's mapping owns its own lifetime until _exit.
+        if (child_reaped) {
+            volatile unsigned char* bytes = reinterpret_cast<volatile unsigned char*>(value);
+            for (size_t left = sizeof(*value); left; --left) *bytes++ = 0;
+        }
+        munmap(value, sizeof(*value));
+    }
+};
 
 std::atomic<uint64_t> probe_slot{0};
 std::atomic<uint64_t> wait_owner{0};
@@ -221,21 +254,7 @@ void observe_credentials(ManagerOwnerRootCredentials& out) {
         out.bounding == mask && out.ambient == mask && out.securebits_observed && !out.securebits;
 }
 
-bool write_snapshot(int fd, const ManagerOwnerRootProbe& result) {
-    const char* bytes = reinterpret_cast<const char*>(&result);
-    size_t left = sizeof(result);
-    while (left) {
-        const ssize_t count = write(fd, bytes, left);
-        if (count < 0 && errno == EINTR) continue;
-        if (!count) errno = EIO;
-        if (count <= 0) return false;
-        bytes += count;
-        left -= static_cast<size_t>(count);
-    }
-    return true;
-}
-
-[[noreturn]] void probe_child(int input, int output, const timespec& deadline) {
+[[noreturn]] void probe_child(int input, int output, const timespec& deadline, RootProbeReceipt& receipt) {
     ManagerOwnerRootProbe result;
     result.child_pid = static_cast<uint32_t>(getpid());
     result.watchdog_error = arm_watchdog(deadline);
@@ -275,8 +294,8 @@ bool write_snapshot(int fd, const ManagerOwnerRootProbe& result) {
     }
     // Publish confirmed Root facts before cleanup; a failed CLOSE cannot erase them.
     result.root_checkpoint_received = true;
-    bool delivered = write_snapshot(output, result);
-    if (!delivered && !result.child_io_error) result.child_io_error = errno ? errno : EIO;
+    receipt.checkpoint = result;
+    receipt.committed.store(1, std::memory_order_release);
     if (result.mode_selected) {
         result.close.attempted = true;
         try { result.close.error = static_cast<int64_t>(maplesu_request_owner_close()); }
@@ -289,31 +308,32 @@ bool write_snapshot(int fd, const ManagerOwnerRootProbe& result) {
         if (reply.command == MAPLESU_REQUEST_SESSION_CLOSE) copy_reply(result.close, reply);
     }
     result.receipt_complete = true;
-    delivered = write_snapshot(output, result) && delivered;
-    if (close(output) < 0) delivered = false;
+    receipt.final = result;
+    receipt.committed.store(3, std::memory_order_release);
+    const bool delivered = close(output) == 0;
     _exit(delivered && !result.child_io_error ? 0 : 1);
 }
 
-int read_snapshot(int fd, ManagerOwnerRootProbe& result, const timespec& deadline) {
-    char* bytes = reinterpret_cast<char*>(&result);
-    size_t left = sizeof(result);
-    while (left) {
-        const int budget = budget_ms(deadline);
-        if (budget <= 0) return budget ? -budget : ETIMEDOUT;
-        pollfd watch{fd, POLLIN, 0};
-        const int ready = poll(&watch, 1, budget);
-        if (ready < 0 && errno == EINTR) continue;
-        if (ready < 0) return errno;
-        if (!ready) return ETIMEDOUT;
-        if (watch.revents & POLLNVAL) return EBADF;
-        const ssize_t count = read(fd, bytes, left);
-        if (count < 0 && errno == EINTR) continue;
-        if (count < 0) return errno;
-        if (!count) return EPIPE;
-        bytes += count;
-        left -= static_cast<size_t>(count);
+int read_receipt(const RootProbeReceipt& receipt, pid_t child, ManagerOwnerRootProbe& result) {
+    const uint32_t committed = receipt.committed.load(std::memory_order_acquire);
+    if (receipt.magic != 0x4d535250 || receipt.version != 1 || (committed != 1 && committed != 3)) return EPROTO;
+    for (unsigned frame = 0; frame < (committed == 3 ? 2u : 1u); ++frame) {
+        const auto& snapshot = frame ? receipt.final : receipt.checkpoint;
+        const auto& root = snapshot.root;
+        const bool root_committed = root.completed && root.command == MAPLESU_REQUEST_CRED_ROOT &&
+            (root.effects & MAPLESU_EFFECT_COMMITTED);
+        if (snapshot.abi_version != 1 || snapshot.child_pid != static_cast<uint32_t>(child) ||
+            !snapshot.root_checkpoint_received || snapshot.receipt_complete != (frame == 1) ||
+            (snapshot.owner_bound && !snapshot.mode_selected) ||
+            (root.attempted && !snapshot.owner_bound) ||
+            (root.completed && (!root.attempted || !root.reply_observed || root.command != MAPLESU_REQUEST_CRED_ROOT)) ||
+            snapshot.root_committed != root_committed ||
+            (frame && snapshot.root_verified != receipt.checkpoint.root_verified) ||
+            (snapshot.root_verified && (!root_committed || root.error || root.status ||
+                (!frame && snapshot.child_exception) || !snapshot.credentials.matches_root))) return EPROTO;
+        result = snapshot;
     }
-    return 0;
+    return committed == 3 ? 0 : EPIPE;
 }
 
 int read_eof(int fd, const timespec& deadline) {
@@ -335,53 +355,62 @@ int read_eof(int fd, const timespec& deadline) {
 }
 } // namespace
 
-ManagerOwnerRootProbe probe_manager_owner_root() {
+ManagerOwnerRootProbe probe_manager_owner_root() { return probe_manager_owner_root(0); }
+
+ManagerOwnerRootProbe probe_manager_owner_root(int64_t session_deadline_nanos) {
     ManagerOwnerRootProbe result;
     const auto start = Clock::now();
     timespec deadline{};
     uint64_t lease = 0;
-    if (const auto admission = manager_worker_admission(); is_failed(admission))
-        result.channel_error = static_cast<int64_t>(admission);
-    else if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) result.watchdog_error = errno;
+    if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) result.watchdog_error = errno;
     else {
         deadline.tv_nsec += 300000000;
         if (deadline.tv_nsec >= 1000000000) { ++deadline.tv_sec; deadline.tv_nsec -= 1000000000; }
-        if (admit_probe(result, deadline, lease)) {
+        if (session_deadline_nanos > 0 && session_deadline_nanos <
+            int64_t(deadline.tv_sec) * INT64_C(1000000000) + deadline.tv_nsec) {
+            deadline.tv_sec = static_cast<time_t>(session_deadline_nanos / INT64_C(1000000000));
+            deadline.tv_nsec = static_cast<long>(session_deadline_nanos % INT64_C(1000000000));
+        }
+        SdkDeadlineScope sdk_deadline(int64_t(deadline.tv_sec) * INT64_C(1000000000) + deadline.tv_nsec);
+        const int64_t operation_deadline = sdk_call_deadline_nanos();
+        deadline.tv_sec = static_cast<time_t>(operation_deadline / INT64_C(1000000000));
+        deadline.tv_nsec = static_cast<long>(operation_deadline % INT64_C(1000000000));
+        const int budget = budget_ms(deadline);
+        if (budget <= 0) {
+            result.transport_error = budget ? -budget : ETIMEDOUT;
+            result.timed_out = !budget;
+        } else if (const auto admission = manager_worker_admission(); is_failed(admission)) {
+            result.channel_error = static_cast<int64_t>(admission);
+        } else if (const int remaining = budget_ms(deadline); remaining <= 0) {
+            result.transport_error = remaining ? -remaining : ETIMEDOUT;
+            result.timed_out = !remaining;
+        } else if (admit_probe(result, deadline, lease)) {
             const int prior_cleanup_error = result.cleanup_error;
+            ReceiptMapping receipt;
             int fds[2];
-            if (pipe2(fds, O_CLOEXEC) != 0) {
+            if (!receipt.value || pipe2(fds, O_CLOEXEC) != 0) {
                 result.transport_error = errno;
                 probe_slot.compare_exchange_strong(lease, 0, std::memory_order_acq_rel);
             } else {
                 maplesu_request_fork_prepare();
-                const pid_t child = fork();
-                if (!child) probe_child(fds[0], fds[1], deadline);
+                const int remaining = budget_ms(deadline);
+                const pid_t child = remaining > 0 ? fork() : -1;
+                if (!child) probe_child(fds[0], fds[1], deadline, *receipt.value);
                 if (child < 0) {
-                    result.transport_error = errno;
+                    result.transport_error = remaining > 0 ? errno : remaining ? -remaining : ETIMEDOUT;
+                    result.timed_out = !remaining;
+                    receipt.child_reaped = true;
                     close(fds[0]); close(fds[1]);
                     probe_slot.compare_exchange_strong(lease, 0, std::memory_order_acq_rel);
                 } else {
                     int transport_error = close(fds[1]) < 0 ? errno : 0;
                     bool receive_failed = false;
-                    for (unsigned frame = 0; frame < 2; ++frame) {
-                        ManagerOwnerRootProbe snapshot;
-                        const int error = read_snapshot(fds[0], snapshot, deadline);
-                        if (error || snapshot.abi_version != 1 || !snapshot.root_checkpoint_received ||
-                            snapshot.receipt_complete != (frame == 1)) {
-                            if (!transport_error) transport_error = error ? error : EPROTO;
-                            result.timed_out = error == ETIMEDOUT;
-                            receive_failed = true;
-                            break;
-                        }
-                        result = snapshot;
-                    }
-                    if (!receive_failed) {
-                        const int error = read_eof(fds[0], deadline);
-                        if (error) {
-                            if (!transport_error) transport_error = error;
-                            result.timed_out = error == ETIMEDOUT;
-                            receive_failed = true;
-                        }
+                    const int eof_error = read_eof(fds[0], deadline);
+                    const int receipt_error = read_receipt(*receipt.value, child, result);
+                    if (eof_error || receipt_error) {
+                        if (!transport_error) transport_error = eof_error ? eof_error : receipt_error;
+                        result.timed_out = eof_error == ETIMEDOUT || budget_ms(deadline) == 0;
+                        receive_failed = true;
                     }
                     result.child_pid = static_cast<uint32_t>(child);
                     result.cleanup_error = prior_cleanup_error;
@@ -395,7 +424,8 @@ ManagerOwnerRootProbe probe_manager_owner_root() {
                     const pid_t waited = wait_nonblocking(child, result.child_status, deadline, error);
                     if (waited == child) result.child_status_valid = true;
                     else if (waited < 0) result.wait_error = error;
-                    if (waited == child || (waited < 0 && error == ECHILD))
+                    receipt.child_reaped = waited == child || (waited < 0 && error == ECHILD);
+                    if (receipt.child_reaped)
                         probe_slot.compare_exchange_strong(lease, 0, std::memory_order_acq_rel);
                     else defer_cleanup(child, result);
                     if (result.child_status_valid && (!WIFEXITED(result.child_status) || WEXITSTATUS(result.child_status) != 0) &&

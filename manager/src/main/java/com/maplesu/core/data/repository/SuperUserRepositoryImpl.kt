@@ -26,7 +26,9 @@ import com.maplesu.core.ui.KsuService
 import com.maplesu.core.ui.util.KsuCli
 import dev.maplesu.manager.runtime.readResult
 import dev.maplesu.manager.runtime.authorization.AndroidApplicationIdentities
+import dev.maplesu.manager.runtime.authorization.ManagerAuthorizations
 import dev.maplesu.manager.runtime.authorization.SuperuserControl
+import dev.maplesu.manager.runtime.HookRootExecutor
 import dev.maplesu.manager.runtime.ultra.UltraAuthorization
 import dev.maplesu.manager.runtime.ultra.UltraEnvironmentProbe
 import dev.maplesu.manager.workmode.ModeRuntime
@@ -209,6 +211,8 @@ class SuperUserRepositoryImpl : SuperUserRepository {
     /** Hook publishes a restricted SU endpoint; application discovery uses PackageManager. */
     private fun loadHookAppList(): Pair<List<AppInfo>, List<Int>> {
         val grants = readHookSnapshot()
+        val delivery = if (HookRootExecutor.production(ksuApp).available()) null
+            else ManagerAuthorizations.currentDeliveryRead(ksuApp)
         val pm = ksuApp.packageManager
         val apps = pm.getInstalledPackages(0).filter { info ->
             val ai = info.applicationInfo ?: return@filter false
@@ -219,6 +223,7 @@ class SuperUserRepositoryImpl : SuperUserRepository {
                 profile = Natives.Profile(info.packageName, currentUid = ai.uid,
                     allowSu = grants.isGranted(info.packageName, ai.uid)),
                 authorizationStale = grants.isStale(info.packageName, ai.uid), authorizationPending = grants.pendingApply)
+                .apply { currentDeliveryRead = delivery }
         }
         return apps to listOf(ksuApp.applicationInfo.uid / 100_000)
     }
@@ -288,6 +293,7 @@ class SuperUserRepositoryImpl : SuperUserRepository {
         val application = ksuApp
         val pm = application.packageManager
         val start = SystemClock.elapsedRealtime()
+        var delivery: ManagerAuthorizations.CurrentDeliveryRead? = null
         val (packages, grants) = UltraAppListSnapshot.withPackages(
             packages = {
                 val installed = traceUltraListStage("pm_enumerate") { pm.getInstalledPackages(0) }
@@ -300,7 +306,7 @@ class SuperUserRepositoryImpl : SuperUserRepository {
                     }
                 }
             },
-            refresh = { traceUltraListStage("sdk_refresh") { UltraAuthorization.refresh(application) } },
+            refresh = { traceUltraListStage("sdk_refresh") { delivery = refreshUltraDelivery(); true } },
             grantedPackages = { UltraAuthorization.grantedPackages() },
             grantedUids = { UltraAuthorization.uidProfiles().filterValues { it.allow }.keys },
         )
@@ -312,7 +318,7 @@ class SuperUserRepositoryImpl : SuperUserRepository {
                     packageInfo = info,
                     profile = Natives.Profile(info.packageName, currentUid = ai.uid,
                         allowSu = grants.isGranted(info.packageName, ai.uid)),
-                )
+                ).apply { currentDeliveryRead = delivery }
             }
         }.toMutableList()
 
@@ -360,17 +366,21 @@ class SuperUserRepositoryImpl : SuperUserRepository {
 
             if (ModeRuntime.active == WorkMode.LITE && dev.maplesu.manager.runtime.authorization.ManagerAuthorizations.usesManagerAuthority(ksuApp)) {
                 val grants = readHookSnapshot()
+                val delivery = if (HookRootExecutor.production(ksuApp).available()) null
+                    else ManagerAuthorizations.currentDeliveryRead(ksuApp)
                 return@runCatching currentApps.map { app ->
                     app.copy(profile = Natives.Profile(app.profileKey, currentUid = app.uid,
                         allowSu = grants.isGranted(app.profileKey, app.uid)),
                         authorizationStale = grants.isStale(app.profileKey, app.uid), authorizationPending = grants.pendingApply)
+                        .apply { currentDeliveryRead = delivery }
                 }
             }
 
             if (ModeRuntime.active == WorkMode.LITE && usesReadyUltraBackend()) {
+                var delivery: ManagerAuthorizations.CurrentDeliveryRead? = null
                 val grants = traceUltraListStage("sdk_refresh_profiles") {
                     UltraAppListSnapshot.read(
-                        refresh = { UltraAuthorization.refresh(ksuApp) },
+                        refresh = { delivery = refreshUltraDelivery(); true },
                         grantedPackages = { UltraAuthorization.grantedPackages() },
                         grantedUids = { UltraAuthorization.uidProfiles().filterValues { it.allow }.keys },
                     )
@@ -379,6 +389,7 @@ class SuperUserRepositoryImpl : SuperUserRepository {
                     currentApps.map { app ->
                         app.copy(profile = Natives.Profile(app.profileKey, currentUid = app.uid,
                             allowSu = grants.isGranted(app.profileKey, app.uid)), authorizationStale = false, authorizationPending = false)
+                            .apply { currentDeliveryRead = delivery }
                     }
                 }
             }
@@ -389,6 +400,14 @@ class SuperUserRepositoryImpl : SuperUserRepository {
                 it.copy(profile = profile, authorizationStale = false, authorizationPending = false)
             }
         }
+    }
+
+    private fun refreshUltraDelivery(): ManagerAuthorizations.CurrentDeliveryRead {
+        val refreshed = UltraAuthorization.refreshDetailed(ksuApp)
+            ?: error("SU_AUTH_SCOPE_CHANGED")
+        check(refreshed.succeeded) { refreshed.diagnosticSummary }
+        val snapshot = refreshed.snapshot ?: error("SU_AUTH_CURRENT_READ_MISSING")
+        return ManagerAuthorizations.currentDeliveryRead(refreshed.scope, snapshot)
     }
 
     private inline fun <T> traceUltraListStage(stage: String, block: () -> T): T {

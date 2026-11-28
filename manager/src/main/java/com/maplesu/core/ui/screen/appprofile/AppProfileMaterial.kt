@@ -100,6 +100,9 @@ fun AppProfileScreenMaterial(
                 if (state.isLoading) LoadingIndicator()
                 else {
                     Text(stringResource(R.string.failed_to_load_app_profile).format(state.appGroup.primary.label))
+                    state.diagnostic?.let {
+                        TextButton(onClick = actions.onShowDiagnostic) { Text(stringResource(R.string.ui_polish_diagnostics_show)) }
+                    }
                     TextButton(onClick = actions.onRetry) { Text(stringResource(R.string.network_retry)) }
                 }
             }
@@ -137,6 +140,9 @@ fun AppProfileScreenMaterial(
             affectedApps = state.appGroup.apps,
             suState = state.suState,
             isSaving = state.isSaving,
+            diagnostic = state.diagnostic,
+            onShowDiagnostic = actions.onShowDiagnostic,
+            onRetry = actions.onRetry,
             onProfileChange = actions.onProfileChange,
         )
     }
@@ -158,6 +164,9 @@ private fun AppProfileInner(
     affectedApps: List<SuperUserViewModel.AppInfo> = emptyList(),
     suState: State = State.NOT_AUTHORIZED,
     isSaving: Boolean = false,
+    diagnostic: AppProfileDiagnostic? = null,
+    onShowDiagnostic: () -> Unit = {},
+    onRetry: () -> Unit = {},
     onProfileChange: (Natives.Profile) -> Unit,
 ) {
     val isRootGranted = !isSpecialApp && profile.allowSu
@@ -225,9 +234,22 @@ private fun AppProfileInner(
                         // the one place a user can see them for this application.
                         summary = stringResource(if (isSaving) R.string.ui_editing_saving_authorization else suStateLabel(suState)),
                         checked = isRootGranted,
+                        enabled = !isSaving,
                         onCheckedChange = { onProfileChange(profile.copy(allowSu = it)) },
                     )
                 }
+                diagnostic?.let { issue -> add {
+                    SegmentedListItem(
+                        onClick = onShowDiagnostic,
+                        headlineContent = { Text(issue.title) },
+                        supportingContent = { Text(stringResource(R.string.ui_polish_diagnostics_show)) },
+                        trailingContent = {
+                            TextButton(onClick = onRetry, enabled = !isSaving) {
+                                Text(stringResource(R.string.work_mode_recheck))
+                            }
+                        },
+                    )
+                } }
             }
         )
 

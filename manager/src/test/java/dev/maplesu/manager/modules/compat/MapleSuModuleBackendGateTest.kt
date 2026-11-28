@@ -760,6 +760,44 @@ class MapleSuModuleBackendGateTest {
         assertNull(h.journal.entries.last().token)
     }
 
+    @Test
+    fun deadlineBeforeSubmissionDiscardsOnlyTheStagedCopyWithoutReplaying() {
+        for (devRunOnce in listOf(false, true)) {
+            val h = harness()
+            val operation = if (devRunOnce) "install_module_dev_run_once" else "install_module"
+            h.host.installFailure = receipt(operation).copy(
+                ok = false, sdkError = "MAPLESU_SDK_DEADLINE_EXCEEDED", sdkErrorCode = -1007,
+            )
+            val result = h.transaction.install(request(devRunOnce = devRunOnce), h.stdout::add, h.stderr::add)
+            assertEquals(UltraOutcome.FAILED, result.outcome)
+            assertEquals(UltraPhase.HOST_CALLED, result.phase)
+            assertEquals("MAPLESU_SDK_DEADLINE_EXCEEDED", result.sdkError)
+            assertEquals(-1007, result.sdkErrorCode)
+            assertEquals("staged_discarded", result.cleanupOutcome)
+            assertEquals(1, h.host.installModuleCalls)
+            assertEquals(1, h.catalog.discardCalls)
+            assertEquals(0, h.catalog.commitCalls)
+            assertNull(h.journal.entries.last().token)
+        }
+    }
+
+    @Test
+    fun deadlineNameWithContradictorySubmissionFactsKeepsReconciliation() {
+        for (failure in listOf(
+            receipt("install_module").copy(ok = false, sdkError = "MAPLESU_SDK_DEADLINE_EXCEEDED", sdkErrorCode = -1001),
+            receipt("install_module").copy(ok = false, sdkError = "MAPLESU_SDK_DEADLINE_EXCEEDED", sdkErrorCode = -1007, operationCompleted = true),
+            receipt("install_module").copy(ok = false, sdkError = "MAPLESU_SDK_DEADLINE_EXCEEDED", sdkErrorCode = -1007, data = JSONObject()),
+        )) {
+            val h = harness()
+            h.host.installFailure = failure
+            val result = h.transaction.install(request(), h.stdout::add, h.stderr::add)
+            assertEquals(UltraOutcome.NEEDS_RECONCILIATION, result.outcome)
+            assertEquals(0, h.catalog.discardCalls)
+            assertEquals(STAGED_TOKEN, h.journal.entries.last().token)
+            assertEquals(1, h.host.installModuleCalls)
+        }
+    }
+
     // ------------------------------------------------------------------ (d) stage 失败
 
     @Test

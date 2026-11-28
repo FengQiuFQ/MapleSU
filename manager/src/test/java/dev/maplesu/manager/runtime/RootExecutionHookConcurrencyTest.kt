@@ -141,7 +141,8 @@ class RootExecutionHookConcurrencyTest {
         val router = RootExecutionRouter(null, modeProvider = { WorkMode.LITE }, hook = hook)
         val result = runBlocking(PageReadDeadline.context(0)) { router.executeHook("expired") }
         assertFalse(result.ok)
-        assertEquals("ROOT_EXECUTION_BUSY", result.detail)
+        assertEquals("ROOT_EXECUTION_DEADLINE_EXCEEDED", result.detail)
+        assertEquals(-1007, result.code)
         assertEquals(0, calls.get())
     }
 }

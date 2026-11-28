@@ -3,6 +3,7 @@ package dev.maplesu.manager.workmode.detect
 
 import dev.maplesu.manager.workmode.EnvironmentProbeResult
 import dev.maplesu.manager.workmode.EnvironmentProbeRunner
+import dev.maplesu.manager.runtime.PageReadDeadline
 import kotlinx.coroutines.CompletableDeferred
 
 /**
@@ -76,7 +77,7 @@ class EnvironmentCheckRunner(
             return unknown(bootId, EnvironmentCheckDetail.DEADLINE_EXCEEDED, startedAt)
         }
         // 预算即"落盘许可"的边界：跑到超时之后才出结果的探测不得覆盖上次状态。
-        val deadlineNanos = System.nanoTime() + budget * 1_000_000L
+        val deadlineNanos = PageReadDeadline.limitNanos(budget)
         val ran = probeRunner.run(budget) {
             resolver.resolve(bootId) {
                 !Thread.currentThread().isInterrupted && System.nanoTime() < deadlineNanos

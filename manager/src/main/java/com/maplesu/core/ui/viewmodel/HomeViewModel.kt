@@ -8,7 +8,6 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -35,6 +34,7 @@ import com.maplesu.core.ksuApp
 import com.maplesu.core.ui.screen.home.HomeEntryFacts
 import com.maplesu.core.ui.screen.home.HomeHiddenFacts
 import com.maplesu.core.ui.screen.home.HomeUiState
+import com.maplesu.core.ui.screen.home.HomeUltraComponentDiagnostic
 import com.maplesu.core.ui.screen.home.HomeWorkModeSwitchRuntime
 import com.maplesu.core.ui.screen.home.ManagerVersion
 import com.maplesu.core.ui.screen.home.SystemInfo
@@ -45,6 +45,7 @@ import com.maplesu.core.ui.screen.home.mergedOver
 import com.maplesu.core.ui.screen.home.withUltraSafety
 import com.maplesu.core.ui.screen.home.afterEnvironmentCheck
 import com.maplesu.core.ui.screen.home.afterUltraEnvironmentHealth
+import com.maplesu.core.ui.screen.home.afterFinalEnvironmentScopeCheck
 import com.maplesu.core.ui.screen.home.asLiteHiddenNotInstalled
 import com.maplesu.core.ui.security.HiddenFactsSignal
 import com.maplesu.core.ui.security.HiddenStartupConfirm
@@ -69,16 +70,15 @@ import com.maplesu.core.ui.screen.home.HomeEnvironmentFailure
 import com.maplesu.core.ui.screen.settings.UltraComponentDiagnosticRequests
 import com.maplesu.core.ui.screen.settings.currentUltraComponentDiagnosticSnapshot
 import dev.maplesu.manager.runtime.ultra.UltraEnvironmentProbe
+import dev.maplesu.manager.runtime.PageReadDeadline
 
 /*
  * P0（Lite 模式启动状态）两个时序常量：
  *  - 模式判定是**两段式**的（阶段二约 2.5s 后才 activate）。未判定窗口里 root 探测本身被
  *    启动门控挡住，这一次失败不能当"Lite 启动失败"，所以要等判定落定后再判；
- *  - 真失败 → 有限重试。root shell 自带 3s 起步的重建退避（见 KsuCli），
- *    所以重试间隔按 3s、6s 递增，别在冷却期里空转。
+ *  - 已在途的模式判定可以有界等待；新的观察只来自显式动作或真实模式变化。
  */
 private const val LITE_MODE_SETTLE_TIMEOUT_MS = 8_000L
-private const val LITE_ROOT_RETRY_STEP_MS = 3_000L
 
 /** 等模式激活后重算一次入口事实的上限；超时后由回前台/切页继续兜底。 */
 private const val ENTRY_FACTS_MODE_WAIT_MS = 15_000L
@@ -225,13 +225,16 @@ class HomeViewModel(
                 evidence = evidence,
                 healthObservation = observation,
             ).state
+            // Bootstrap diagnostics belong to a detection revision. A later Home
+            // session must not reintroduce a failure already consumed by its final publication.
+            val detectionFailure = ModeRuntime.detectionFailure.takeIf { revision != publishedDetectionRevision }
             val projected = observed.afterEnvironmentCheck(
                 modeResolved = ModeRuntime.active != null,
                 detectionComplete = knownUltra || ModeRuntime.detectionComplete,
-                detectionFailure = ModeRuntime.detectionFailure.takeUnless { knownUltra },
+                detectionFailure = detectionFailure,
                 detectedState = ModeRuntime.latestDetection?.state.takeUnless { knownUltra },
                 knownUltra = knownUltra,
-                failureDetail = ModeRuntime.detectionFailure.takeUnless { knownUltra },
+                failureDetail = ModeRuntime.detectionFailureDetail.takeIf { detectionFailure != null } ?: detectionFailure,
             )
             val state = if (observation != null) projected.afterUltraEnvironmentHealth(
                 observation = observation,
@@ -337,23 +340,45 @@ class HomeViewModel(
         Log.i(TAG, "home environment probe ${failure.name.lowercase()}/$reason: mode=${mode ?: "unresolved"}")
         return _uiState.value.copy(environmentFailure = failure, isLateLoadMode = false,
             environmentRuntimeReady = false, sdkRootAvailable = false, isRootAvailable = false, rootReadiness = null,
-            cachedEnvironmentReady = false, ultraObservationFailure = failure, ultraObservationDetail = reason)
+            cachedEnvironmentReady = false, ultraObservationFailure = failure, ultraObservationDetail = reason,
+            ultraObservationCode = null, ultraComponentDiagnostic = null)
     }
 
-    private suspend fun publishState(state: HomeUiState, owner: HomeInformationOwner) {
-        publishMutex.withLock {
-            if (!owner.isCurrent(environmentOwner)) return@withLock
+    private suspend fun publishState(state: HomeUiState, owner: HomeInformationOwner, source: HomeStateRead?): Long? {
+        val consumedRevision = publishMutex.withLock {
+            if (!owner.isCurrent(environmentOwner)) return@withLock null
+            val currentBootId = if (source?.owner?.bootId?.isNotBlank() == true)
+                runCatching { BootIdSourceAdapter.read() }.getOrNull() else null
+            val sourceCurrent = source?.evidenceActivation === ModeRuntime.activation &&
+                source?.owner?.revision == ModeRuntime.detectionRevision.value &&
+                (currentBootId.isNullOrBlank() || source.owner.bootId == currentBootId)
+            val scoped = state.afterFinalEnvironmentScopeCheck(
+                source?.evidenceActivation, source?.owner?.revision,
+                ModeRuntime.activation, ModeRuntime.detectionRevision.value,
+                currentBootId = currentBootId,
+                currentObservation = if (state.ultraComponentDiagnostic != null)
+                    UltraEnvironmentProbe.currentSnapshot(ksuApp) else null,
+                observedBootId = source?.owner?.bootId,
+            )
+            val currentState = if (scoped.sdkRootAvailable && source?.hasCurrentSdkHealthScope() != true) scoped.copy(
+                sdkRootAvailable = false, environmentRuntimeReady = false,
+                ultraObservationFailure = HomeEnvironmentFailure.UNCONFIRMED,
+                ultraObservationDetail = "SDK_IDENTITY_SCOPE_CHANGED",
+                ultraObservationCode = null, ultraComponentDiagnostic = null,
+            ) else scoped
             _uiState.update { previous ->
-                state.copy(systemInfo = state.systemInfo.copy(
+                currentState.copy(systemInfo = currentState.systemInfo.copy(
                     deviceModel = previous.systemInfo.deviceModel,
                     selinuxStatus = previous.systemInfo.selinuxStatus,
                 )).mergedOver(previous).copy(
-                    manualEnvironmentChecking = state.manualEnvironmentChecking,
-                    manualEnvironmentFailure = state.manualEnvironmentFailure,
-                ).withUltraSafety(previous.isSafeMode, state.environmentMode)
+                    manualEnvironmentChecking = currentState.manualEnvironmentChecking,
+                    manualEnvironmentFailure = currentState.manualEnvironmentFailure,
+                ).withUltraSafety(previous.isSafeMode, currentState.environmentMode)
             }
+            owner.revision.takeIf { sourceCurrent }
         }
         refreshEntryFacts()
+        return consumedRevision
     }
 
     /** Pure cache/prefs reads only; keep KSU safety and the screen's existing hidden projection. */
@@ -437,30 +462,31 @@ class HomeViewModel(
         }
         if (environmentSessionJob?.isActive == true || !explicit && environmentSessionJob != null) return
         environmentSessionJob = refreshFlight.launch(viewModelScope) {
-            _uiState.update { it.copy(environmentChecking = true, environmentFailure = null,
-                manualEnvironmentChecking = explicit, manualEnvironmentFailure = null) }
-            var candidate: HomeStateRead? = null
-            val deadline = SystemClock.elapsedRealtime() + HOME_ENVIRONMENT_SESSION_TIMEOUT_MS
-            val completed = withTimeoutOrNull(HOME_ENVIRONMENT_SESSION_TIMEOUT_MS) {
-                while (remainingEnvironmentTime(deadline) > 0L) {
-                    try {
-                        prepareEnvironmentObservation(deadline)
-                        candidate = observeEnvironment(deadline) { candidate = it }
-                        if (!environmentExplicitRequest && candidate?.hasFreshIdentityEvidence() == true) {
-                            return@withTimeoutOrNull true
+            withContext(PageReadDeadline.context(HOME_ENVIRONMENT_SESSION_TIMEOUT_MS)) {
+                _uiState.update { it.copy(environmentChecking = true, environmentFailure = null,
+                    manualEnvironmentChecking = explicit, manualEnvironmentFailure = null) }
+                var candidate: HomeStateRead? = null
+                val deadline = SystemClock.elapsedRealtime() + HOME_ENVIRONMENT_SESSION_TIMEOUT_MS
+                val completed = withTimeoutOrNull(HOME_ENVIRONMENT_SESSION_TIMEOUT_MS) {
+                    do {
+                        try {
+                            prepareEnvironmentObservation(deadline)
+                            candidate = observeEnvironment(deadline) { candidate = it }
+                        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                            currentCoroutineContext().ensureActive()
+                            Log.w(TAG, "Environment observation cancelled", cancelled)
+                        } catch (error: Exception) {
+                            Log.w(TAG, "Environment observation failed", error)
+                            val failed = resolvedFailure(HomeEnvironmentFailure.FAILED,
+                                error.message ?: error.javaClass.simpleName)
+                            candidate = candidate?.copy(state = failed) ?: HomeStateRead(failed)
                         }
-                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                        currentCoroutineContext().ensureActive()
-                        Log.w(TAG, "Environment observation cancelled", cancelled)
-                    } catch (error: Exception) {
-                        Log.w(TAG, "Environment observation failed", error)
-                    }
-                    delay(minOf(LITE_ROOT_RETRY_STEP_MS, remainingEnvironmentTime(deadline)))
+                    } while (environmentExplicitRequest && remainingEnvironmentTime(deadline) > 0L)
+                    true
                 }
-                false
+                currentCoroutineContext().ensureActive()
+                finishEnvironmentSession(candidate, deadlineExceeded = completed != true)
             }
-            currentCoroutineContext().ensureActive()
-            finishEnvironmentSession(candidate, deadlineExceeded = completed != true)
         }
     }
 
@@ -487,6 +513,7 @@ class HomeViewModel(
 
     private suspend fun observeEnvironment(
         deadline: Long,
+        eventRecheckAllowed: Boolean = true,
         onIdentity: (HomeStateRead) -> Unit,
     ): HomeStateRead {
         val activation = ModeRuntime.activation
@@ -499,7 +526,8 @@ class HomeViewModel(
             environmentRuntimeReady = false, sdkRootAvailable = false, isRootAvailable = false, rootReadiness = null,
             cachedEnvironmentReady = false,
             ultraObservationFailure = HomeEnvironmentFailure.UNCONFIRMED.takeIf { evidence?.verdict == EnvironmentVerdict.ULTRA },
-            ultraObservationDetail = "home_health_pending".takeIf { evidence?.verdict == EnvironmentVerdict.ULTRA }),
+            ultraObservationDetail = "home_health_pending".takeIf { evidence?.verdict == EnvironmentVerdict.ULTRA },
+            ultraObservationCode = null, ultraComponentDiagnostic = null),
             owner, evidence, activation)
         if (identity.hasFreshIdentityEvidence()) onIdentity(identity)
         else if (ModeRuntime.active == null && remainingEnvironmentTime(deadline) > 0L) {
@@ -507,7 +535,7 @@ class HomeViewModel(
                 ModeBootstrap.pendingEnvironmentDetection()?.await()
             }
         }
-        return collectEnvironment(
+        val read = collectEnvironment(
             rootProbeSettled = ModeRuntime.detectionComplete,
             modeSettled = ModeRuntime.detectionComplete,
             evidence = evidence,
@@ -515,6 +543,12 @@ class HomeViewModel(
             owner = owner,
             deadline = deadline,
         )
+        // Activation or a completed detection invalidates the observation's actual
+        // scope. Reconcile that event once within this session; never poll a failure.
+        return if (eventRecheckAllowed && remainingEnvironmentTime(deadline) > 0L &&
+            (activation !== ModeRuntime.activation || owner.revision != ModeRuntime.detectionRevision.value)) {
+            observeEnvironment(deadline, eventRecheckAllowed = false, onIdentity = onIdentity)
+        } else read
     }
 
     private fun HomeStateRead.hasFreshIdentityEvidence(): Boolean {
@@ -544,15 +578,8 @@ class HomeViewModel(
 
     private suspend fun finishEnvironmentSession(candidate: HomeStateRead?, deadlineExceeded: Boolean) {
         val confirmed = candidate?.takeIf { it.hasFreshIdentityEvidence() }
-        val observed = confirmed?.let { read ->
-            val state = read.state
-            if (state.sdkRootAvailable && !read.hasCurrentSdkHealthScope()) state.copy(
-                sdkRootAvailable = false, environmentRuntimeReady = false,
-                ultraObservationFailure = HomeEnvironmentFailure.UNCONFIRMED,
-                ultraObservationDetail = "SDK_IDENTITY_SCOPE_CHANGED",
-            ) else state
-        } ?: _uiState.value
-        val state = observed.copy(
+        val observed = confirmed?.state ?: _uiState.value
+        val settledState = observed.copy(
             environmentChecking = false, litePending = false,
             environmentFailure = null, manualEnvironmentChecking = false, manualEnvironmentFailure = null,
             previousEnvironmentMode = null, cachedEnvironmentReady = false,
@@ -567,24 +594,35 @@ class HomeViewModel(
                 EnvironmentVerdict.KSU_NORMAL -> settled.copy(environmentMode = WorkMode.KSU,
                     environmentConfirmedAbsent = false, liteInstalled = false,
                     sdkRootAvailable = false,
-                    ultraBrandVisible = false, ultraObservationFailure = null, ultraObservationDetail = null)
+                    ultraBrandVisible = false, ultraObservationFailure = null, ultraObservationDetail = null,
+                    ultraObservationCode = null, ultraComponentDiagnostic = null)
                 EnvironmentVerdict.NOT_INSTALLED -> settled.asLiteHiddenNotInstalled()
-                else -> settled.copy(
-                    environmentMode = null, environmentConfirmedAbsent = false, ultraBrandVisible = false,
-                    ksuVersion = null, kernelUAPIVersion = null, liteInstalled = false,
-                    environmentRuntimeReady = false, sdkRootAvailable = false,
-                    isManager = false, isRootAvailable = false, rootReadiness = null,
-                    liteRootFailure = false, ultraObservationFailure = null, ultraObservationDetail = null,
-                    isLateLoadMode = false,
-                )
+                else -> settled.afterFinalEnvironmentScopeCheck(null, null,
+                    ModeRuntime.activation, ModeRuntime.detectionRevision.value)
             }
         }
+        val state = if (confirmed?.evidence?.verdict == EnvironmentVerdict.ULTRA) {
+            val diagnostic = settledState.ultraObservationDetail?.takeIf {
+                settledState.ultraObservationFailure != null && it.isNotBlank() && it != "home_health_pending"
+            }?.let { detail ->
+                HomeUltraComponentDiagnostic(
+                    modeActivation = confirmed.evidenceActivation ?: ModeRuntime.activation,
+                    detectionRevision = confirmed.owner?.revision ?: ModeRuntime.detectionRevision.value,
+                    bootId = confirmed.owner?.bootId.orEmpty(),
+                    managerOwnerIdentity = confirmed.evidence.ultraOwnerIdentity ?:
+                        confirmed.healthObservation?.managerOwnerIdentity,
+                    legacyCredentialFingerprint = confirmed.healthObservation?.legacyCredentialFingerprint,
+                    failureCode = settledState.ultraObservationCode,
+                    detail = detail,
+                )
+            }
+            settledState.copy(ultraComponentDiagnostic = diagnostic)
+        } else settledState
         val owner = publishMutex.withLock {
             HomeInformationOwner(++environmentOwner, ModeRuntime.detectionRevision.value, ModeRuntime.active,
                 confirmed?.owner?.bootId.orEmpty())
         }
-        publishState(state, owner)
-        if (owner.isCurrent(environmentOwner)) publishedDetectionRevision = owner.revision
+        publishState(state, owner, candidate)?.let { publishedDetectionRevision = it }
         refreshUpdate(_uiState.value.checkUpdateEnabled)
     }
 

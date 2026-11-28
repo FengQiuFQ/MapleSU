@@ -12,8 +12,11 @@ class KsuProbeMappingTest {
     fun fastNormalProbeRequiresManagerOwnershipLikeFullDetection() {
         val owned = KsuNativeSnapshot(true, 32650, 7, true, true)
         assertEquals(true, KsuProbeMapping.normalStatus(owned))
-        assertEquals(false, KsuProbeMapping.normalStatus(owned.copy(isManager = false)))
-        assertEquals(false, KsuProbeMapping.normalStatus(owned.copy(version = 0)))
+        assertEquals(null, KsuProbeMapping.normalStatus(owned.copy(isManager = false)))
+        assertEquals(null, KsuProbeMapping.normalStatus(owned.copy(isManager = false, kernelUapi = -1)))
+        assertEquals(false, KsuProbeMapping.normalStatus(owned.copy(isManager = false, kernelUapi = 6)))
+        assertEquals(null, KsuProbeMapping.normalStatus(owned.copy(version = 0)))
+        assertEquals(null, KsuProbeMapping.normalStatus(owned.copy(version = -1)))
         assertEquals(null, KsuProbeMapping.normalStatus(KsuNativeSnapshot.UNAVAILABLE))
     }
 
@@ -23,7 +26,7 @@ class KsuProbeMappingTest {
         val compatible = KsuNativeSnapshot(true, 10940, 0, false, false)
         assertTrue(KsuProbeMapping.from(compatible).responded)
         assertFalse(KsuProbeMapping.from(compatible).isManager)
-        assertEquals(false, KsuProbeMapping.normalStatus(compatible))
+        assertEquals(null, KsuProbeMapping.normalStatus(compatible))
     }
 
     @Test
@@ -43,11 +46,7 @@ class KsuProbeMappingTest {
             KsuNativeSnapshot(available = true, version = 0, kernelUapi = 7, isManager = true, isLkm = true),
         )
         assertFalse(facts.responded)
-        assertEquals(0, facts.version)
-        // 版本不可读时仍透传其它已读到的字段，不伪造为 false/0。
-        assertEquals(7, facts.uapi)
-        assertTrue(facts.isManager)
-        assertTrue(facts.isLkm)
+        assertEquals(KsuFacts(), facts)
     }
 
     @Test
@@ -77,5 +76,25 @@ class KsuProbeMappingTest {
         // responded=false 分支保证（R4 需要 responded）。
         assertEquals(-1, KsuProbeMapping.from(KsuNativeSnapshot.UNAVAILABLE).uapi)
         assertFalse(KsuProbeMapping.from(KsuNativeSnapshot.UNAVAILABLE).responded)
+    }
+
+    @Test
+    fun aSingleNativeReceiptBindsVersionOwnershipAndAbi() {
+        val current = KsuNativeSnapshot.fromCurrentInfo(intArrayOf(0, 32650, 3, 7))
+        assertEquals(true, KsuProbeMapping.normalStatus(current))
+        assertEquals(KsuFacts(true, 32650, 7, true, true), KsuProbeMapping.from(current))
+        val revoked = KsuNativeSnapshot.fromCurrentInfo(intArrayOf(0, 32650, 1, 7))
+        assertEquals(null, KsuProbeMapping.normalStatus(revoked))
+        assertFalse(KsuProbeMapping.from(revoked).isManager)
+    }
+
+    @Test
+    fun deniedOrMalformedCurrentReceiptsDoNotReusePositiveFields() {
+        for (receipt in listOf(null, intArrayOf(), intArrayOf(0, 32650, 3),
+            intArrayOf(-13, 32650, 3, 7), intArrayOf(-9, 0, 0, 0), intArrayOf(0, 0, 3, 7))) {
+            val current = KsuNativeSnapshot.fromCurrentInfo(receipt)
+            assertEquals(null, KsuProbeMapping.normalStatus(current))
+            assertEquals(KsuFacts(), KsuProbeMapping.from(current))
+        }
     }
 }

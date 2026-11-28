@@ -27,19 +27,40 @@ internal class UltraRootCommandReceipt(script: String, nonce: String = UUID.rand
         val facts = receipt.obj("rootCommand")
         val detail = buildString {
             append("ULTRA_ROOT_FAILED:").append(name)
-            if (facts != null || receipt.sdkErrorCode == 0) {
+            if (facts != null || name !in setOf("MAPLESU_SDK_BUSY", "MAPLESU_SDK_INTERRUPTED",
+                "MAPLESU_SDK_DEADLINE_EXCEEDED")) {
                 append(";sdkCode=").append(receipt.sdkErrorCode)
             }
             if (facts != null) {
-                for (key in listOf("phase", "systemError", "shellStatus", "shellError",
-                    "transportPhase", "transportError", "childStatus")) {
-                    val value = facts.opt(key)
-                    if (value is Byte || value is Short || value is Int || value is Long)
-                        append(';').append(key).append('=').append(value)
+                fun appendNumbers(values: org.json.JSONObject, keys: List<String>, prefix: String = "") {
+                    for (key in keys) {
+                        val value = values.opt(key)
+                        if (value is Byte || value is Short || value is Int || value is Long ||
+                            value is String && value.toLongOrNull() != null)
+                            append(';').append(prefix).append(key).append('=').append(value)
+                    }
                 }
-                for (key in listOf("receiptComplete", "shellCloseAttempted", "childStatusValid")) {
-                    (facts.opt(key) as? Boolean)?.let {
-                        append(';').append(key).append('=').append(if (it) 1 else 0)
+                fun appendBooleans(values: org.json.JSONObject, keys: List<String>, prefix: String = "") {
+                    for (key in keys) {
+                        (values.opt(key) as? Boolean)?.let {
+                            append(';').append(prefix).append(key).append('=').append(if (it) 1 else 0)
+                        }
+                    }
+                }
+                appendNumbers(facts, listOf("error", "phase", "systemError", "workingDirectoryError",
+                    "shellStatus", "shellError", "transportPhase", "transportError", "childStatus",
+                    "vendorChildStatus", "rootProcess", "rootError", "rootSystemError", "threadsTotal",
+                    "cpusetMoved", "stuneMoved", "cgroupError"))
+                appendBooleans(facts, listOf("receiptComplete", "shellCloseAttempted", "childStatusValid",
+                    "vendorChildStatusValid", "rootInvocationKnown", "rootAttempted", "rootReturned",
+                    "rootReportReceived", "ownerMode", "environmentCompleted"))
+                (facts.opt("rootPhase") as? String)?.takeIf { it.matches(Regex("[A-Za-z0-9_-]{1,32}")) }?.let {
+                    append(";rootPhase=").append(it)
+                }
+                for (group in listOf("credentials", "taskState")) {
+                    facts.optJSONObject(group)?.let { values ->
+                        appendNumbers(values, listOf("error", "status", "effects"), "$group.")
+                        appendBooleans(values, listOf("attempted", "replyObserved", "completed"), "$group.")
                     }
                 }
             }

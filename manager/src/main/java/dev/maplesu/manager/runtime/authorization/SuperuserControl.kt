@@ -76,18 +76,23 @@ object SuperuserControl {
     @JvmStatic
     fun snapshot(context: Context): AuthorizationSnapshot? = snapshot(context, null)
 
-    private fun snapshot(context: Context, scope: UltraAuthorization.Scope?): AuthorizationSnapshot? {
-        if (!scopeCurrent(scope)) return null
-        val snapshot = when (val reply = runTool(context, scope, "snapshot")) {
-            is RootToolOutcome.Ok -> snapshotOf(reply)
-            // Fail closed. The named code is visible on the write paths; a read has no
-            // result type that could carry it, and a fabricated empty snapshot would be
-            // worse than "unknown".
-            is RootToolOutcome.Failed -> null
+    internal data class SnapshotReadResult(val snapshot: AuthorizationSnapshot?, val code: String? = null,
+                                          val detail: String = "")
+
+    private fun snapshot(context: Context, scope: UltraAuthorization.Scope?): AuthorizationSnapshot? =
+        snapshotDetailed(context, scope).snapshot
+
+    internal fun snapshotDetailed(context: Context, scope: UltraAuthorization.Scope? = null): SnapshotReadResult {
+        if (!scopeCurrent(scope)) return SnapshotReadResult(null, "SU_AUTH_SCOPE_CHANGED")
+        val reply = runTool(context, scope, "snapshot")
+        if (!scopeCurrent(scope)) return SnapshotReadResult(null, "SU_AUTH_SCOPE_CHANGED")
+        val result = when (reply) {
+            is RootToolOutcome.Ok -> snapshotOf(reply)?.let { SnapshotReadResult(it) }
+                ?: SnapshotReadResult(null, SuCodes.SU_STORE_READ_FAILED, "invalid-snapshot")
+            is RootToolOutcome.Failed -> SnapshotReadResult(null, reply.code, reply.detail)
         }
-        if (!scopeCurrent(scope)) return null
-        if (scope == null) dev.maplesu.manager.runtime.NativeSuAdmission.update(context, snapshot)
-        return snapshot.takeIf { scopeCurrent(scope) }
+        if (scope == null) dev.maplesu.manager.runtime.NativeSuAdmission.update(context, result.snapshot)
+        return if (scopeCurrent(scope)) result else SnapshotReadResult(null, "SU_AUTH_SCOPE_CHANGED")
     }
 
     /** Minted only from the root tool's fresh same-revision identity observation. */
@@ -134,7 +139,12 @@ object SuperuserControl {
     internal fun ensureManagerGrant(context: Context, scope: UltraAuthorization.Scope): Result {
         val uid = context.applicationInfo.uid
         if (!scope.current()) return Result.failure("SU_AUTH_SCOPE_CHANGED")
-        val observed = snapshot(context, scope) ?: return Result.failure(SuCodes.SU_STORE_READ_FAILED)
+        val reply = runTool(context, scope, "snapshot")
+        if (!scope.current()) return Result.failure("SU_AUTH_SCOPE_CHANGED")
+        val observed = when (reply) {
+            is RootToolOutcome.Ok -> snapshotOf(reply) ?: return Result.failure(SuCodes.SU_STORE_READ_FAILED)
+            is RootToolOutcome.Failed -> return reply.result()
+        }
         if (!observed.enabled || observed.switchPending) return Result.failure(SuCodes.AUTH_DISABLED)
         if (observed.revoked(uid) || observed.profileOf(uid)?.profile?.allowSu == false)
             return Result.failure(SuCodes.AUTH_NOT_GRANTED)
@@ -373,9 +383,9 @@ object SuperuserControl {
                 scope = scope, decision = outcome, mirrorDetail = "snapshot-unavailable")
             markPending(context)
             if (!recorded.ok) return@synchronized recorded
-            return@synchronized outcome.copy(pendingApply = true,
+            return@synchronized outcome.copy(pendingApply = true, code = recorded.code ?: outcome.code,
                 detail = listOf(outcome.detail, "snapshot-unavailable",
-                    if (recorded.ok) "" else "mark-applied code=${recorded.code} ${recorded.detail}")
+                    recorded.detail.takeUnless { recorded.succeeded }.orEmpty())
                     .filter { it.isNotEmpty() }.joinToString("; "))
         }
         val mirrored = runCatching { mirror.apply(snapshot) }
@@ -387,8 +397,9 @@ object SuperuserControl {
         if (!recorded.ok) return@synchronized recorded
         outcome.copy(
             pendingApply = !applied,
+            code = recorded.code ?: outcome.code,
             detail = listOf(outcome.detail, mirrored.detail,
-                if (recorded.ok) "" else "mark-applied code=${recorded.code} ${recorded.detail}")
+                recorded.detail.takeUnless { recorded.succeeded }.orEmpty())
                 .filter { it.isNotEmpty() }.joinToString("; "),
         )
     }
@@ -406,10 +417,10 @@ object SuperuserControl {
             if (decision == null) return failed
             val detail = listOf(failed.detail,
                 "decisionRev=${decision.rev} markApplied=${if (known) "failed" else "unknown"}",
+                if (known) "markRev=${failed.rev} markPending=${failed.pendingApply}" else "",
                 decision.detail, mirrorDetail).filter { it.isNotEmpty() }.joinToString("; ")
-            // Missing or malformed mark receipts cannot erase the observed decision.
-            return if (known) failed.copy(detail = detail)
-            else failed.copy(rev = decision.rev, pendingApply = true, detail = detail)
+            // A later delivery receipt does not erase this invocation's confirmed decision.
+            return failed.copy(ok = decision.ok, rev = decision.rev, pendingApply = true, detail = detail)
         }
         val detail = Base64.getEncoder().encodeToString(outcome.detail.toByteArray(Charsets.UTF_8))
         val reply = when (val reply = runTool(
@@ -421,7 +432,7 @@ object SuperuserControl {
         }
         val recorded = parseOutcome(reply.payload)
         if (!recorded.ok) return failedMark(recorded, known = false)
-        val checked = if (recorded.ok && !recorded.pendingApply && recorded.rev == rev) recorded
+        val checked = if (recorded.rev == rev && recorded.pendingApply == !outcome.ok) recorded
         else recorded.copy(ok = false, code = recorded.code ?: SuCodes.SU_TRANSPORT_UNAVAILABLE,
             detail = "expectedRev=$rev observedRev=${recorded.rev} pending=${recorded.pendingApply} ${recorded.detail}")
         if (!checked.ok) return failedMark(checked, known = true)

@@ -33,11 +33,26 @@ for name in ('installed_helper_readback.cpp', 'manager_owner_root_probe.cpp'):
         sources.append('/case/' + name)
     else:
         sources.append('/repo/' + rel)
-command = ['g++', '-std=c++17', '-O2', '-ffunction-sections', '-fdata-sections',
+dependencies = ['runtime/tests/ultra_raw_root_worker_tls_test.cpp', 'runtime/tests/ultra_sdk_deadline_scope_host.cpp',
+                'runtime/ultra/bridge/sdk_call_scope.cpp', 'runtime/ultra/bridge/sdk_call_scope.h',
+                'runtime/ultra/bridge/installed_helper_readback.h', 'runtime/ultra/bridge/manager_owner_root_probe.h',
+                'runtime/ultra/bridge/manager_owner_identity.h',
+                'runtime/maplesu-sdk/sdk/src/kernel_request/module_base_kernel_request.cpp',
+                'runtime/maplesu-sdk/sdk/src/module/module_current_identity.cpp',
+                'runtime/ultra/authorization/request_context.cpp',
+                'runtime/maplesu-sdk/sdk/include/maplesu_deadline_private.h',
+                'runtime/maplesu-sdk/sdk/include/maplesu_operation_fork_private.h',
+                'runtime/maplesu-sdk/sdk/include/maplesu_operation_wait_private.h',
+                'scripts/tests/test-ultra-raw-root-worker-tls.py']
+records += [dict(path=path, sha256=hashlib.sha256((repo / path).read_bytes()).hexdigest()) for path in dependencies]
+command = ['g++', '-std=c++17', '-O2', '-ffunction-sections', '-fdata-sections', '-DFIXTURE_REAL_REQUEST_TLS',
            '-I/case', '-I/repo/runtime/ultra/bridge', '-I/repo/runtime/maplesu-sdk/sdk/include',
            '-I/repo/runtime/maplesu-sdk/include', *sources,
            '/repo/runtime/tests/ultra_raw_root_worker_tls_test.cpp',
+           '/repo/runtime/tests/ultra_sdk_deadline_scope_host.cpp',
            '/repo/runtime/maplesu-sdk/sdk/src/module/module_current_identity.cpp',
+           '/repo/runtime/ultra/authorization/request_context.cpp',
+           '-Wl,--wrap=maplesu_prepare_kernel_request',
            '-Wl,--wrap=__cxa_thread_atexit',
            '-Wl,--wrap=_ZN13kernel_module29maplesu_request_set_auth_modeENS_15RequestAuthModeE',
            '-Wl,--wrap=_ZN13kernel_module32maplesu_request_worker_admissionEv',
@@ -49,10 +64,11 @@ assert compiled.returncode == 0, compiled.stdout + compiled.stderr
 result = subprocess.run(docker + ['./raw-worker-tls'], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30)
 output = result.stdout + result.stderr
 (build / 'run.log').write_text(output, encoding='utf-8')
-receipt = dict(exitCode=result.returncode, coldControl=args.cold_control, coldThreads=6,
+stable = all(hashlib.sha256((repo / item['path']).read_bytes()).hexdigest() == item['sha256'] for item in records)
+receipt = dict(passed=result.returncode == 0 and stable, sourcesStable=stable, exitCode=result.returncode, coldControl=args.cold_control, coldThreads=6,
                workersPerThread=2, deviceOperations=0, sdkRebuilds=0, sources=records,
-               scope='Actual parent/worker/framing/deadline and actual request TLS/mode setter; admission is a fixture seam: denied Manager/Helper callers have zero pipe/fork/ROOT and restore parent mode, admitted workers return auth error after child selection; no ROOT or helper bytes.',
+               scope='Actual parent/worker/framing/deadline and actual request TLS/mode setter; admission is a fixture seam: denied Manager/Helper callers have zero pipe/fork/ROOT and restore parent mode, admitted workers return auth error after child selection; real m023 operation deadline, parent exact restore, inherited child local bound and no post-fork TLS destructor registration; no ROOT or helper bytes.',
                output=output)
 (build / 'RESULT.json').write_text(json.dumps(receipt, indent=2) + '\n', encoding='utf-8')
 print(output, end='')
-raise SystemExit(result.returncode)
+raise SystemExit(0 if receipt["passed"] else 1)

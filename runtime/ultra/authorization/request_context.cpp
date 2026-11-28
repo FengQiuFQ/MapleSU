@@ -1,7 +1,24 @@
 #include "module_err_def.h"
+#include "maplesu_deadline_private.h"
 #include <linux/capability.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+namespace {
+thread_local int64_t operation_deadline_nanos;
+}
+
+extern "C" __attribute__((visibility("hidden")))
+int64_t maplesu_request_operation_deadline_nanos() noexcept {
+    return operation_deadline_nanos;
+}
+
+extern "C" __attribute__((visibility("hidden")))
+int64_t maplesu_request_set_operation_deadline_nanos(int64_t deadline_nanos) noexcept {
+    const int64_t previous = operation_deadline_nanos;
+    operation_deadline_nanos = deadline_nanos;
+    return previous;
+}
 
 // The legacy kernel channel writes its reply into current->cred's saved IDs.
 // Threads and fork children initially share that object. A raw capset commits

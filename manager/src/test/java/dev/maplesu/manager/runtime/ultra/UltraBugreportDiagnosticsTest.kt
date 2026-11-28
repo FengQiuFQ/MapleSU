@@ -68,6 +68,18 @@ class UltraBugreportDiagnosticsTest {
         assertTrue(directory.list()!!.isEmpty())
     }
 
+    @Test fun deadlineDiagnosticsDoNotRetryExpiredCommands() {
+        val directory = temporary.newFolder()
+        val port = Port().apply {
+            rootReceipt = NativeReceipt.parse("""{"backend":"maplesu_ultra","operation":"run_root_cmd","ok":false,"sdkError":"MAPLESU_SDK_DEADLINE_EXCEEDED","sdkErrorCode":-1007,"reason":"Current request expired before submission."}""")!!
+        }
+        UltraBugreportDiagnostics.collect(directory, true) { port }
+        assertEquals(6, port.commands.size)
+        assertEquals(port.commands.size, port.commands.distinct().size)
+        val report = File(directory, "ultra-authorization.txt").readText()
+        assertTrue(report.contains("sdkError=MAPLESU_SDK_DEADLINE_EXCEEDED sdkErrorCode=-1007"))
+    }
+
     @Test fun sdkEvidenceIsCollectedEvenWhenNoKeySuIsBroken() {
         val directory = temporary.newFolder()
         val port = Port()
@@ -243,19 +255,20 @@ class UltraBugreportDiagnosticsTest {
         }
     }
 
-    @Test fun busySdkReadIsRetriedInsteadOfLeavingAnEmptyDiagnosticFile() {
+    @Test fun busySdkReadIsRecordedWithoutReplayingTheDiagnosticCommand() {
         val directory = temporary.newFolder()
         val port = Port().apply { busyDmesgReads = 1 }
         UltraBugreportDiagnostics.collect(directory, true) { port }
-        assertTrue("the supplied report lost dmesg on MAPLESU_SDK_BUSY", File(directory, "dmesg.txt").length() > 0)
-        assertEquals(2, port.commands.count { it.startsWith("dmesg") })
+        assertFalse(File(directory, "dmesg.txt").exists())
+        assertEquals(1, port.commands.count { it.startsWith("dmesg") })
+        assertTrue(File(directory, "ultra-authorization.txt").readText().contains("sdkError=MAPLESU_SDK_BUSY"))
     }
 
-    @Test fun busyRetriesAreBoundedAndOtherErrorsAreNotRetried() {
+    @Test fun busyAndOtherFailuresEachKeepOneOriginalAttempt() {
         val directory = temporary.newFolder()
         val port = Port().apply { busyDmesgReads = 100; failPackages = true }
         UltraBugreportDiagnostics.collect(directory, true) { port }
-        assertEquals(3, port.commands.count { it.startsWith("dmesg") })
+        assertEquals(1, port.commands.count { it.startsWith("dmesg") })
         assertEquals(1, port.commands.count { it.contains("packages.list") })
         assertFalse(File(directory, "dmesg.txt").exists())
         assertTrue(File(directory, "ultra-authorization.txt").readText().contains("sdkError=MAPLESU_SDK_BUSY"))

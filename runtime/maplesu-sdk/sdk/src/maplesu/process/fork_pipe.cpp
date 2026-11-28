@@ -1,6 +1,8 @@
 // MapleSU fork and pipe process transport.
 //
 #include "module_err_def.h"
+#include "maplesu_operation_wait_private.h"
+#include "maplesu_operation_fork_private.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -24,15 +26,40 @@ using Pipe = maplesu::sdk::fork_pipe_info;
 using TransferRead = maplesu::sdk::FixedTransferRead;
 using TransferStatus = maplesu::sdk::FixedTransferStatus;
 
+class NonblockingTransfer {
+public:
+    explicit NonblockingTransfer(int fd) : fd_(fd) {}
+    bool prepare() {
+        if (!maplesu::deadline::available()) return false;
+        if (!maplesu_request_operation_deadline_nanos()) return true;
+        flags_ = fcntl(fd_, F_GETFL);
+        if (flags_ < 0) return false;
+        if (flags_ & O_NONBLOCK) return true;
+        changed_ = fcntl(fd_, F_SETFL, flags_ | O_NONBLOCK) == 0;
+        return changed_;
+    }
+    ~NonblockingTransfer() {
+        const int error = errno;
+        if (changed_) (void)fcntl(fd_, F_SETFL, flags_);
+        errno = error;
+    }
+private:
+    int fd_;
+    int flags_ = 0;
+    bool changed_ = false;
+};
 
 // 其他错误立刻返回 false。返回“是否把 remaining 写到了 0”。
 static bool write_full(int fd, const void* data, size_t size) {
+    NonblockingTransfer transfer(fd);
+    if (!transfer.prepare()) return false;
     const uint8_t* cursor = static_cast<const uint8_t*>(data);
     size_t remaining = size;
     for (;;) {
         if (remaining == 0) {
             break;
         }
+        if (!maplesu::deadline::available()) break;
         const ssize_t written = write(fd, cursor, remaining);
         if (written > 0) {
             cursor += written;
@@ -45,8 +72,7 @@ static bool write_full(int fd, const void* data, size_t size) {
                 continue;
             }
             if (error == EAGAIN) {
-                usleep(1000);
-                continue;
+                if (maplesu::deadline::wait_fd(fd, POLLOUT)) continue;
             }
         }
         break;
@@ -55,10 +81,19 @@ static bool write_full(int fd, const void* data, size_t size) {
 }
 
 static bool read_full(int fd, void* data, size_t size, TransferRead* detail = nullptr) {
+    NonblockingTransfer transfer(fd);
+    if (!transfer.prepare()) {
+        if (detail) { detail->status = TransferStatus::IoError; detail->systemErrno = errno; }
+        return false;
+    }
     uint8_t* cursor = static_cast<uint8_t*>(data);
     size_t remaining = size;
     for (;;) {
         if (remaining == 0) {
+            break;
+        }
+        if (!maplesu::deadline::available()) {
+            if (detail) { detail->status = TransferStatus::IoError; detail->systemErrno = errno; }
             break;
         }
         const ssize_t got = read(fd, cursor, remaining);
@@ -69,13 +104,13 @@ static bool read_full(int fd, void* data, size_t size, TransferRead* detail = nu
             continue;
         }
         if (got == -1) {
-            const int error = errno;
+            int error = errno;
             if (error == EINTR) {
                 continue;
             }
             if (error == EAGAIN) {
-                usleep(1000);
-                continue;
+                if (maplesu::deadline::wait_fd(fd, POLLIN)) continue;
+                error = errno;
             }
             if (detail) {
                 detail->status = TransferStatus::IoError;
@@ -108,13 +143,15 @@ static bool read_full(int fd, void* data, size_t size, TransferRead* detail = nu
 //   field0 = -1;  field3 = -1;
 //   return false;
 bool fork_child(Pipe& pipe) {
+    if (!maplesu::deadline::available()) return false;
     int command_pipe[2] = {-1, -1};
     int data_pipe[2] = {-1, -1};
+    const int flags = O_CLOEXEC | (maplesu_request_operation_deadline_nanos() ? O_NONBLOCK : 0);
 
-    if (pipe2(command_pipe, O_CLOEXEC) == -1) {
+    if (pipe2(command_pipe, flags) == -1) {
         return false;
     }
-    if (pipe2(data_pipe, O_CLOEXEC) == -1) {
+    if (pipe2(data_pipe, flags) == -1) {
         const int error = errno;
         close(command_pipe[0]);
         close(command_pipe[1]);
@@ -123,9 +160,22 @@ bool fork_child(Pipe& pipe) {
     }
 
     if (maplesu_request_fork_prepare) maplesu_request_fork_prepare();
+    maplesu::deadline::ForkAdmission admission;
+    if (!admission.prepare()) {
+        const int error = errno;
+        close(command_pipe[0]);
+        close(command_pipe[1]);
+        close(data_pipe[0]);
+        close(data_pipe[1]);
+        errno = error;
+        return false;
+    }
     // The transport owns raw pipes, not inherited FILE buffers. A nested worker
     // must not enumerate parent stdio locks whose owner did not survive fork.
     const pid_t child_pid = fork();
+    const int fork_error = errno;
+    admission.complete();
+    errno = fork_error;
     if (child_pid < 0) {
         const int error = errno;
         close(command_pipe[0]);

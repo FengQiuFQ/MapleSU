@@ -42,7 +42,7 @@ class UltraProbeAdmissionTest {
         try {
             UltraEnvironmentProbe.publishSnapshot(UltraEnvironmentProbe.Snapshot(UltraEnvironmentProbe.State.Running,
                 kernelRootVerified = true, managerOwnerIdentity = owner, sdkChannelAvailable = true))
-            for (error in listOf("MAPLESU_SDK_BUSY", "MAPLESU_SDK_INTERRUPTED", "ERR_MODULE_NO_BOOT")) {
+            for (error in listOf("MAPLESU_SDK_BUSY", "MAPLESU_SDK_INTERRUPTED", "MAPLESU_SDK_DEADLINE_EXCEEDED", "ERR_MODULE_NO_BOOT")) {
                 val observed = UltraEnvironmentProbe.observeFreshIdentity(current = { true }, queryOwner = {
                     UltraRuntimeClient.ManagerOwnerIdentityResult(receipt("query_manager_owner_identity", error, -19914), null)
                 })
@@ -132,11 +132,64 @@ class UltraProbeAdmissionTest {
         }
     }
 
+    @Test fun anEnvironmentReadRetainsManagerSuFailureForTheSameOwnerAndBoot() {
+        val previous = UltraEnvironmentProbe.currentSnapshot()
+        val error = "SU_STORE_READ_FAILED;phase=11;sdkCode=-19914"
+        val observed = UltraEnvironmentProbe.Snapshot(UltraEnvironmentProbe.State.Running,
+            managerOwnerIdentity = owner, observedBootId = "boot-a", managerSuFailureDetail = error)
+        try {
+            UltraEnvironmentProbe.publishSnapshot(observed)
+            UltraEnvironmentProbe.publishSnapshot(observed.copy(kernelRootVerified = true,
+                sdkChannelAvailable = true, managerSuFailureDetail = null))
+            val refreshed = UltraEnvironmentProbe.currentSnapshot()
+            assertEquals(error, refreshed.managerSuFailureDetail)
+            assertTrue(refreshed.rootAvailable)
+            assertTrue(refreshed.sdkChannelAvailable)
+        } finally { UltraEnvironmentProbe.publishSnapshot(previous) }
+    }
+
+    @Test fun managerSuDiagnosticsRequireTheCurrentFullOwnerOrLegacyAndBoot() {
+        val observed = UltraEnvironmentProbe.Snapshot(managerOwnerIdentity = owner, observedBootId = "boot-a")
+        assertTrue(UltraEnvironmentProbe.managerSuDiagnosticScopeCurrent(observed, observed, "boot-a"))
+        assertFalse(UltraEnvironmentProbe.managerSuDiagnosticScopeCurrent(observed, observed, null))
+        assertFalse(UltraEnvironmentProbe.managerSuDiagnosticScopeCurrent(observed, observed, "boot-b"))
+        assertFalse(UltraEnvironmentProbe.managerSuDiagnosticScopeCurrent(observed,
+            observed.copy(observedBootId = "boot-b"), "boot-a"))
+        assertFalse(UltraEnvironmentProbe.managerSuDiagnosticScopeCurrent(observed,
+            observed.copy(managerOwnerIdentity = owner.copy(epoch = owner.epoch + 1)), "boot-a"))
+        val unbound = observed.copy(managerOwnerIdentity = null)
+        assertFalse(UltraEnvironmentProbe.managerSuDiagnosticScopeCurrent(unbound, unbound, "boot-a"))
+        val legacy = unbound.copy(legacyCredentialFingerprint = "current-legacy")
+        assertTrue(UltraEnvironmentProbe.managerSuDiagnosticScopeCurrent(legacy, legacy, "boot-a"))
+        assertFalse(UltraEnvironmentProbe.managerSuDiagnosticScopeCurrent(legacy,
+            legacy.copy(legacyCredentialFingerprint = "other-legacy"), "boot-a"))
+    }
+
+    @Test fun aNewBootNeverInheritsManagerSuFailureFromThePreviousBoot() {
+        val previous = UltraEnvironmentProbe.currentSnapshot()
+        val observed = UltraEnvironmentProbe.Snapshot(managerOwnerIdentity = owner,
+            observedBootId = "boot-a", managerSuFailureDetail = "SU_STORE_READ_FAILED")
+        try {
+            UltraEnvironmentProbe.publishSnapshot(observed)
+            UltraEnvironmentProbe.publishSnapshot(observed.copy(observedBootId = "boot-b", managerSuFailureDetail = null))
+            assertNull(UltraEnvironmentProbe.currentSnapshot().managerSuFailureDetail)
+        } finally { UltraEnvironmentProbe.publishSnapshot(previous) }
+    }
+
     @Test fun cancelledAdmissionContainsNoNewEnvironmentObservation() {
         val probe = UltraEnvironmentProbe
         for (previous in UltraEnvironmentProbe.State.entries) {
             assertEquals(previous, probe.stateAfterAdmission(previous, UltraEnvironmentProbe.State.Unknown, "MAPLESU_SDK_INTERRUPTED", true))
             assertEquals(UltraEnvironmentProbe.State.Unknown, probe.stateAfterAdmission(previous, UltraEnvironmentProbe.State.Unknown, "MAPLESU_SDK_INTERRUPTED", false))
+        }
+    }
+
+    @Test fun expiredAdmissionKeepsOnlyTheSameIdentityObservationWithoutANewCapability() {
+        for (previous in UltraEnvironmentProbe.State.entries) {
+            assertEquals(previous, UltraEnvironmentProbe.stateAfterAdmission(previous,
+                UltraEnvironmentProbe.State.Unknown, "MAPLESU_SDK_DEADLINE_EXCEEDED", true))
+            assertEquals(UltraEnvironmentProbe.State.Unknown, UltraEnvironmentProbe.stateAfterAdmission(previous,
+                UltraEnvironmentProbe.State.Unknown, "MAPLESU_SDK_DEADLINE_EXCEEDED", false))
         }
     }
 

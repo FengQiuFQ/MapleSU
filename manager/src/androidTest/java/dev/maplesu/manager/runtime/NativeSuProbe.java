@@ -107,6 +107,107 @@ final class NativeSuProbe {
         suExec(service, "/system/bin/id -u", reply);
     }
 
+    /** FIRST+11 preserves FIRST+8 and shares the caller's absolute ten-second budget. */
+    static void suCompatBefore(Service service, long deadlineNanos, Parcel reply) {
+        Bundle result = suCompatBefore(service, deadlineNanos, true);
+        reply.writeNoException();
+        reply.writeTypedObject(result, 0);
+    }
+
+    /** Foreground test APK entry; execution still belongs to this service's real UID. */
+    static Bundle suCompatInCurrentProcessBefore(Service service, long deadlineNanos) {
+        return suCompatBefore(service, deadlineNanos, false);
+    }
+
+    private static Bundle suCompatBefore(Service service, long deadlineNanos, boolean binderCaller) {
+        long started = android.os.SystemClock.elapsedRealtimeNanos();
+        long deadline = Math.min(deadlineNanos, started + TimeUnit.SECONDS.toNanos(10));
+        Bundle result = new Bundle();
+        result.putInt("uid", Process.myUid());
+        result.putString("path", "/system/bin/su");
+        result.putString("command", "/system/bin/id -u");
+        result.putLong("deadlineElapsedRealtimeNanos", deadline);
+        java.lang.Process process = null;
+        ExecutorService readers = null;
+        String stage = "caller_identity";
+        try {
+            if (binderCaller) {
+                int manager = service.getPackageManager().getApplicationInfo("dev.maplesu.manager", 0).uid;
+                if (Binder.getCallingUid() != manager) throw new SecurityException("Fixture caller mismatch");
+            } else if (service.getApplicationInfo().uid != Process.myUid()) {
+                throw new SecurityException("Fixture process identity mismatch");
+            }
+            remainingSuNanos(deadline);
+            stage = "exec";
+            process = new ProcessBuilder("/system/bin/su", "-c", "/system/bin/id -u").start();
+            result.putBoolean("started", true);
+            process.getOutputStream().close();
+            final java.lang.Process running = process;
+            readers = Executors.newFixedThreadPool(2);
+            Future<byte[]> output = readers.submit(() -> read(running.getInputStream()));
+            Future<byte[]> error = readers.submit(() -> read(running.getErrorStream()));
+            stage = "wait";
+            boolean finished = process.waitFor(remainingSuNanos(deadline), TimeUnit.NANOSECONDS);
+            result.putBoolean("finished", finished);
+            if (!finished) throw new TimeoutException("SU_FIXTURE_DEADLINE_EXCEEDED");
+            result.putInt("code", process.exitValue());
+            stage = "stdout";
+            result.putByteArray("stdout", output.get(remainingSuNanos(deadline), TimeUnit.NANOSECONDS));
+            stage = "stderr";
+            result.putByteArray("stderr", error.get(remainingSuNanos(deadline), TimeUnit.NANOSECONDS));
+            stage = "complete";
+        } catch (Exception failure) {
+            if (failure instanceof InterruptedException) Thread.currentThread().interrupt();
+            result.putString("exception", failure.toString());
+            result.putBoolean("timedOut", failure instanceof TimeoutException);
+            StringBuilder causes = new StringBuilder();
+            for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
+                if (causes.length() > 0) causes.append(" <- ");
+                causes.append(cause);
+                if (cause instanceof ErrnoException) {
+                    int errno = ((ErrnoException) cause).errno;
+                    result.putInt("errno", errno);
+                    result.putString("errnoName", Os.strerror(errno));
+                }
+            }
+            result.putString("causes", causes.toString());
+        } finally {
+            result.putString("stage", stage);
+            if (process != null) {
+                if (process.isAlive()) process.destroyForcibly();
+                long remaining = deadline - android.os.SystemClock.elapsedRealtimeNanos();
+                try {
+                    if (process.isAlive() && remaining > 0) process.waitFor(remaining, TimeUnit.NANOSECONDS);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    result.putString("cleanupFailure", interrupted.toString());
+                }
+                result.putBoolean("cleanupPending", process.isAlive());
+            }
+            if (readers != null) {
+                readers.shutdownNow();
+                long remaining = deadline - android.os.SystemClock.elapsedRealtimeNanos();
+                try {
+                    boolean terminated = readers.isTerminated() || remaining > 0 &&
+                            readers.awaitTermination(remaining, TimeUnit.NANOSECONDS);
+                    result.putBoolean("cleanupPending", result.getBoolean("cleanupPending") || !terminated);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    result.putBoolean("cleanupPending", true);
+                    result.putString("cleanupFailure", interrupted.toString());
+                }
+            }
+            result.putLong("elapsedNanos", android.os.SystemClock.elapsedRealtimeNanos() - started);
+        }
+        return result;
+    }
+
+    private static long remainingSuNanos(long deadline) throws TimeoutException {
+        long remaining = deadline - android.os.SystemClock.elapsedRealtimeNanos();
+        if (remaining <= 0) throw new TimeoutException("SU_FIXTURE_DEADLINE_EXCEEDED");
+        return remaining;
+    }
+
     /**
      * P1.su domain (FIRST_CALL_TRANSACTION + 9): the same real `su` exec from this
      * fixture's own UID, but the command also prints the **SELinux domain** of the child:

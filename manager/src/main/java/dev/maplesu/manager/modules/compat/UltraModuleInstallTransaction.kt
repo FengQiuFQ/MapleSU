@@ -341,6 +341,7 @@ class UltraModuleInstallTransaction(
             val notSubmitted = install.operation == operation && !install.ok &&
                 !install.operationCompleted && install.data == null && when (install.sdkError) {
                     "MAPLESU_SDK_BUSY" -> install.sdkErrorCode in setOf(-1001, -1005)
+                    "MAPLESU_SDK_DEADLINE_EXCEEDED" -> install.sdkErrorCode == -1007
                     "MAPLESU_SDK_INTERRUPTED", "MAPLESU_BRIDGE_UNAVAILABLE",
                     "SDK_INSTALLATION_SCOPE_CHANGED" -> install.sdkErrorCode == -1001
                     else -> false

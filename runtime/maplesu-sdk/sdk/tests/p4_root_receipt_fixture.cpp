@@ -7,8 +7,12 @@
 #include <fcntl.h>
 #include <new>
 #include <stdexcept>
+#include <string>
 #include <sys/wait.h>
 #include <vector>
+
+extern "C" int64_t maplesu_request_operation_deadline_nanos() noexcept { return 0; }
+namespace default_modules::module_root { KModErr set_current_root(bool); }
 
 namespace kernel_module {
 static RequestManagementReply current_reply{};
@@ -32,16 +36,22 @@ KModErr maplesu_request_owner_close() {
 RequestManagementReply maplesu_request_management_reply() { return current_reply; }
 }
 
-namespace maplesu::sdk {
-// EXACT_FORK_FUNCTIONS
-namespace {
-// EXACT_ROOT_FUNCTIONS
-}
-}
+// EXACT_ROOT_SOURCE
 
 using namespace maplesu::sdk;
 namespace {
 unsigned checks = 0, failures = 0;
+bool write_fixture_bytes(int fd, const void* data, size_t bytes) {
+    auto* cursor = static_cast<const unsigned char*>(data);
+    while (bytes) {
+        const ssize_t count = write(fd, cursor, bytes);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) return false;
+        cursor += count;
+        bytes -= static_cast<size_t>(count);
+    }
+    return true;
+}
 #define CHECK(value) do { ++checks; if (!(value)) { ++failures; \
     std::fprintf(stderr, "line %d: %s\n", __LINE__, #value); } } while (0)
 
@@ -206,7 +216,7 @@ void command_pipe(Case test) {
             close(fds[0]);
             constexpr size_t close_bytes = sizeof(KModErr) + 3 * sizeof(int) + 4 * sizeof(uint64_t);
             if (bytes.size() <= close_bytes) _exit(6);
-            sent = write_full(transfer.fd_child_to_parent_write, bytes.data(), bytes.size() - close_bytes);
+            sent = write_fixture_bytes(transfer.fd_child_to_parent_write, bytes.data(), bytes.size() - close_bytes);
         } else sent = send_command_result(transfer, result);
         transfer.close_all();
         _exit(sent ? 0 : 7);

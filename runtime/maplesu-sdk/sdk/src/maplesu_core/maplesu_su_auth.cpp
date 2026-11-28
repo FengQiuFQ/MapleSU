@@ -5,11 +5,25 @@
 #include "closure_fork_pipe.h"
 #include "maplesu_request_private.h"
 #include "maplesu_storage_worker_private.h"
+#include "maplesu_operation_wait_private.h"
 #include "../module/su_redirect_tu/su_auth_result_private.h"
 #include "../module/su_redirect_tu/su_uid_profile_private.h"
 #include <cerrno>
 #include <sys/wait.h>
 #include <utility>
+
+namespace {
+pid_t wait_su_worker(pid_t child, int& status, int& error_number) {
+    const auto reaped = maplesu::deadline::wait_child(child, &status);
+    error_number = reaped < 0 ? errno : 0;
+    if (reaped < 0 && error_number == ETIMEDOUT) {
+        (void)kill(child, SIGKILL);
+        if (waitpid(child, &status, WNOHANG) == child) return child;
+    }
+    errno = error_number;
+    return reaped;
+}
+}
 
 namespace default_modules::module_root {
 KModErr set_current_root(bool);
@@ -125,8 +139,8 @@ template<class Item, class Reader> static KModErr read_su_auth_over_pipe(
         err = KModErr::ERR_READ_CHILD_DATA;
     pipe.close_all();
     int status = 0;
-    pid_t reaped;
-    do { reaped = waitpid(pipe.child_pid, &status, 0); } while (reaped < 0 && errno == EINTR);
+    int wait_errno = 0;
+    const auto reaped = wait_su_worker(pipe.child_pid, status, wait_errno);
     if (err == KModErr::OK &&
         (reaped != pipe.child_pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0))
         err = KModErr::ERR_READ_CHILD_ERRCODE;
@@ -210,9 +224,8 @@ KModErr mutate(const char* package, Operation operation, ResultV1& result,
     // blocked on a pipe that the parent has stopped reading.
     pipe.close_all();
     int status = 0;
-    pid_t reaped;
-    do { reaped = waitpid(pipe.child_pid, &status, 0); } while (reaped < 0 && errno == EINTR);
-    const int wait_errno = reaped < 0 ? errno : 0;
+    int wait_errno = 0;
+    const auto reaped = wait_su_worker(pipe.child_pid, status, wait_errno);
     const bool completed = reaped == pipe.child_pid;
     if (completed) {
         result.childWaitStatus = status;
@@ -255,17 +268,147 @@ KModErr read_uid_profiles(std::vector<UidProfileV1>& profiles) {
 }
 }
 KModErr get_uid_profiles_with_cb(void (*callback)(const UidProfileV1*)) {
-    if (!callback) return KModErr::ERR_MODULE_PARAM;
-    std::vector<UidProfileV1> profiles;
-    const auto error = maplesu::sdk::read_su_auth_over_pipe(profiles, read_uid_profiles);
-    if (is_failed(error)) return error;
-    // Validate the complete fixed-record array before publishing any callback.
-    for (const auto& profile : profiles) {
-        if (!profile.uid || profile.uid > uint32_t(INT32_MAX) || profile.allow > 1 || !profile.package[0] ||
-            strnlen(profile.package, sizeof(profile.package)) == sizeof(profile.package))
-            return KModErr::ERR_READ_CHILD_DATA;
+    ReadResultV1 result;
+    return get_uid_profiles_with_cb(callback, result);
+}
+namespace {
+KModErr read_failure(ReadResultV1& result, KModErr error, ReadPhase phase, int error_number) {
+    if (!result.resultCode) {
+        result.resultCode = to_num(error);
+        result.primaryPhase = static_cast<uint32_t>(phase);
+        result.primaryErrno = error_number;
     }
-    for (const auto& profile : profiles) callback(&profile);
-    return KModErr::OK;
+    return static_cast<KModErr>(static_cast<ssize_t>(result.resultCode));
+}
+void read_management(UidReadbackV1& output, const kernel_module::RequestManagementReply& reply) {
+    output.managementStatus = reply.status;
+    output.managementEffects = reply.effects;
+    output.managementResult = reply.result;
+    output.managementCommand = reply.command;
+    output.managementCompleted = reply.completed;
+    output.managementHasHandle = reply.handle != 0;
+}
+void read_diagnostic(ReadResultV1& result) {
+    const auto diagnostic = kernel_module::maplesu_request_uid_readback_diagnostic();
+    auto& output = result.readback;
+    output.code = diagnostic.errorCode;
+    output.systemErrno = diagnostic.systemErrno;
+    output.phase = static_cast<uint32_t>(diagnostic.phase);
+    output.capabilities = diagnostic.capabilities;
+    output.revision = diagnostic.revision;
+    output.count = diagnostic.count;
+    output.schema = diagnostic.schema;
+    // Package validation can fail after a successful typed READ. Root may
+    // also fail before that READ; keep the actual pre-CLOSE reply in both cases.
+    read_management(output, output.phase ? diagnostic.reply : kernel_module::maplesu_request_management_reply());
+}
+}
+KModErr get_uid_profiles_with_cb(void (*callback)(const UidProfileV1*), ReadResultV1& result) {
+    result = {};
+    const int original_errno = errno;
+    result.authMode = static_cast<uint32_t>(kernel_module::maplesu_request_auth_mode(
+        kernel_module::maplesu_request_auth_state()));
+    const auto selected_mode = result.authMode;
+    if (!callback) {
+        errno = EINVAL;
+        return read_failure(result, KModErr::ERR_MODULE_PARAM, ReadPhase::Validate, errno);
+    }
+    errno = 0;
+    const auto admission = kernel_module::maplesu_request_worker_admission();
+    if (is_failed(admission)) return read_failure(result, admission, ReadPhase::Admission, errno);
+    maplesu::sdk::fork_pipe_info pipe;
+    if (maplesu::sdk::fork_pipe_child_process(pipe)) {
+        result.flags = kReadResultAvailable;
+        maplesu::storage::WorkerScope worker;
+        errno = 0;
+        const auto rooted = worker.root();
+        result.root = {to_num(rooted), is_failed(rooted) ? errno : 0, 1};
+        if (is_failed(rooted)) read_failure(result, rooted, ReadPhase::Root, errno);
+        std::vector<UidProfileV1> profiles;
+        if (is_ok(rooted)) {
+            errno = 0;
+            KModErr read;
+            try { read = read_uid_profiles(profiles); }
+            catch (const std::bad_alloc&) { errno = ENOMEM; read = KModErr::ERR_NO_MEM; }
+            if (is_ok(read) && profiles.size() > MAPLESU_UID_SNAPSHOT_MAX_RECORDS) {
+                errno = EOVERFLOW;
+                read = KModErr::ERR_READ_CHILD_DATA;
+            }
+            result.read = {to_num(read), is_failed(read) ? errno : 0, 1};
+            if (is_failed(read)) {
+                read_failure(result, read, ReadPhase::Read, errno);
+                profiles.clear();
+            }
+        }
+        read_diagnostic(result);
+        errno = 0;
+        const auto closed = worker.close_checked();
+        result.close = {to_num(closed), is_failed(closed) ? errno : 0, 1};
+        if (is_failed(closed)) read_failure(result, closed, ReadPhase::Close, errno);
+        result.recordCount = static_cast<uint32_t>(profiles.size());
+        const bool sent = maplesu::sdk::write_transfer_data_from_child(pipe, read_wire::encode(result)) &&
+            maplesu::sdk::write_transfer_data_from_child(pipe, maplesu::sdk::to_bytes_memcpy(profiles));
+        pipe.close_all();
+        _exit(sent ? 0 : 1);
+    }
+    if (pipe.child_pid <= 0) {
+        result.transportStatus = static_cast<uint32_t>(Transport::ForkFailed);
+        return read_failure(result, KModErr::ERR_READ_CHILD_ERRCODE, ReadPhase::Fork, errno);
+    }
+    std::array<uint8_t, kReadResultBytes> frame{};
+    const auto receipt = maplesu::sdk::read_fixed_transfer_data_from_child(pipe, frame.data(), frame.size());
+    const bool available = receipt.status == maplesu::sdk::FixedTransferStatus::Complete &&
+        read_wire::decode(frame.data(), frame.size(), result);
+    std::vector<UidProfileV1> profiles;
+    if (!available || result.recordCount > MAPLESU_UID_SNAPSHOT_MAX_RECORDS) {
+        result = {};
+        result.authMode = selected_mode;
+        result.transportStatus = static_cast<uint32_t>(
+            receipt.status == maplesu::sdk::FixedTransferStatus::Truncated ? Transport::Truncated :
+            receipt.status == maplesu::sdk::FixedTransferStatus::IoError ? Transport::ReadError : Transport::FrameInvalid);
+        read_failure(result, KModErr::ERR_READ_CHILD_ERRCODE, ReadPhase::Transfer, receipt.systemErrno);
+    } else {
+        try { profiles.resize(result.recordCount); }
+        catch (const std::bad_alloc&) {
+            result.transportStatus = static_cast<uint32_t>(Transport::ReadError);
+            result.transportErrno = ENOMEM;
+            read_failure(result, KModErr::ERR_NO_MEM, ReadPhase::Records, ENOMEM);
+        }
+        if (profiles.size() == result.recordCount) {
+            const auto records = maplesu::sdk::read_fixed_transfer_data_from_child(pipe, profiles.data(),
+                profiles.size() * sizeof(UidProfileV1));
+            result.transportStatus = static_cast<uint32_t>(records.status == maplesu::sdk::FixedTransferStatus::Complete
+                ? Transport::Complete : records.status == maplesu::sdk::FixedTransferStatus::Truncated
+                ? Transport::Truncated : records.status == maplesu::sdk::FixedTransferStatus::IoError
+                ? Transport::ReadError : Transport::FrameInvalid);
+            result.transportErrno = records.systemErrno;
+            if (records.status != maplesu::sdk::FixedTransferStatus::Complete)
+                read_failure(result, KModErr::ERR_READ_CHILD_DATA, ReadPhase::Transfer, records.systemErrno);
+        }
+    }
+    pipe.close_all();
+    int status = 0, wait_errno = 0;
+    const auto reaped = wait_su_worker(pipe.child_pid, status, wait_errno);
+    if (reaped == pipe.child_pid) {
+        result.childWaitStatus = status;
+        result.childWaitStatusValid = 1;
+    }
+    if (wait_errno || reaped != pipe.child_pid || !WIFEXITED(status) || WEXITSTATUS(status)) {
+        result.transportStatus = static_cast<uint32_t>(!wait_errno && reaped == pipe.child_pid
+            ? Transport::ChildFailed : Transport::WaitFailed);
+        result.transportErrno = wait_errno;
+        read_failure(result, KModErr::ERR_READ_CHILD_ERRCODE, ReadPhase::Wait, wait_errno);
+    }
+    // Adopt no partial list, even when a valid child receipt preceded bad bytes.
+    if (!result.resultCode) for (const auto& profile : profiles) {
+        if (!profile.uid || profile.uid > uint32_t(INT32_MAX) || profile.allow > 1 || !profile.package[0] ||
+            strnlen(profile.package, sizeof(profile.package)) == sizeof(profile.package)) {
+            read_failure(result, KModErr::ERR_READ_CHILD_DATA, ReadPhase::Records, EBADMSG);
+            break;
+        }
+    }
+    if (!result.resultCode) for (const auto& profile : profiles) callback(&profile);
+    errno = result.resultCode ? result.primaryErrno : original_errno;
+    return static_cast<KModErr>(static_cast<ssize_t>(result.resultCode));
 }
 }

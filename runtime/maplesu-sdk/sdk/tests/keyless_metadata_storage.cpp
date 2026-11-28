@@ -1,8 +1,11 @@
 // Real m035 and m041 implementations; only gateway/lifetime boundaries are fixtures.
+#include "module_base_kernel_func_executor.h"
+#include "module_base_kernel_mem.h"
 #include "../src/module_base/module_base_disk_storage.cpp"
 #include "../src/module/module_append_package_parser.cpp"
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <thread>
 
 namespace {
@@ -20,6 +23,12 @@ template<typename T> void put(unsigned offset, T value) { std::memcpy(append + o
 void reset() { auth = 1; alive = supported = true; stale_facts = stale_read = false; metadata_error = read_error = KModErr::OK; reads = 0; std::memset(append, 0, sizeof(append)); append_bytes = MAPLESU_APPEND64_BYTES; capabilities = 0; }
 }
 namespace kernel_module {
+// Standard owner requests must never fall back to the legacy emitter or Key.
+void maplesu_legacy_asm_func_start(asmjit::a64::Assembler*) { std::abort(); }
+void maplesu_legacy_asm_func_end(asmjit::a64::Assembler*, asmjit::a64::GpX) { std::abort(); }
+KModErr execute_kernel_asm_func(const std::vector<uint8_t>&, uint64_t&) { std::abort(); }
+KModErr read_kernel_mem(uint64_t, void*, uint32_t) { std::abort(); }
+KModErr get_kernel_base_vaddr(uint64_t&) { std::abort(); }
 uint64_t maplesu_request_auth_state() { return auth; }
 bool maplesu_request_owner_lifetime_capture(RequestOwnerLifetimeToken&) { return alive; }
 bool maplesu_request_owner_lifetime_matches(const RequestOwnerLifetimeToken&) { return alive; }
@@ -38,6 +47,12 @@ KModErr maplesu_request_owner_read(uint64_t source, void* out, uint32_t size, co
     if (stale_read) ++auth;
     return KModErr::OK;
 }
+}
+extern "C" const char* __get_current_module_root_key_hd04aBTnbSZlTRP7S4mQpIeVvr2ssGjW() {
+    std::abort();
+}
+extern "C" const char* __get_current_module_id32_1b0494ae8a788541db46b82cc1f0577c() {
+    std::abort();
 }
 int main() {
     unsigned checks = 0;
@@ -98,5 +113,6 @@ int main() {
     assert(get_append_package_kallsyms_kaddr(result) == KModErr::ERR_MODULE_INTERNAL_APPEND && result == 123); ++checks;
     reset(); capabilities = MAPLESU_CAP_APPEND64; append_bytes = 87; result = 123;
     assert(get_append_package_kallsyms_kaddr(result) == KModErr::ERR_MODULE_INTERNAL_APPEND && result == 123); ++checks;
-    std::printf("KEYLESS_METADATA_STORAGE_PASS checks=%u actual_m035_m041=1 gateway=fixture device=0\n", checks);
+    assert(metadata_test::init_count == 0); ++checks;
+    std::printf("KEYLESS_METADATA_STORAGE_PASS checks=%u actual_m035_m041=1 gateway=fixture legacy=not_invoked device=0\n", checks);
 }

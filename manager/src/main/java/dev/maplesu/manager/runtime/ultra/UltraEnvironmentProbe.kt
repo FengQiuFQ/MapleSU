@@ -33,6 +33,8 @@ object UltraEnvironmentProbe {
         val sdkChannelAvailable: Boolean = false,
         val legacyCredentialFingerprint: String? = null,
         val rootProbeDetail: String? = null,
+        val managerSuFailureDetail: String? = null,
+        internal val observedBootId: String? = null,
     ) {
         val rootAvailable: Boolean get() = kernelRootVerified &&
             state in setOf(State.Running, State.Unknown, State.NotInstalled)
@@ -40,7 +42,7 @@ object UltraEnvironmentProbe {
 
     private const val TAG = "MapleSUUltraProbe"
     private const val CACHE_TTL_MS = 3_000L
-    private val ADMISSION_FAILURES = setOf("MAPLESU_SDK_BUSY", "MAPLESU_SDK_INTERRUPTED")
+    private val ADMISSION_FAILURES = setOf("MAPLESU_SDK_BUSY", "MAPLESU_SDK_INTERRUPTED", "MAPLESU_SDK_DEADLINE_EXCEEDED")
     private val snapshots = MutableStateFlow(Snapshot())
     private val snapshot: Snapshot get() = snapshots.value
     private val lock = Any()
@@ -67,6 +69,25 @@ object UltraEnvironmentProbe {
             UltraSdkCredentials.suspended(context), UltraSdkCredentials.hookWithoutSdk(context),
             if (owner == null) UltraLegacyCredential.read(context)?.fingerprint else null)
     }
+
+    internal fun publishManagerSuDiagnostic(context: Context, expected: Snapshot, detail: String?): Boolean = synchronized(lock) {
+        val current = currentSnapshot(context)
+        val boot = UltraEnvironmentAutoSetup.currentBootId()
+        if (!managerSuDiagnosticScopeCurrent(expected, current, boot)) return@synchronized false
+        snapshots.value = current.copy(managerSuFailureDetail = detail?.takeIf(String::isNotBlank))
+        true
+    }
+
+    internal fun managerSuDiagnosticScopeCurrent(expected: Snapshot, current: Snapshot, boot: String?): Boolean =
+        !boot.isNullOrBlank() && expected.observedBootId == boot && current.observedBootId == boot &&
+            expected.modeActivation === ModeRuntime.activation && current.modeActivation === expected.modeActivation &&
+            if (expected.managerOwnerIdentity != null) {
+                expected.managerOwnerIdentity.fullUid == Process.myUid() &&
+                    current.managerOwnerIdentity == expected.managerOwnerIdentity
+            } else {
+                current.managerOwnerIdentity == null && expected.legacyCredentialFingerprint != null &&
+                    current.legacyCredentialFingerprint == expected.legacyCredentialFingerprint
+            }
     internal fun webUiOwnerScope(context: Context): ModuleWebUiSessions.OwnerScope? =
         currentSnapshot(context).managerOwnerIdentity?.takeIf { ModeRuntime.active != WorkMode.KSU }?.let {
             ModuleWebUiSessions.OwnerScope(it.fullUid, it.epoch, it.hostInstance)
@@ -131,6 +152,7 @@ object UltraEnvironmentProbe {
             UltraEnvironmentAutoSetup.currentBootId() == boot && removalCurrent() &&
             !UltraSdkCredentials.suspended(app)
         return observeFreshIdentity(::current, { UltraRuntimeClient().queryManagerOwnerIdentity() }, activation)
+            .copy(observedBootId = boot)
     }
 
     internal fun observeFreshIdentity(
@@ -220,7 +242,7 @@ object UltraEnvironmentProbe {
             val receipt = client.environmentState()
             val root = if (current()) client.probeManagerOwnerRoot() else null
             val confirmed = if (current()) client.queryManagerOwnerIdentity().identity else null
-            val measured = healthSnapshot(receipt, root, owner, confirmed, activation)
+            val measured = healthSnapshot(receipt, root, owner, confirmed, activation).copy(observedBootId = boot)
             return synchronized(lock) {
                 if (expectedRevision != revision || !current()) return@synchronized unknown("ULTRA_PROBE_SCOPE_CHANGED")
                 snapshotBootId = boot
@@ -309,7 +331,11 @@ object UltraEnvironmentProbe {
                 ModuleWebUiSessions.observedOwner(ModuleWebUiSessions.OwnerScope(it.fullUid, it.epoch, it.hostInstance))
             }
         }
-        snapshots.value = observation.copy(modeActivation = activation)
+        val previous = snapshot
+        val sameDiagnosticScope = managerSuDiagnosticScopeCurrent(previous, observation, observation.observedBootId)
+        snapshots.value = observation.copy(modeActivation = activation,
+            managerSuFailureDetail = observation.managerSuFailureDetail ?:
+                previous.managerSuFailureDetail.takeIf { sameDiagnosticScope })
     }
 
     private fun publish(state: State, detail: String?, kernelRootVerified: Boolean,
@@ -329,6 +355,7 @@ object UltraEnvironmentProbe {
             sdkChannelAvailable = sdkChannelAvailable,
             legacyCredentialFingerprint = legacyCredentialFingerprint,
             modeActivation = activation,
+            observedBootId = snapshotBootId,
         )
         publishSnapshot(observed, activation)
         return observed

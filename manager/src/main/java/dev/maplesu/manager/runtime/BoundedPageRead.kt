@@ -23,9 +23,19 @@ internal object PageReadDeadline {
 
     fun currentNanos(): Long? = deadline.get()
 
-    fun context(timeoutMillis: Long): CoroutineContext {
-        val next = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis)
-        return deadline.asContextElement(deadline.get()?.let { minOf(it, next) } ?: next)
+    fun limitNanos(timeoutMillis: Long): Long {
+        val next = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis.coerceAtLeast(0))
+        return deadline.get()?.let { minOf(it, next) } ?: next
+    }
+
+    fun context(timeoutMillis: Long): CoroutineContext = deadline.asContextElement(limitNanos(timeoutMillis))
+
+    fun <T> onWorker(limitNanos: Long, block: () -> T): T {
+        val previous = deadline.get()
+        deadline.set(previous?.let { minOf(it, limitNanos) } ?: limitNanos)
+        return try { block() } finally {
+            if (previous == null) deadline.remove() else deadline.set(previous)
+        }
     }
 }
 

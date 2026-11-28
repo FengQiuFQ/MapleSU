@@ -3,6 +3,7 @@
 #include <vector>
 
 namespace maplesu::sdk { struct module_record; }
+namespace skroot_env { struct module_record; }
 
 namespace maplesu {
 // Extension ABI: legacy packed module_record and all legacy entrypoints stay intact.
@@ -31,4 +32,10 @@ std::vector<ModuleControlResult> get_module_controls(
     const std::vector<maplesu::sdk::module_record>& records);
 // Changes desired boot state only; never invokes install/uninstall or module entry.
 int64_t set_module_enabled(const char* id32, bool enabled, ModuleControlState& out);
+// Explicit 5.2.0 compatibility overloads authenticate the supplied legacy key.
+int64_t module_control_capability(const char* rootKey, bool& supported);
+int64_t get_module_control(const char* rootKey, const char* id32, ModuleControlState& out);
+std::vector<ModuleControlResult> get_module_controls(
+    const char* rootKey, const std::vector<skroot_env::module_record>& records);
+int64_t set_module_enabled(const char* rootKey, const char* id32, bool enabled, ModuleControlState& out);
 }

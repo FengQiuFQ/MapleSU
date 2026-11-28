@@ -62,23 +62,12 @@ class EnvironmentDetectionProjectionTest {
     }
 
     @Test
-    fun inheritedStatesOverrideOnlyForKsuAndNotInstalled() {
-        val inheritedKsu = EnvironmentDetectionProjection.override(
-            outcome(EnvironmentVerdict.INHERITED, WorkMode.KSU, trigger = null),
-        )
-        assertEquals(ModeState.MODE_B_KERNEL_ONLY, inheritedKsu?.state)
-
-        val inheritedNone = EnvironmentDetectionProjection.override(
-            outcome(EnvironmentVerdict.INHERITED, null, trigger = null),
-        )
-        assertEquals(ModeState.NOT_INSTALLED, inheritedNone?.state)
-
-        // LITE 的激活必须带本 boot 的凭据握手证据：继承不得直接激活 Ultra。
-        assertNull(
-            EnvironmentDetectionProjection.override(
-                outcome(EnvironmentVerdict.INHERITED, WorkMode.LITE, trigger = null),
-            ),
-        )
+    fun inheritedStatesNeverGrantCurrentIdentityOrAbsence() {
+        for (mode in listOf(WorkMode.KSU, WorkMode.LITE, null)) {
+            assertNull("History is display data only: $mode", EnvironmentDetectionProjection.override(
+                outcome(EnvironmentVerdict.INHERITED, mode, trigger = null),
+            ))
+        }
     }
 
     @Test

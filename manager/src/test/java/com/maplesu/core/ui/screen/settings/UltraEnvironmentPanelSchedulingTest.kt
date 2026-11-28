@@ -82,13 +82,30 @@ class UltraEnvironmentPanelSchedulingTest {
         val refreshGate = text.substringAfter("fun refresh()").substringBefore("val generation")
         assertTrue(refreshGate.contains("!foreground"))
         assertTrue(refreshGate.contains("reading?.isActive == true"))
-        assertTrue(refreshGate.contains("ModeRuntime.active != WorkMode.LITE"))
+        assertTrue(refreshGate.contains("ModeRuntime.active == WorkMode.KSU"))
+        assertTrue(text.contains("if (visible && foreground) panel.resume()"))
     }
 
-    @Test fun aReadableVersionDoesNotStopRetriesWhileTheUpdateReadIsIncomplete() {
+    @Test fun completedOperationsRetirePendingReadsBeforeRefreshingThePage() {
+        val body = source().substringAfter("internal fun operationChanged(").substringBefore("internal fun pause()")
+        assertTrue(body.contains("operation.completedRevision != operationRevision"))
+        assertTrue(body.contains("reading?.cancel()"))
+        assertTrue(body.contains("readGeneration++"))
+        assertTrue(body.contains("observationRead.invalidate()"))
+        assertTrue(body.indexOf("observationRead.invalidate()") < body.indexOf("refresh()"))
+        val completion = source().substringAfter("fun startUpgrade()").substringBefore("private fun apply(")
+        assertTrue(completion.contains("operationChanged(UltraEnvironmentUpgrade.operationFlow.value)"))
+    }
+
+    @Test fun factsAreReadOnceWithinOneBudgetAndSubsequentReadsNeedRealEvents() {
         val refresh = source().substringAfter("fun refresh()").substringBefore("private fun readInstalledVersion")
-        assertTrue(refresh.contains("version != null && !readUnknown"))
-        assertTrue(refresh.contains("coerceAtMost(8_000L)"))
+        assertTrue(refresh.contains("readCurrentObservation()"))
+        assertTrue(refresh.contains("observationRead.read("))
+        assertFalse(refresh.contains("generateSequence"))
+        assertFalse(refresh.contains("delay("))
         assertFalse(refresh.contains("toast("))
+        assertTrue(source().contains("BoundedPageRead<Pair<String?, UltraEnvFacts?>>(10_000L)"))
+        assertTrue(source().contains("LaunchedEffect(panel, upgradeOperation) { panel.operationChanged(upgradeOperation) }"))
+        assertTrue(source().contains("fun checkForUpgrade(onChecked: (UltraEnvUpgrade) -> Unit)"))
     }
 }

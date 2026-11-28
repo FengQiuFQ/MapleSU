@@ -4,7 +4,6 @@ import com.maplesu.core.ui.screen.settings.UltraEnvironmentInstallCardMaterial
 import com.maplesu.core.ui.screen.settings.rememberUltraEnvironmentInstallPanel
 import com.maplesu.core.ui.screen.settings.UltraEnvironmentUpdatePanel
 import com.maplesu.core.ui.screen.settings.UltraEnvironmentUpdateCardMaterial
-import com.maplesu.core.ui.screen.settings.ultraEnvironmentLabel
 
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandVertically
@@ -15,7 +14,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.defaultMinSize
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -25,6 +24,7 @@ import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
@@ -204,18 +204,6 @@ fun HomePagerMaterial(
             if (state.showLiteRootFailure) {
                 WarningCard(message = stringResource(R.string.home_lite_root_failure))
             }
-            if (state.showUltraObservationFailure) {
-                val summary = stringResource(when (state.ultraObservationFailure) {
-                    HomeEnvironmentFailure.TIMED_OUT -> R.string.home_ultra_observation_timeout_summary
-                    HomeEnvironmentFailure.BUSY -> R.string.home_ultra_observation_busy_summary
-                    HomeEnvironmentFailure.UNCONFIRMED -> R.string.home_ultra_observation_unconfirmed_summary
-                    else -> R.string.home_ultra_observation_failed_summary
-                })
-                WarningCard(
-                    message = summary,
-                    onClick = actions.onOpenEnvironmentSettings,
-                )
-            }
             if (state.showEnvironmentRefreshWarning) {
                 val summary = stringResource(when (state.manualEnvironmentFailure) {
                     HomeEnvironmentFailure.TIMED_OUT -> R.string.home_environment_check_timeout_summary
@@ -232,8 +220,20 @@ fun HomePagerMaterial(
             ThemeHomeStatus(state, actions) { MaterialStatusCard(
                 state = state,
                 actions = actions,
-                ultraVersionLabel = if (state.ultraBrandVisible) ultraEnvironmentLabel(ultraEnvironment?.version) else null,
+                ultraVersionLabel = if (state.ultraBrandVisible) ultraEnvironment?.version else null,
             ) }
+            if (state.showUltraObservationFailure) {
+                val summary = stringResource(when (state.ultraObservationFailure) {
+                    HomeEnvironmentFailure.TIMED_OUT -> R.string.home_ultra_observation_timeout_summary
+                    HomeEnvironmentFailure.BUSY -> R.string.home_ultra_observation_busy_summary
+                    HomeEnvironmentFailure.UNCONFIRMED -> R.string.home_ultra_observation_unconfirmed_summary
+                    else -> R.string.home_ultra_observation_failed_summary
+                })
+                WarningCard(
+                    message = summary,
+                    onClick = actions.onOpenEnvironmentSettings,
+                )
+            }
             // 「发现 Ultra 环境更新」：紧贴状态卡下方，写法与交互同 KSU 的管理器更新卡。
             if (ultraEnvironment != null && !showInstalledKernelUpdate) {
                 UltraEnvironmentUpdateCardMaterial(ultraEnvironment)
@@ -316,7 +316,7 @@ private fun TopBar(
 internal fun MaterialStatusCard(
     state: HomeUiState,
     actions: HomeActions,
-    // Ultra 下的版本行（例如 `MapleSU_Ultra 5.0.5`）；为 null 时沿用原来的版本行。
+    // Ultra 当前版本值；身份名由独立标题显示。
     ultraVersionLabel: String? = null,
 ) {
     // Keep normal content available while automatic observations finish.
@@ -447,7 +447,8 @@ internal fun MaterialStatusCard(
             shape = MaterialTheme.shapes.large,
         ) {
             Column {
-            Box(Modifier.defaultMinSize(minHeight = if (artwork != null) 112.dp else 0.dp)) {
+            BoxWithConstraints(Modifier.fillMaxWidth()) {
+            val cardMinHeight = if (ksuActive) homeStatusCardMinHeight(maxWidth, decorationPrefs.homeLargeCard) else 0.dp
             if (ksuActive) StatusThemeBackdrop(themeArt)
             if (artwork != null) {
                 StatusDecorationImage(
@@ -469,6 +470,7 @@ internal fun MaterialStatusCard(
             }
             if (artwork == null || !decorationPrefs.statusDecorationHideText || keepProtectedText) {
             ListItem(
+                modifier = Modifier.heightIn(min = cardMinHeight),
                 leadingContent = if (ksuActive && (themeArt.hideIcon || themeArt.file != null || artwork != null)) null else ({
                     Icon(statusIcon, contentDescription = statusTitle,
                         modifier = if (ksuActive) Modifier.testTag("home-status-default-check") else Modifier)
@@ -521,10 +523,9 @@ internal fun MaterialStatusCard(
                 },
             )
             } else {
-                Spacer(Modifier.fillMaxWidth().height(112.dp))
+                Spacer(Modifier.fillMaxWidth().height(cardMinHeight))
             }
             }
-            EnvironmentRefreshAction(state.environmentChecking || state.manualEnvironmentChecking, actions.onEnvironmentRetry)
             }
         }
     }

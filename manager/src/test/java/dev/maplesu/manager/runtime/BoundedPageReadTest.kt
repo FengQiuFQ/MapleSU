@@ -32,6 +32,25 @@ class BoundedPageReadTest {
         assertEquals(2, calls)
     }
 
+    @Test fun aCancelledPageCannotPublishAnObservationFromBeforeTheUpgrade() = runBlocking {
+        val queue = BoundedPageRead<String>(2_000)
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        var calls = 0
+        val first = launch(start = CoroutineStart.UNDISPATCHED) {
+            queue.read("LITE") { calls++; entered.complete(Unit); release.await(); "before-upgrade" }
+        }
+        entered.await()
+        first.cancelAndJoin()
+        queue.invalidate()
+        val refreshed = async(start = CoroutineStart.UNDISPATCHED) {
+            queue.read("LITE") { calls++; "after-upgrade" }
+        }
+        release.complete(Unit)
+        assertEquals("after-upgrade", refreshed.await())
+        assertEquals(2, calls)
+    }
+
     @Test fun repositoryTimeoutRemainsAResultFailure() = runBlocking {
         val queue = BoundedPageRead<Result<String>>(50)
         val release = CompletableDeferred<Unit>()

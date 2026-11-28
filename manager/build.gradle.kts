@@ -97,6 +97,7 @@ android {
     namespace = "com.maplesu.core"
     compileSdk { version = release(37) { minorApiLevel = 0 } }
     buildToolsVersion = "37.0.0"
+    ndkVersion = "26.1.10909125"
     // Normal's kernel APK verifier accepts v2 signatures and verity padding only.
     // AGP dependency metadata adds block 0x504b4453 and prevents manager recognition.
     dependenciesInfo { includeInApk = false }
@@ -107,6 +108,13 @@ android {
         versionCode = 50201
         versionName = "5.2.1"
         buildConfigField("boolean", "IS_PR_BUILD", "false")
+        ndk { abiFilters += "arm64-v8a" }
+        externalNativeBuild {
+            cmake {
+                arguments += listOf("-DANDROID_STL=c++_static",
+                    "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,-z,max-page-size=16384")
+            }
+        }
         // Values describe the selected, verified source delivery.
         buildConfigField("String", "ULTRA_SDK_BUILD_ID", ultraSdkJavaString(ultraSdkIdentity.buildId))
         buildConfigField(
@@ -193,6 +201,14 @@ android {
     // 多目录方案并入 main；边界由 KsuSourceIsolationTest 机器校验（目录 + import 规则）。
     sourceSets["main"].kotlin.srcDir("src/ksu/java")
     sourceSets["main"].kotlin.srcDir(rootProject.file("jailbreak-providers/maplesu-93260/src/main/kotlin"))
+    // Current Normal JNI comes from CMake; retained companions have one generated source.
+    sourceSets["main"].jniLibs.setSrcDirs(emptyList<String>())
+    externalNativeBuild {
+        cmake {
+            path = rootProject.file("third_party/kernelsu/applied/manager/app/src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_21
         targetCompatibility = JavaVersion.VERSION_21
@@ -226,13 +242,43 @@ android {
         // runtime/maplesu-sdk/PROVENANCE.json. Stripping the bridge would change the
         // bytes the deployment receipt records, so keep them.
         keepDebugSymbols += "**/libmaplesu_ultra_bridge.so"
-        // KSU JNI (W12d): built by third_party/kernelsu/scripts/build_jni.sh (NDK 26.1,
-        // 16KB page). ksu-payload.json records their exact sha256, and the KSU facade is
-        // validated against those bytes; AGP strip would change them, so keep them intact.
+        // Normal JNI is compiled from the current applied source with 16KB page alignment.
+        // Keep exact source-built bytes for final APK provenance verification.
         keepDebugSymbols += "**/libmaplesu_ksu.so"
         keepDebugSymbols += "**/libksud_ksu.so"
         keepDebugSymbols += "**/libadbroot.so"
     }
+}
+
+abstract class PackageNormalRetainedJni : DefaultTask() {
+    @get:InputFiles @get:PathSensitive(PathSensitivity.RELATIVE)
+    abstract val libraries: ConfigurableFileCollection
+    @get:InputDirectory abstract val sourceDirectory: DirectoryProperty
+    @get:OutputDirectory abstract val jniDirectory: DirectoryProperty
+
+    @TaskAction fun packageLibraries() {
+        val source = sourceDirectory.get().asFile
+        val output = jniDirectory.get().asFile
+        if (output.isDirectory) output.listFiles()?.forEach { it.deleteRecursively() }
+        libraries.forEach { library ->
+            val target = output.resolve(library.relativeTo(source))
+            target.parentFile.mkdirs()
+            library.copyTo(target, overwrite = true)
+        }
+    }
+}
+val normalPayloadDirectory = providers.gradleProperty("maplesuNormalPayloadDirectory")
+    .map { rootProject.file(it) }.getOrElse(layout.projectDirectory.dir("src/main/jniLibs").asFile)
+val packageNormalRetainedJni = tasks.register<PackageNormalRetainedJni>("packageNormalRetainedJni") {
+    sourceDirectory.set(normalPayloadDirectory)
+    libraries.from(fileTree(normalPayloadDirectory) {
+        include("**/*.so")
+        exclude("**/libmaplesu_ksu.so", "**/libadbroot.so")
+    })
+    jniDirectory.set(layout.buildDirectory.dir("generated/normalRetainedJni"))
+}
+androidComponents.onVariants { variant ->
+    variant.sources.jniLibs?.addGeneratedSourceDirectory(packageNormalRetainedJni, PackageNormalRetainedJni::jniDirectory)
 }
 
 // androidTest 签名（5.0.5 验收）：`testBuildType = "release"` 只决定测试组件按哪个变体

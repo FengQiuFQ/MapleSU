@@ -1842,7 +1842,136 @@ def stage_source_validation_archive(tc: S.Toolchain, report: dict[str, Any]) -> 
 # --------------------------------------------------------------------------- #
 
 
-def stage_keyless_public_abi(tc: S.Toolchain, report: dict[str, Any]) -> dict[str, Any]:
+def stage_explicit_legacy_abi(tc: S.Toolchain, report: dict[str, Any], required: list[str],
+                              manifest_path: Path, signatures: dict[str, str]) -> dict[str, Any]:
+    """Measure the source-selected explicit compatibility adapter, separately from keyless APIs."""
+    directory = LINK_DIR / "explicit-legacy-abi"
+    directory.mkdir(parents=True, exist_ok=True)
+    contract_path = TOOLS_DIR / "explicit_legacy_abi.json"
+    contract_identity = P.file_record(contract_path, S.REPO_ROOT)
+    contract_bytes = contract_path.read_bytes()
+    contract = json.loads(contract_bytes.decode("utf-8"))
+    source = MAPLESU_SDK_ROOT / keyless_gate.EXPLICIT_LEGACY_SOURCE
+    consumer = TOOLS_DIR / "explicit_legacy_public_abi.cpp"
+    historical = MAPLESU_SDK_ROOT / keyless_gate.EXPLICIT_LEGACY_INCLUDE
+    problems: list[str] = []
+    if (len(contract_bytes) != contract_identity["size"] or
+            S.sha256_bytes(contract_bytes) != contract_identity["sha256"] or
+            P.file_record(contract_path, S.REPO_ROOT) != contract_identity):
+        problems.append("explicit legacy ABI contract changed while reading")
+    selected = [json.loads(line) for line in manifest_path.read_text(encoding="utf-8").splitlines()
+                if line.strip() and not line.lstrip().startswith("#")]
+    members = [row for row in selected if row["idx"] == 53]
+    compiled = [row for row in (report.get("compile") or {}).get("rows", []) if row["idx"] == 53]
+    composed = [row for row in (report.get("compose") or {}).get("rows", []) if row["idx"] == 53]
+    archive_members = [member for member in S.read_archive(ARCHIVE_OUT).members
+                       if member.idx == 53 and member.name == keyless_gate.EXPLICIT_LEGACY_MEMBER["name"]]
+    unit = None
+    if len(members) == len(compiled) == len(composed) == len(archive_members) == 1:
+        member, compile_row, compose_row, archived = members[0], compiled[0], composed[0], archive_members[0]
+        units = [item for item in compile_row.get("outputs", [])
+                 if (S.REPO_ROOT / item["source"]).resolve() == source.resolve()]
+        if (member["name"] != keyless_gate.EXPLICIT_LEGACY_MEMBER["name"] or
+                member["sources"].count(keyless_gate.EXPLICIT_LEGACY_SOURCE.removeprefix("sdk/")) != 1 or
+                compile_row.get("status") != "ok" or len(units) != 1 or
+                compile_row.get("sources") != [rel(resolve_source(item)) for item in member["sources"]]):
+            problems.append("explicit legacy source selection/compile receipt differs")
+        else:
+            unit = units[0]
+            identity = P.file_record(S.REPO_ROOT / unit["object"], S.REPO_ROOT)
+            if (identity != {"path": unit["object"], "size": unit["bytes"], "sha256": unit["sha256"]} or
+                    identity not in compose_row.get("object_inputs", []) or
+                    (archived.sha256, archived.size) != (compose_row.get("sha256"), compose_row.get("bytes")) or
+                    P.file_record(S.REPO_ROOT / compose_row["object"], S.REPO_ROOT) !=
+                    {"path": compose_row["object"], "size": archived.size, "sha256": archived.sha256} or
+                    (S.REPO_ROOT / unit["build_source"]).resolve() != source.resolve() or
+                    unit.get("source_sha256") != S.sha256_file(source) or
+                    unit.get("build_source_sha256") != S.sha256_file(source) or
+                    not unit.get("dependency_complete") or not unit.get("precompile_complete") or
+                    P.file_record(source, S.REPO_ROOT) not in unit.get("dependencies", []) or
+                    any(P.file_record(S.REPO_ROOT / item["path"], S.REPO_ROOT) != item
+                        for item in unit.get("dependencies", []))):
+                problems.append("explicit legacy compiled source/object/member pairing differs")
+    else:
+        problems.append("explicit legacy requires original m053 compile/compose/archive receipts")
+
+    def capture(name: str, argv: list[str]) -> tuple[dict[str, Any], str]:
+        completed = run_checked("gate", name, argv, name + ".log", EXIT_GATE)
+        path = directory / (name + ".txt")
+        S.write_text(path, completed.stdout)
+        return dict(argv=argv, output=P.file_record(path, S.REPO_ROOT)), completed.stdout
+
+    archive_capture, nm = capture("explicit-legacy-archive-nm", [str(tc.tool("llvm-nm")), "-A",
+        "--defined-only", "--extern-only", "--format=posix", str(ARCHIVE_OUT)])
+    providers = keyless_gate.archive_legacy_providers(nm, contract)
+    definitions: dict[str, list[dict[str, str]]] = {}
+    references: dict[str, dict[str, list[str]]] = {}
+    probes = []
+    units = []
+    for abi, target in (("arm64", "aarch64-linux-android21"), ("armv7", "armv7a-linux-androideabi23")):
+        references[abi] = {}
+        for kind, input_source, includes in (("adapter", source, include_flags()),
+                ("original", consumer, ["-I", str(historical)]), ("current", consumer, include_flags())):
+            obj = directory / (abi + "-" + kind + ".o")
+            argv = [str(tc.tool("clang++")), "--target=" + target, "-std=c++20", "-Oz", "-fPIC",
+                    "-fexceptions", *includes, *P.dependency_flags(input_source, obj),
+                    "-c", str(input_source), "-o", str(obj)]
+            before = P.precompile_snapshot(argv, input_source, obj, Path.cwd(), S.REPO_ROOT)
+            run_checked("gate", "compile explicit legacy " + abi + " " + kind, argv,
+                        "explicit-legacy-" + abi + "-" + kind + ".log", EXIT_GATE)
+            dependencies = P.dependency_receipt(input_source, obj, Path.cwd(), S.REPO_ROOT, precompile=before)
+            probe_unit = dict(source=rel(input_source), build_source=rel(input_source), object=rel(obj),
+                              bytes=obj.stat().st_size, sha256=S.sha256_file(obj), stage="explicit-legacy-abi", **dependencies)
+            units.append(probe_unit)
+            captured, nm = capture("explicit-legacy-" + abi + "-" + kind + "-nm",
+                [str(tc.tool("llvm-nm")), "--extern-only", "--format=posix", str(obj)])
+            rows = [line.split()[:2] for line in nm.splitlines() if line.strip()]
+            if kind == "adapter":
+                definitions[abi] = [dict(symbol=symbol, kind=tag) for symbol, tag in rows
+                                    if tag in S.STRONG_DEFINED_KINDS]
+            else:
+                references[abi][kind] = sorted(symbol for symbol, tag in rows if tag in ("U", "w", "v")
+                    and symbol.startswith(("_ZN10skroot_env", "_ZN7maplesu", "_ZN11kernel_root")))
+            probe = dict(abi=abi, kind=kind, source=P.file_record(input_source, S.REPO_ROOT),
+                         object=P.file_record(obj, S.REPO_ROOT), compile_argv=argv, unit=probe_unit, nm=captured)
+            if abi == "arm64" and kind != "adapter":
+                output = directory / (kind + "-public-abi.so")
+                link_argv = [str(tc.tool("clang++")), "--target=" + target, "-shared", "-Wl,--no-undefined",
+                    "-Wl,--no-gc-sections", str(obj), str(ARCHIVE_OUT), "-lc++_shared", "-llog", "-lz", "-ldl", "-lm", "-o", str(output)]
+                run_checked("gate", "link explicit legacy " + kind, link_argv,
+                            "explicit-legacy-" + kind + "-link.log", EXIT_GATE)
+                probe["link"] = dict(argv=link_argv, output=P.file_record(output, S.REPO_ROOT))
+            probes.append(probe)
+    if unit:
+        captured, nm = capture("explicit-legacy-archive-input-nm",
+            [str(tc.tool("llvm-nm")), "--extern-only", "--defined-only", "--format=posix", str(S.REPO_ROOT / unit["object"])])
+        actual = [line.split()[:2] for line in nm.splitlines() if line.strip()]
+        if sorted((symbol, kind) for symbol, kind in actual if kind in S.STRONG_DEFINED_KINDS) != sorted(
+                (item["symbol"], item["kind"]) for item in definitions["arm64"]):
+            problems.append("explicit legacy original compile object exports differ from measured adapter")
+    else:
+        captured = None
+    problems += keyless_gate.explicit_legacy_abi_problems(contract, archive_providers=providers,
+        adapter_definitions=definitions, consumer_references=references,
+        symbol_signatures=signatures, keyless_required=required)
+    if P.file_record(contract_path, S.REPO_ROOT) != contract_identity:
+        problems.append("explicit legacy ABI contract changed during validation")
+    result = dict(schema="maplesu-sdk-explicit-legacy-abi/1", status="FAIL" if problems else "PASS", problems=problems,
+        contract=contract_identity, source=P.file_record(source, S.REPO_ROOT),
+        manifest=P.file_record(manifest_path, S.REPO_ROOT), compile_unit=unit,
+        compose=composed[0] if len(composed) == 1 else None,
+        archive_member=dict(idx=53, name=archive_members[0].name, size=archive_members[0].size,
+                            sha256=archive_members[0].sha256) if len(archive_members) == 1 else None,
+        archive_nm=archive_capture, archive_input_nm=captured, archive_providers=providers,
+        adapter_definitions=definitions, consumer_references=references, probes=probes, units=units,
+        symbol_signatures={row["symbol"]: signatures.get(row["symbol"]) for row in contract["symbols"]},
+        runtime_acceptance=False)
+    S.write_json(REPORT_DIR / "explicit-legacy-abi.json", result)
+    return result
+
+
+def stage_keyless_public_abi(tc: S.Toolchain, report: dict[str, Any],
+                             manifest_path: Path = MANIFEST_PATH) -> dict[str, Any]:
     """Compile and link every public SDK API and a real module macro consumer."""
     source = TOOLS_DIR / "keyless_public_abi.cpp"
     directory = LINK_DIR / "keyless-public-abi"
@@ -1882,8 +2011,14 @@ def stage_keyless_public_abi(tc: S.Toolchain, report: dict[str, Any]) -> dict[st
     if completed.returncode or len(names) != len(all_symbols):
         raise StageError("keyless ABI signature capture failed", EXIT_GATE)
     signatures = dict(zip(all_symbols, names))
-    problems = keyless_gate.retired_api_problems(raw, [signatures[name] for name in raw],
-                                                [signatures[name] for name in required])
+    capture_input = directory / "signature-input.txt"
+    capture_output = directory / "signature-output.txt"
+    S.write_text(capture_input, "\n".join(all_symbols) + "\n")
+    S.write_text(capture_output, completed.stdout)
+    explicit = stage_explicit_legacy_abi(tc, report, required, manifest_path, signatures)
+    approved = explicit["symbol_signatures"] if not explicit["problems"] else None
+    problems = explicit["problems"] + keyless_gate.retired_api_problems(raw, [signatures[name] for name in raw],
+        [signatures[name] for name in required], explicit_legacy=approved)
     problems += keyless_gate.legacy_credential_problems(required)
     header = INCLUDE_DIR / "maplesu/compat/native_module_abi.h"
     module_symbols = keyless_gate.module_entry_symbols(header.read_text(encoding="utf-8-sig"))
@@ -1903,6 +2038,9 @@ def stage_keyless_public_abi(tc: S.Toolchain, report: dict[str, Any]) -> dict[st
                   unit=unit, tools_before=tools_before, signature_tool=tool_before, required_symbols={name: signatures[name] for name in required},
                   module_symbols=module_symbols,
                   legacy_credential_symbols=sorted(set(raw).intersection(keyless_gate.LEGACY_CREDENTIAL_SYMBOLS)),
+                  explicit_legacy_abi=explicit,
+                  signature_input=P.file_record(capture_input, S.REPO_ROOT),
+                  signature_output=P.file_record(capture_output, S.REPO_ROOT),
                   problems=problems, runtime_acceptance=False)
     S.write_json(REPORT_DIR / "keyless-public-abi.json", result)
     return result
@@ -1950,7 +2088,7 @@ def stage_gate(args: argparse.Namespace, report: dict[str, Any], tc: S.Toolchain
         if not report.get("source_validation"):
             stage_source_validation_archive(tc, report)
         problems = keyless_gate.structural_problems(gate)
-        public_abi = stage_keyless_public_abi(tc, report)
+        public_abi = stage_keyless_public_abi(tc, report, Path(args.manifest))
         problems += public_abi["problems"]
         report["keyless_public_abi"] = public_abi
         report["gate"] = dict(schema="maplesu-sdk-keyless-delivery-gate/1",
@@ -2155,10 +2293,24 @@ def collect_build_provenance(args: argparse.Namespace, report: dict[str, Any],
     public_abi = report.get("keyless_public_abi")
     if public_abi:
         units.append(public_abi["unit"])
+        units.extend(public_abi["explicit_legacy_abi"]["units"])
         inputs += [(TOOLS_DIR / "keyless_gate.py", "build_script"),
                    (TOOLS_DIR / "keyless_public_abi.cpp", "abi_contract"),
+                   (TOOLS_DIR / "explicit_legacy_abi.json", "abi_contract"),
+                   (TOOLS_DIR / "explicit_legacy_public_abi.cpp", "abi_contract"),
                    (REPORT_DIR / "keyless-public-abi.json", "validation_artifact"),
+                   (REPORT_DIR / "explicit-legacy-abi.json", "validation_artifact"),
                    (S.REPO_ROOT / public_abi["output"]["path"], "validation_artifact")]
+        explicit = public_abi["explicit_legacy_abi"]
+        artifacts = [public_abi["signature_input"], public_abi["signature_output"],
+                     explicit["archive_nm"]["output"]]
+        if explicit["archive_input_nm"]:
+            artifacts.append(explicit["archive_input_nm"]["output"])
+        for probe in explicit["probes"]:
+            artifacts.append(probe["nm"]["output"])
+            if probe.get("link"):
+                artifacts.append(probe["link"]["output"])
+        inputs += [(S.REPO_ROOT / item["path"], "validation_artifact") for item in artifacts]
     selection = report.get("source_selection")
     if selection:
         inputs.append((S.REPO_ROOT / selection["manifest"]["path"], "source_selection"))
@@ -2562,7 +2714,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             gate_allow = Path(args.gate_allow) if args.gate_allow else GATE_ALLOW_PATH
             build_inputs += [(Path(member_gate.__file__), "build_script"),
                              (Path(keyless_gate.__file__), "build_script"),
-                             (TOOLS_DIR / "keyless_public_abi.cpp", "abi_contract")]
+                             (TOOLS_DIR / "keyless_public_abi.cpp", "abi_contract"),
+                             (TOOLS_DIR / "explicit_legacy_abi.json", "abi_contract"),
+                             (TOOLS_DIR / "explicit_legacy_public_abi.cpp", "abi_contract")]
             build_inputs += [(path, "build_rule") for path in (gate_allow, member_gate.DEFAULT_BASELINE)
                              if path.is_file()]
         report["input_snapshots"] = P.snapshot_inputs(build_inputs, S.REPO_ROOT)

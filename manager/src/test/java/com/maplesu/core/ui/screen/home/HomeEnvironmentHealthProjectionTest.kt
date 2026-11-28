@@ -6,6 +6,7 @@ import dev.maplesu.manager.runtime.ultra.UltraEnvironmentProbe
 import dev.maplesu.manager.runtime.ultra.UltraRuntimeClient.ManagerOwnerIdentity
 import dev.maplesu.manager.workmode.ModeActivation
 import dev.maplesu.manager.workmode.WorkMode
+import dev.maplesu.manager.workmode.detect.ModeState
 import dev.maplesu.manager.workmode.detect.SuReadiness
 import org.junit.Assert.*
 import org.junit.Test
@@ -81,6 +82,135 @@ class HomeEnvironmentHealthProjectionTest {
         )
         assertInstalledFailure(current, raw)
         assertEquals(HomeEnvironmentFailure.BUSY, current.ultraObservationFailure)
+    }
+
+    private fun bootstrapFailure(detail: String) = state().afterEnvironmentCheck(
+        modeResolved = false, detectionComplete = true,
+        detectionFailure = "MODE_DETECT_FAILED", detectedState = ModeState.INDETERMINATE,
+        knownUltra = true, failureDetail = detail,
+    )
+
+    @Test fun aLaterBusyKeepsTheFirstFailureAndBothOriginalReceiptsInOrder() {
+        val first = "root:pipe:EACCES:13:receipt=command10,status0,effects8"
+        val busy = "MAPLESU_SDK_BUSY"
+        val current = bootstrapFailure(first).afterUltraEnvironmentHealth(
+            health(UltraEnvironmentProbe.State.Unknown, root = false, observedOwner = null, detail = busy),
+            owner, true,
+        )
+        assertInstalledFailure(current, "$first\n$busy")
+        assertEquals(HomeEnvironmentFailure.BUSY, current.ultraObservationFailure)
+        assertEquals("MODE_DETECT_FAILED", current.ultraObservationCode)
+    }
+
+    @Test fun aLaterRootFailureKeepsTheBootstrapAndHealthOriginalText() {
+        val first = "root:pipe:EACCES:13:receipt=command10,status0,effects8"
+        val receipt = "operation=probe_manager_owner_root;sdkError=ERR_READ_CHILD_ERRCODE;sdkErrorCode=11;phase=11;child=256"
+        val environment = "operation=get_maplesu_environment_state;sdkError=ERR_MODULE_NO_BOOT;sdkErrorCode=42"
+        val current = bootstrapFailure(first).afterUltraEnvironmentHealth(
+            health(UltraEnvironmentProbe.State.Unknown, root = false, detail = environment, rootDetail = receipt),
+            owner, true,
+        )
+        assertInstalledFailure(current, "$first\n$receipt\n$environment")
+        assertEquals(HomeEnvironmentFailure.FAILED, current.ultraObservationFailure)
+        assertEquals("MODE_DETECT_FAILED", current.ultraObservationCode)
+    }
+
+    @Test fun identicalRawFailureTextIsIncludedOnce() {
+        val raw = "operation=probe_manager_owner_root;sdkError=ERR_READ_CHILD_ERRCODE;sdkErrorCode=11"
+        val current = bootstrapFailure(raw).afterUltraEnvironmentHealth(
+            health(UltraEnvironmentProbe.State.Unknown, root = false, detail = raw, rootDetail = raw), owner, true,
+        )
+        assertInstalledFailure(current, raw)
+    }
+
+    @Test fun actualHealthyRootClearsTheFailureFromTheSameRound() {
+        val current = bootstrapFailure("root:pipe:EACCES:13").afterUltraEnvironmentHealth(health(), owner, true)
+        assertNull(current.ultraObservationFailure)
+        assertNull(current.ultraObservationDetail)
+        assertNull(current.ultraObservationCode)
+        assertNull(current.ultraComponentDiagnostic)
+        assertTrue(current.sdkRootAvailable)
+        assertTrue(current.showEnvironmentReady)
+    }
+
+    @Test fun pendingPresentationIsNotAnEarlierComponentFailure() {
+        val raw = "operation=probe_manager_owner_root;sdkError=ERR_READ_CHILD_ERRCODE;sdkErrorCode=11"
+        val pending = state().copy(ultraObservationFailure = HomeEnvironmentFailure.UNCONFIRMED,
+            ultraObservationDetail = "home_health_pending")
+        val current = pending.afterUltraEnvironmentHealth(
+            health(UltraEnvironmentProbe.State.Unknown, root = false, detail = raw, rootDetail = raw), owner, true,
+        )
+        assertInstalledFailure(current, raw)
+    }
+
+    @Test fun aDifferentOwnerDoesNotReceiveTheEarlierOwnersFailure() {
+        for (different in listOf(owner.copy(fullUid = owner.fullUid + 100000),
+            owner.copy(epoch = owner.epoch + 1), owner.copy(hostInstance = "another-host"))) {
+            val current = bootstrapFailure("earlier-owner-receipt").afterUltraEnvironmentHealth(
+                health(observedOwner = different, detail = "current-owner-receipt", root = false), owner, true,
+            )
+            assertFalse(current.ultraObservationDetail.orEmpty().contains("earlier-owner-receipt"))
+            assertTrue(current.ultraObservationDetail.orEmpty().contains("current-owner-receipt"))
+            assertNull(current.ultraObservationCode)
+            assertFalse(current.sdkRootAvailable)
+        }
+    }
+
+    @Test fun aChangedActivationDoesNotReceiveTheEarlierActivationsFailure() {
+        val current = bootstrapFailure("earlier-activation-receipt").afterUltraEnvironmentHealth(
+            health(detail = null, root = false), owner, false,
+        )
+        assertInstalledFailure(current, "SDK_IDENTITY_SCOPE_CHANGED")
+        assertNull(current.ultraObservationCode)
+    }
+
+    @Test fun aDisplayDiagnosticDoesNotRestoreAnyCapabilityAndIsClearedByNormalOrHiddenFacts() {
+        val failed = bootstrapFailure("root:pipe:EACCES:13").afterUltraEnvironmentHealth(
+            health(UltraEnvironmentProbe.State.Unknown, root = false, observedOwner = null, detail = "MAPLESU_SDK_BUSY"),
+            owner, true,
+        )
+        val diagnostic = HomeUltraComponentDiagnostic(ModeActivation.Unresolved, 21L, "boot-r21",
+            owner, null, failed.ultraObservationCode, requireNotNull(failed.ultraObservationDetail))
+        val current = failed.copy(ultraComponentDiagnostic = diagnostic)
+        assertFalse(current.sdkRootAvailable)
+        assertFalse(current.isRootAvailable)
+        assertFalse(current.showEnvironmentReady)
+        for (cleared in listOf(current.withUltraSafety(false, WorkMode.KSU),
+            current.withHiddenFacts(HomeHiddenFacts(true, false)), current.asLiteHiddenNotInstalled())) {
+            assertNull(cleared.ultraComponentDiagnostic)
+            assertNull(cleared.ultraObservationCode)
+            assertNull(cleared.ultraObservationDetail)
+            assertFalse(cleared.sdkRootAvailable)
+        }
+    }
+
+    @Test fun aManagerSuFailureKeepsUltraAndItsOriginalReceiptEvenWhenKernelRootWorked() {
+        val raw = "MANAGER_SU_COMMAND_FAILED;stage=management;code=-19999;receipt=command10,status0,effects8"
+        val current = state().afterUltraEnvironmentHealth(health().copy(managerSuFailureDetail = raw), owner, true)
+        assertInstalledFailure(current, raw)
+        assertEquals(HomeEnvironmentFailure.FAILED, current.ultraObservationFailure)
+        assertFalse(current.isRootAvailable)
+    }
+
+    @Test fun aManagerSuFailureIsAppendedAfterTheSameRoundsOriginalBootstrapError() {
+        val first = "root:pipe:EACCES:13:receipt=command10,status0,effects8"
+        val raw = "MANAGER_SU_COMMAND_FAILED;stage=management;code=-19999;receipt=command10,status0,effects8"
+        val current = bootstrapFailure(first).afterUltraEnvironmentHealth(
+            health().copy(managerSuFailureDetail = raw), owner, true,
+        )
+        assertInstalledFailure(current, "$first\n$raw")
+        assertEquals("MODE_DETECT_FAILED", current.ultraObservationCode)
+    }
+
+    @Test fun anActualManagerSuSuccessClearsThePreviousComponentFailure() {
+        val raw = "MANAGER_SU_COMMAND_FAILED;stage=management;code=-19999"
+        val failed = state().afterUltraEnvironmentHealth(health().copy(managerSuFailureDetail = raw), owner, true)
+        val recovered = failed.afterUltraEnvironmentHealth(health(), owner, true).mergedOver(failed)
+        assertNull(recovered.ultraObservationFailure)
+        assertNull(recovered.ultraObservationDetail)
+        assertNull(recovered.ultraObservationCode)
+        assertTrue(recovered.sdkRootAvailable)
+        assertTrue(recovered.showEnvironmentReady)
     }
 
     @Test fun runningEnvironmentWithoutRootProofStillShowsTheRootFailure() {

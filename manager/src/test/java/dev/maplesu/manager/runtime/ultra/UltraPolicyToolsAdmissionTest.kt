@@ -89,6 +89,19 @@ class UltraPolicyToolsAdmissionTest {
         assertEquals(3,calls)
     }
 
+    @Test fun deadlineIsReturnedOnceWithTheOriginalReceipt() {
+        val receipt = NativeReceipt.parse("""{"backend":"maplesu_ultra","operation":"run_root_cmd","ok":false,"sdkError":"MAPLESU_SDK_DEADLINE_EXCEEDED","sdkErrorCode":-1007,"reason":"Current request expired before submission."}""")!!
+        var calls = 0
+        var observed: NativeReceipt? = null
+        val failure = UltraPolicyBackendDeployment.prepareTools("write-once", {
+            calls++; receipt
+        }, ::decode, { observed = it })
+        assertEquals("MODULE_TOOLS_TRANSPORT:MAPLESU_SDK_DEADLINE_EXCEEDED", failure)
+        assertEquals(1, calls)
+        assertSame(receipt, observed)
+        assertEquals(-1007, observed!!.sdkErrorCode)
+    }
+
     @Test fun cancellationBeforeRetryIsRespected() {
         var calls=0
         try {

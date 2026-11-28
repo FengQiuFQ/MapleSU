@@ -169,6 +169,8 @@ object UltraEnvironmentAutoSetup {
         resumed == UltraEnvironmentUpgrade.Result.SUBMITTED -> Result(true, true, "SDK_UPGRADE_SUBMITTED")
         pendingThisBoot -> Result(false, false, "SDK_UPGRADE_PENDING")
         preparationFailure != null -> Result(resumed != null, false, preparationFailure)
+        // A failed prior-boot continuation still owns the original submission.
+        resumed != null -> Result(false, false, "SDK_UPGRADE_PENDING")
         else -> null
     }
 

@@ -2,10 +2,14 @@
 package dev.maplesu.manager.runtime.ultra
 
 import android.util.Log
+import dev.maplesu.manager.runtime.PageReadDeadline
 import java.io.ByteArrayOutputStream
+import java.io.Closeable
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.locks.ReentrantLock
 
 class UltraSuChannel(
     private val exec: SuExec = ProcessSuExec,
@@ -15,7 +19,7 @@ class UltraSuChannel(
     @Volatile
     private var discoveredPath: String? = null
 
-    private val probeLock = Any()
+    private val probeLock = ReentrantLock()
     private class RootObservation(val uid: Int?)
     @Volatile private var lastObservation: RootObservation? = null
 
@@ -29,11 +33,22 @@ class UltraSuChannel(
 
     fun rootUid(): Int? {
         val before = lastObservation
-        return synchronized(probeLock) {
+        val deadline = PageReadDeadline.limitNanos(timeoutMillis)
+        val remaining = (deadline - System.nanoTime()).coerceAtLeast(0L)
+        val acquired = try {
+            remaining > 0L && probeLock.tryLock(remaining, TimeUnit.NANOSECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            lastFailure = "EXEC_INTERRUPTED"
+            return null
+        }
+        if (!acquired) { lastFailure = "SU_TIMEOUT"; return null }
+        return try {
+            if (System.nanoTime() >= deadline) { lastFailure = "SU_TIMEOUT"; return null }
             val completed = lastObservation
             if (completed != null && completed !== before) completed.uid
-            else probeRootUid().also { lastObservation = RootObservation(it) }
-        }
+            else PageReadDeadline.onWorker(deadline) { probeRootUid() }.also { lastObservation = RootObservation(it) }
+        } finally { probeLock.unlock() }
     }
 
     private fun probeRootUid(): Int? {
@@ -54,8 +69,8 @@ class UltraSuChannel(
                 lastFailure = "SU_TIMEOUT"
                 continue
             }
-            if (result.failure != null) {
-                lastFailure = result.failure
+            if (result.failure != null || result.cleanupPending || result.cleanupFailure != null) {
+                lastFailure = result.failure ?: result.cleanupFailure ?: "PROCESS_CLEANUP_PENDING"
                 continue
             }
             val uid = SuCommands.parseUid(result.output)
@@ -82,11 +97,7 @@ class UltraSuChannel(
             discoveredPath ?: DEFAULT_SU_PATH
         }
         val result = runSafely(SuCommands.rootArgv(path, script), timeout, stdin)
-        if (result == null || result.timedOut || result.failure != null) {
-            synchronized(probeLock) {
-                if (discoveredPath == path) discoveredPath = null
-            }
-        }
+        if (result == null || !result.ok) if (discoveredPath == path) discoveredPath = null
         return result
     }
 
@@ -95,7 +106,12 @@ class UltraSuChannel(
         timeout: Long,
         stdin: String? = null,
     ): SuExecResult? = try {
-        exec.exec(argv, timeout, stdin)
+        val deadline = PageReadDeadline.limitNanos(timeout)
+        val remaining = (deadline - System.nanoTime()).coerceAtLeast(0L)
+        if (remaining == 0L) SuExecResult(-1, "", timedOut = true)
+        else PageReadDeadline.onWorker(deadline) {
+            exec.exec(argv, TimeUnit.NANOSECONDS.toMillis(remaining).coerceAtLeast(1L), stdin)
+        }
     } catch (error: Throwable) {
         // 日志本身绝不允许把「su 探测」变成异常（主机单测里 Log 是 stub，会抛）。
         runCatching { Log.w(TAG, "su exec failed: ${error.javaClass.simpleName}") }
@@ -117,8 +133,10 @@ data class SuExecResult(
     val output: String,
     val timedOut: Boolean = false,
     val failure: String? = null,
+    val cleanupPending: Boolean = false,
+    val cleanupFailure: String? = null,
 ) {
-    val ok: Boolean get() = failure == null && !timedOut && exitCode == 0
+    val ok: Boolean get() = failure == null && !timedOut && exitCode == 0 && !cleanupPending && cleanupFailure == null
 }
 
 /** 可注入的 su 进程执行器（主机测试造假；生产用 [ProcessSuExec]）。 */
@@ -129,72 +147,87 @@ fun interface SuExec {
 /** 真实进程执行（`ProcessBuilder` + 合并 stderr + 超时强杀）。 */
 object ProcessSuExec : SuExec {
     private val processSlot = Semaphore(1, true)
+    private val pendingCleanup = AtomicReference<OwnedProcess?>()
 
-    override fun exec(argv: List<String>, timeoutMillis: Long, stdin: String?): SuExecResult {
+    override fun exec(argv: List<String>, timeoutMillis: Long, stdin: String?): SuExecResult =
+        exec(argv, timeoutMillis, stdin) { ProcessBuilder(argv).redirectErrorStream(true).start() }
+
+    internal fun exec(argv: List<String>, timeoutMillis: Long, stdin: String?, startProcess: () -> Process): SuExecResult {
         if (argv.isEmpty()) return SuExecResult(-1, "", failure = "EMPTY_ARGV")
-        val started = System.nanoTime()
-        val budget = TimeUnit.MILLISECONDS.toNanos(timeoutMillis.coerceAtLeast(1L))
+        val deadline = PageReadDeadline.limitNanos(timeoutMillis)
+        if (remaining(deadline) == 0L) return SuExecResult(-1, "", timedOut = true)
+        pendingCleanup.get()?.resume(deadline)
         val acquired = try {
-            processSlot.tryAcquire(budget, TimeUnit.NANOSECONDS)
+            processSlot.tryAcquire(remaining(deadline), TimeUnit.NANOSECONDS)
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
             return SuExecResult(-1, "", failure = "EXEC_INTERRUPTED")
         }
         if (!acquired) return SuExecResult(-1, "", timedOut = true)
+        var owner: OwnedProcess? = null
         return try {
-            if (System.nanoTime() - started >= budget) SuExecResult(-1, "", timedOut = true)
-            else executeOwned(argv, stdin, started, budget)
+            if (remaining(deadline) == 0L) return SuExecResult(-1, "", timedOut = true)
+            val process = try {
+                startProcess()
+            } catch (error: Throwable) {
+                val errno = Regex("\\berror=([0-9]{1,4})\\b").find(error.message.orEmpty())?.groupValues?.get(1)
+                return SuExecResult(-1, "", failure = "START_FAILED:${error.javaClass.simpleName}" +
+                    (errno?.let { ":errno=$it" } ?: ""))
+            }
+            val owned = OwnedProcess(process)
+            owner = owned
+            executeOwned(owned, stdin, deadline)
         } finally {
-            processSlot.release()
+            if (owner == null) processSlot.release()
         }
     }
 
-    private fun executeOwned(argv: List<String>, stdin: String?, started: Long, budget: Long): SuExecResult {
-        val process = try {
-            ProcessBuilder(argv).redirectErrorStream(true).start()
-        } catch (error: Throwable) {
-            // Preserve errno without logging argv, commands or private helper paths.
-            val errno = Regex("\\berror=([0-9]{1,4})\\b").find(error.message.orEmpty())?.groupValues?.get(1)
-            return SuExecResult(-1, "", failure = "START_FAILED:${error.javaClass.simpleName}" +
-                (errno?.let { ":errno=$it" } ?: ""))
-        }
+    private fun executeOwned(owner: OwnedProcess, stdin: String?, deadline: Long): SuExecResult {
+        val process = owner.process
         val buffer = ByteArrayOutputStream()
         val inputFailure = AtomicReference<Throwable?>()
         val outputFailure = AtomicReference<Throwable?>()
-        val reader = Thread {
-            try {
-                process.inputStream.use { it.copyTo(buffer) }
-            } catch (error: Throwable) {
-                outputFailure.set(error)
-            }
-        }.apply {
-            name = "maplesu-ultra-su-reader"
-            isDaemon = true
-        }
-        val writer = Thread {
-            try {
-                process.outputStream.use { stream ->
-                    if (stdin != null) stream.write(stdin.toByteArray(Charsets.UTF_8))
+        var reader: Thread? = null
+        var writer: Thread? = null
+        val result = try {
+            val readerThread = Thread {
+                try {
+                    owner.output.stream.copyTo(buffer)
+                } catch (error: Throwable) {
+                    outputFailure.set(error)
+                } finally {
+                    owner.output.close(owner.failure)
+                    owner.reading.set(false)
+                    owner.complete()
                 }
-            } catch (error: Throwable) {
-                inputFailure.set(error)
-            }
-        }.apply {
-            name = "maplesu-ultra-su-writer"
-            isDaemon = true
-        }
-        return try {
-            reader.start()
-            writer.start()
-            val remaining = (budget - (System.nanoTime() - started)).coerceAtLeast(0L)
-            val finished = process.waitFor(remaining, TimeUnit.NANOSECONDS)
+            }.apply {
+                name = "maplesu-ultra-su-reader"
+                isDaemon = true
+            }.also { reader = it }
+            val writerThread = Thread {
+                try {
+                    if (stdin != null) owner.input.stream.write(stdin.toByteArray(Charsets.UTF_8))
+                } catch (error: Throwable) {
+                    inputFailure.set(error)
+                } finally {
+                    owner.input.close(owner.failure)
+                    owner.writing.set(false)
+                    owner.complete()
+                }
+            }.apply {
+                name = "maplesu-ultra-su-writer"
+                isDaemon = true
+            }.also { writer = it }
+            startIo(readerThread, owner.reading)
+            startIo(writerThread, owner.writing)
+            val finished = process.waitFor(remaining(deadline), TimeUnit.NANOSECONDS)
             if (!finished) {
                 SuExecResult(-1, buffer.toString(Charsets.UTF_8.name()), timedOut = true)
             } else {
-                writer.join(500)
-                reader.join(500)
+                joinUntil(writerThread, deadline)
+                joinUntil(readerThread, deadline)
                 val failure = when {
-                    writer.isAlive || reader.isAlive -> "PROCESS_IO_INCOMPLETE"
+                    writerThread.isAlive || readerThread.isAlive -> "PROCESS_IO_INCOMPLETE"
                     inputFailure.get() != null -> "STDIN_FAILED:${inputFailure.get()!!.javaClass.simpleName}"
                     outputFailure.get() != null -> "STDOUT_FAILED:${outputFailure.get()!!.javaClass.simpleName}"
                     else -> null
@@ -207,33 +240,93 @@ object ProcessSuExec : SuExec {
         } catch (error: Throwable) {
             SuExecResult(-1, "", failure = "EXEC_FAILED:${error.javaClass.simpleName}")
         } finally {
-            closeOwnedProcess(process, reader, writer)
+            owner.beginCleanup(deadline)
+            var interrupted = Thread.interrupted()
+            try {
+                owner.worker?.let { joinUntil(it, deadline) }
+                writer?.let { joinUntil(it, deadline) }
+                reader?.let { joinUntil(it, deadline) }
+            } catch (_: InterruptedException) {
+                interrupted = true
+            } finally { if (interrupted) Thread.currentThread().interrupt() }
+        }
+        owner.complete()
+        val cleanupPending = !owner.released.get()
+        val cleanupFailure = owner.failure.get()
+        return result.copy(failure = result.failure ?: when {
+            cleanupFailure != null -> "PROCESS_CLEANUP_FAILED"
+            cleanupPending -> "PROCESS_CLEANUP_PENDING"
+            else -> null
+        }, cleanupPending = cleanupPending, cleanupFailure = cleanupFailure)
+    }
+
+    private fun remaining(deadline: Long): Long = (deadline - System.nanoTime()).coerceAtLeast(0L)
+
+    private fun joinUntil(thread: Thread, deadline: Long) {
+        val nanos = remaining(deadline)
+        if (nanos > 0L) thread.join(TimeUnit.NANOSECONDS.toMillis(nanos), (nanos % 1_000_000L).toInt())
+    }
+
+    private fun startIo(thread: Thread, running: AtomicBoolean) {
+        running.set(true)
+        try { thread.start() } catch (error: Throwable) { running.set(false); throw error }
+    }
+
+    private class PipeClose<T : Closeable>(val stream: T, private val name: String) {
+        private val closing = AtomicBoolean(false)
+        @Volatile var closed = false
+        fun close(failure: AtomicReference<String?>) {
+            if (closed || !closing.compareAndSet(false, true)) return
+            try { stream.close(); closed = true }
+            catch (error: Throwable) { failure.compareAndSet(null, "${name}_CLOSE_FAILED:${error.javaClass.simpleName}") }
+            finally { closing.set(false) }
         }
     }
 
-    private fun closeOwnedProcess(process: Process, reader: Thread, writer: Thread) {
-        // Closing a pipe held by a descendant can block. Keep cleanup bounded for the caller;
-        // this executor owns the direct child, not the SDK's independent module processes.
-        val closer = Thread {
-            runCatching { if (process.isAlive) process.destroyForcibly() }
-            runCatching { process.waitFor(500, TimeUnit.MILLISECONDS) }
-            runCatching { process.outputStream.close() }
-            runCatching { process.inputStream.close() }
-            runCatching { process.errorStream.close() }
-        }.apply {
-            name = "maplesu-ultra-su-cleanup"
-            isDaemon = true
-            start()
+    /** A pending close keeps the one process slot until its actual resources are released. */
+    private class OwnedProcess(val process: Process) {
+        val input = PipeClose(process.outputStream, "STDIN")
+        val output = PipeClose(process.inputStream, "STDOUT")
+        private val error = PipeClose(process.errorStream, "STDERR")
+        val reading = AtomicBoolean(false)
+        val writing = AtomicBoolean(false)
+        val failure = AtomicReference<String?>()
+        val released = AtomicBoolean(false)
+        private val cleaning = AtomicBoolean(false)
+        @Volatile var worker: Thread? = null
+
+        fun complete() {
+            if (input.closed && output.closed && error.closed && !reading.get() && !writing.get() &&
+                !process.isAlive && released.compareAndSet(false, true)) {
+                pendingCleanup.compareAndSet(this, null)
+                processSlot.release()
+            }
         }
-        var interrupted = Thread.interrupted()
-        try {
-            closer.join(750)
-            writer.join(100)
-            reader.join(100)
-        } catch (_: InterruptedException) {
-            interrupted = true
-        } finally {
-            if (interrupted) Thread.currentThread().interrupt()
+
+        fun beginCleanup(deadline: Long) {
+            pendingCleanup.set(this)
+            resume(deadline)
+        }
+
+        fun resume(deadline: Long) {
+            complete()
+            if (released.get() || !cleaning.compareAndSet(false, true)) return
+            try {
+                worker = Thread {
+                    try {
+                        try { if (process.isAlive) process.destroyForcibly() }
+                        catch (error: Throwable) { failure.compareAndSet(null, "DESTROY_FAILED:${error.javaClass.simpleName}") }
+                        try { process.waitFor(remaining(deadline), TimeUnit.NANOSECONDS) }
+                        catch (error: Throwable) { failure.compareAndSet(null, "WAIT_FAILED:${error.javaClass.simpleName}") }
+                        input.close(failure)
+                        output.close(failure)
+                        error.close(failure)
+                    } finally { cleaning.set(false); complete() }
+                }.apply { name = "maplesu-ultra-su-cleanup"; isDaemon = true; start() }
+            } catch (error: Throwable) {
+                cleaning.set(false)
+                failure.compareAndSet(null, "CLEANUP_START_FAILED:${error.javaClass.simpleName}")
+            }
         }
     }
 }

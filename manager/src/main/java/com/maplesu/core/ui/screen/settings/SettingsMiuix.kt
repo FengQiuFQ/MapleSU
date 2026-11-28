@@ -47,6 +47,7 @@ import androidx.compose.material.icons.rounded.SystemUpdateAlt
 import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -127,6 +128,11 @@ fun SettingPagerMiuix(
         if (appearanceOnly || fullUltraPanel != null) null else uiState.ultraComponentDiagnostic,
     )
     val ultraPanel = fullUltraPanel ?: diagnosticPanel
+    val homeDiagnostic = rememberHomeUltraComponentDiagnostic(
+        enabled = !appearanceOnly && !uiState.hiddenMasked,
+    )
+    LaunchedEffect(ultraPanel, homeDiagnostic) { ultraPanel?.updateHomeDiagnostic(homeDiagnostic) }
+    val standaloneDiagnostic = homeDiagnostic.takeIf { ultraPanel == null }
     val savedInstallFailure = rememberSavedUltraInstallFailureDiagnostic(
         enabled = !appearanceOnly && ultraPanel == null && modePolicy.mode == null && !uiState.hiddenMasked,
     )
@@ -225,6 +231,13 @@ fun SettingPagerMiuix(
                     item(key = "ultra-env") {
                         Box(Modifier.animateItem(fadeInSpec = tween(120), placementSpec = tween(160), fadeOutSpec = null)) {
                             UltraEnvironmentSectionMiuix(panel, uiState.installedKernelUpdateRequired)
+                        }
+                    }
+                }
+                standaloneDiagnostic?.let { detail ->
+                    item(key = "ultra-component-diagnostic") {
+                        SettingsCardMiuix {
+                            HomeUltraComponentDiagnosticMiuix(detail)
                         }
                     }
                 }

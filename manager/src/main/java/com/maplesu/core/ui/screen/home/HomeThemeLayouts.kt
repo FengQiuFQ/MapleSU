@@ -19,6 +19,7 @@ import com.maplesu.core.ui.util.AppearancePreferences
 import com.maplesu.core.ui.util.AppearancePrefsPolicy
 import com.maplesu.core.ui.util.WallpaperPrefs
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.Alignment
 import com.maplesu.core.R
@@ -34,6 +35,10 @@ internal data class StatusThemeArt(
     val photo: ThemePhoto? = null, val foreground: Color = Color.White,
 )
 internal val LocalPreparedStatusThemeArt = staticCompositionLocalOf<StatusThemeArt?> { null }
+
+/** Preserve the original square large artwork; compact cards keep their existing height. */
+internal fun homeStatusCardMinHeight(width: Dp, large: Boolean): Dp =
+    if (large) width / com.maplesu.core.ui.util.StatusDecoration.CARD_ASPECT_RATIO else 112.dp
 
 @Composable
 internal fun statusThemeArt(): StatusThemeArt {
@@ -90,9 +95,6 @@ internal fun homeInstalledStatusTitle(state: HomeUiState): String {
 
 @Composable
 internal fun homeInstalledStatusSummary(state: HomeUiState, ultraVersionLabel: String? = null): String {
-    if (state.showInstalledUnready) {
-        return stringResource(R.string.home_environment_installed_unready_summary)
-    }
     val versionLabel = if (state.ultraBrandVisible) {
         val ultraName = stringResource(R.string.work_mode_lite)
         ultraVersionLabel?.trim()?.takeIf { it.isNotEmpty() && it != ultraName }
@@ -100,6 +102,7 @@ internal fun homeInstalledStatusSummary(state: HomeUiState, ultraVersionLabel: S
         state.kernelUAPIVersion?.let { stringResource(R.string.maplesu_backend_version, it) }
     }
     return if (versionLabel != null) stringResource(R.string.home_working_version, versionLabel)
+        else if (state.showInstalledUnready) stringResource(R.string.home_environment_installed_unready_summary)
         else stringResource(R.string.home_environment_cached_title)
 }
 
@@ -126,12 +129,16 @@ internal fun ThemeHomeStatus(state: HomeUiState, actions: HomeActions, modifier:
     CompositionLocalProvider(LocalPreparedStatusThemeArt provides art,
         com.maplesu.core.ui.util.LocalPreparedStatusDecoration provides decoration) {
         if (layout != ThemeHomeLayout.Three || !state.showInstalledStatus) {
-            Box(modifier.testTag("home-original-status")) { status() }
+            Column(modifier.testTag("home-original-status")) {
+                status()
+                EnvironmentRefreshAction(state.environmentChecking || state.manualEnvironmentChecking, actions.onEnvironmentRetry)
+            }
         } else {
-            // Match the reference grid: a square hero and two equal tiles sharing its height.
+            // Keep the square proportion while allowing larger text to grow the whole row.
             BoxWithConstraints(modifier.fillMaxWidth().testTag("home-three")) {
                 Column {
-                Row(Modifier.fillMaxWidth().height((this@BoxWithConstraints.maxWidth-12.dp)/2),
+                Row(Modifier.fillMaxWidth().heightIn(min=(this@BoxWithConstraints.maxWidth-12.dp)/2)
+                    .height(IntrinsicSize.Min),
                     horizontalArrangement=Arrangement.spacedBy(12.dp)) {
                     ThemeThreeStatus(state,actions,Modifier.weight(1f).fillMaxHeight())
                     val counts = LocalThemeHomeCounts.current
@@ -153,18 +160,20 @@ internal fun ThemeHomeStatus(state: HomeUiState, actions: HomeActions, modifier:
 @Composable
 internal fun EnvironmentRefreshAction(checking: Boolean, onRetry: () -> Unit) {
     Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)
-        .testTag("home-environment-footer"), horizontalArrangement = Arrangement.End,
+        .testTag("home-environment-footer"), horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
         verticalAlignment = Alignment.CenterVertically) {
         val label = stringResource(if (checking) R.string.home_status_checking else R.string.home_environment_check_retry)
         when (LocalUiMode.current) {
             UiMode.Miuix -> {
                 if (checking) top.yukonga.miuix.kmp.basic.InfiniteProgressIndicator(
                     color = top.yukonga.miuix.kmp.theme.MiuixTheme.colorScheme.onBackground, size = 18.dp)
-                top.yukonga.miuix.kmp.basic.TextButton(text = label, onClick = onRetry, enabled = !checking)
+                top.yukonga.miuix.kmp.basic.TextButton(text = label, onClick = onRetry, enabled = !checking,
+                    modifier = Modifier.heightIn(min = 48.dp))
             }
             UiMode.Material -> {
                 if (checking) androidx.compose.material3.CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
-                androidx.compose.material3.TextButton(onClick = onRetry, enabled = !checking) {
+                androidx.compose.material3.TextButton(onClick = onRetry, enabled = !checking,
+                    modifier = Modifier.heightIn(min = 48.dp)) {
                     androidx.compose.material3.Text(label)
                 }
             }
@@ -176,10 +185,10 @@ internal fun EnvironmentRefreshAction(checking: Boolean, onRetry: () -> Unit) {
 private fun ThemeCountTile(label: String, count: Int?, icon: androidx.compose.ui.graphics.vector.ImageVector,
     modifier: Modifier) {
     val content: @Composable () -> Unit = {
-        Row(Modifier.fillMaxSize().padding(horizontal=18.dp,vertical=12.dp),verticalAlignment=Alignment.CenterVertically,
-            horizontalArrangement=Arrangement.spacedBy(16.dp)) {
+        Row(Modifier.fillMaxSize().padding(horizontal=16.dp,vertical=12.dp),verticalAlignment=Alignment.CenterVertically,
+            horizontalArrangement=Arrangement.spacedBy(12.dp)) {
             HomeThemeIcon(icon,Modifier.size(20.dp))
-            Column(verticalArrangement=Arrangement.spacedBy(4.dp)) {
+            Column(Modifier.weight(1f),verticalArrangement=Arrangement.spacedBy(4.dp)) {
                 HomeTileText(label,secondary=true)
                 HomeTileText(count?.toString() ?: "—",title=true)
             }
@@ -270,11 +279,11 @@ private fun HomeTileText(text: String, title: Boolean = false, secondary: Boolea
         UiMode.Miuix -> top.yukonga.miuix.kmp.basic.Text(text,
             style=if (title) top.yukonga.miuix.kmp.theme.MiuixTheme.textStyles.title3 else top.yukonga.miuix.kmp.theme.MiuixTheme.textStyles.body2,
             color=LocalThemePhotoContent.current ?: if (secondary) top.yukonga.miuix.kmp.theme.MiuixTheme.colorScheme.onSurfaceVariantSummary else top.yukonga.miuix.kmp.theme.MiuixTheme.colorScheme.onSurface,
-            maxLines=if (secondary) 1 else Int.MAX_VALUE,overflow=TextOverflow.Ellipsis)
+            overflow=TextOverflow.Ellipsis)
         UiMode.Material -> androidx.compose.material3.Text(text,
             style=if (title) androidx.compose.material3.MaterialTheme.typography.titleLarge else androidx.compose.material3.MaterialTheme.typography.bodyMedium,
             color=LocalThemePhotoContent.current ?: if (secondary) androidx.compose.material3.MaterialTheme.colorScheme.onSurfaceVariant else androidx.compose.material3.MaterialTheme.colorScheme.onSurface,
-            maxLines=if (secondary) 1 else Int.MAX_VALUE,overflow=TextOverflow.Ellipsis)
+            overflow=TextOverflow.Ellipsis)
     }
 }
 

@@ -23,16 +23,7 @@ internal object UltraBugreportDiagnostics {
             "Package-list readback and Manager-only su probe; not a target-app execution proof.\n",
         )
         fun record(label: String, read: () -> NativeReceipt): NativeReceipt? =
-            runCatching {
-                var receipt = read()
-                var retries = 0
-                while (receipt.sdkError == "MAPLESU_SDK_BUSY" && retries < 2) {
-                    Thread.sleep(150)
-                    retries++
-                    receipt = read()
-                }
-                receipt
-            }.fold(
+            runCatching(read).fold(
                 onSuccess = { receipt ->
                     report.append("$label: ok=${receipt.succeeded} sdkError=${receipt.sdkError} sdkErrorCode=${receipt.sdkErrorCode}\n")
                     receipt.obj("rootCommand")?.let { root ->

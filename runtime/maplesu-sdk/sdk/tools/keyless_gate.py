@@ -5,6 +5,71 @@ import re
 import ast
 
 
+EXPLICIT_LEGACY_SOURCE = "sdk/src/maplesu/compat/keyed_exports_legacy_abi.cpp"
+EXPLICIT_LEGACY_MEMBER = {"idx": 53, "name": "maplesu_installer.o"}
+EXPLICIT_LEGACY_CONSUMER = "sdk/tools/explicit_legacy_public_abi.cpp"
+EXPLICIT_LEGACY_INCLUDE = "maintenance/freeze/freeze-maplesu-pro-5.2.0-su-uid-isolation-20261114-20261114/include"
+
+
+def explicit_legacy_abi_problems(contract: dict, *, archive_providers: dict,
+                                 adapter_definitions: dict, consumer_references: dict,
+                                 symbol_signatures: dict, keyless_required) -> list[str]:
+    """Check the measured explicit adapter; this never authorizes a keyless dependency."""
+    rows = contract.get("symbols") or []
+    symbols = [row.get("symbol") for row in rows]
+    signatures = [row.get("signature") for row in rows]
+    problems = []
+    if (contract.get("schema") != "maplesu-sdk-explicit-legacy-contract/1" or
+            contract.get("provider_member") != EXPLICIT_LEGACY_MEMBER or
+            contract.get("provider_source") != EXPLICIT_LEGACY_SOURCE or
+            contract.get("consumer_source") != EXPLICIT_LEGACY_CONSUMER or
+            contract.get("historical_include") != EXPLICIT_LEGACY_INCLUDE or
+            len(symbols) != 35 or len(set(symbols)) != 35 or
+            len(set(signatures)) != 35 or not all(symbols) or not all(signatures)):
+        return ["invalid explicit legacy ABI contract"]
+    expected = set(symbols)
+    if not set(RETIRED_SYMBOLS) <= expected:
+        problems.append("explicit legacy ABI contract omits historical exports")
+    if set(archive_providers) != expected:
+        problems.append("explicit legacy archive provider coverage differs")
+    for symbol in symbols:
+        if archive_providers.get(symbol) != [{"member": EXPLICIT_LEGACY_MEMBER["name"], "kind": "T"}]:
+            problems.append("explicit legacy export requires one strong definition in m053: " + symbol)
+    for row in rows:
+        if symbol_signatures.get(row["symbol"]) != row["signature"]:
+            problems.append("explicit legacy exact signature differs: " + row["symbol"])
+    if set(adapter_definitions) != {"arm64", "armv7"} or set(consumer_references) != {"arm64", "armv7"}:
+        problems.append("explicit legacy ABI requires both ARM architectures")
+    for abi in ("arm64", "armv7"):
+        definitions = adapter_definitions.get(abi) or []
+        if (len(definitions) != 35 or
+                {row.get("symbol") for row in definitions} != expected or
+                any(row.get("kind") != "T" for row in definitions)):
+            problems.append("explicit legacy adapter strong definitions differ: " + abi)
+        references = consumer_references.get(abi) or {}
+        if set(references) != {"original", "current"} or any(
+                set(references.get(kind) or []) != expected for kind in ("original", "current")):
+            problems.append("explicit legacy original/current header references differ: " + abi)
+    problems += ["explicit legacy API required by keyless public API: " + symbol
+                 for symbol in sorted(expected.intersection(keyless_required))]
+    return problems
+
+
+def archive_legacy_providers(nm_output: str, contract: dict) -> dict:
+    """Preserve duplicate archive definitions and their actual member names."""
+    result = {row["symbol"]: [] for row in contract["symbols"]}
+    for line in nm_output.splitlines():
+        match = re.fullmatch(r".+\[([^\]]+)\]: (\S+) (\S)(?: .*)?", line.strip())
+        if not match:
+            if line.strip():
+                raise ValueError("invalid archive symbol provenance: " + line)
+            continue
+        member, symbol, kind = match.groups()
+        if symbol in result:
+            result[symbol].append(dict(member=member, kind=kind))
+    return result
+
+
 # The explicit legacy TLS adapter remains linkable; current public APIs must not require it.
 LEGACY_CREDENTIAL_SYMBOLS = (
     "__set_current_module_root_key_hd04aBTnbSZlTRP7S4mQpIeVvr2ssGjW",
@@ -81,7 +146,17 @@ def legacy_credential_problems(required_symbols) -> list[str]:
 
 
 def retired_api_problems(raw_symbols: list[str], signatures: list[str],
-                         required_signatures: list[str]) -> list[str]:
+                         required_signatures: list[str], *,
+                         explicit_legacy: dict[str, str] | None = None) -> list[str]:
+    # Callers may supply only the exact pairs whose actual source/member/ARM
+    # contract was validated. The default remains the historical strict gate.
+    if explicit_legacy:
+        if len(raw_symbols) != len(signatures):
+            return ["explicit legacy signature capture differs"]
+        current = [(symbol, signature) for symbol, signature in zip(raw_symbols, signatures)
+                   if explicit_legacy.get(symbol) != signature]
+        raw_symbols = [symbol for symbol, _ in current]
+        signatures = [signature for _, signature in current]
     problems = ["retired RootKey symbol: " + symbol for symbol in raw_symbols
                 if symbol in RETIRED_SYMBOLS]
     expected = {}

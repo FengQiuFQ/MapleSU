@@ -3,6 +3,7 @@ package dev.maplesu.manager.runtime
 import android.content.Context
 import android.util.Log
 import dev.maplesu.manager.runtime.authorization.DirectPolicy
+import dev.maplesu.manager.runtime.authorization.ManagerAuthorizations
 import dev.maplesu.manager.runtime.ultra.UltraEnvironmentProbe
 import dev.maplesu.manager.runtime.ultra.UltraSdkCredentials
 import dev.maplesu.manager.workmode.superuser.ImplantPreparation
@@ -288,9 +289,21 @@ fun statesFor(
     // Ultra uses its durable fullUID authority and kernel SU entry. Its list does not
     // deploy a traditional client or start PATH probes for display reads.
     if (UltraEnvironmentProbe.usesUltraBackend(context)) {
-        val entryReady = !dev.maplesu.manager.runtime.ultra.UltraAuthorization.isDeliveryIncomplete()
-        return identities.mapValues { (_, isGranted) ->
-            managerSuState(isGranted, stale = false, pending = false, entryReady = entryReady)
+        if (identities.none { it.value }) return identities.mapValues { (name, _) ->
+            managerSuState(false, name in stale, pending = false, entryReady = false)
+        }
+        val read = ManagerAuthorizations.currentDeliveryRead(context)
+        val states = identities.mapValues { (packageName, isGranted) ->
+            val uid = if (isGranted) runCatching { context.packageManager.getApplicationInfo(packageName, 0).uid }.getOrNull() else null
+            val members = uid?.let { runCatching { context.packageManager.getPackagesForUid(it).orEmpty().toSet() }.getOrNull() }
+            val applied = uid != null && packageName in members.orEmpty() &&
+                members.orEmpty().any { read.confirms(uid, it, isGranted) }
+            managerSuState(isGranted, stale = packageName in stale,
+                pending = isGranted && read.isCurrent() && read.uidProfiles?.ok == true && uid != null && !applied,
+                entryReady = applied && read.entryConfirmed == true)
+        }
+        return if (read.isCurrent()) states else identities.mapValues { (name, granted) ->
+            managerSuState(granted, name in stale, pending = false, entryReady = false)
         }
     }
     val application = context.applicationContext

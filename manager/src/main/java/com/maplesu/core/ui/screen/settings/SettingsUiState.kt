@@ -1,6 +1,10 @@
 package com.maplesu.core.ui.screen.settings
 
 import androidx.compose.runtime.Immutable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import com.maplesu.core.ui.screen.home.HomeUltraComponentDiagnostic
 import com.materialkolor.PaletteStyle
 import com.materialkolor.dynamiccolor.ColorSpec
 import com.maplesu.core.ui.UiMode
@@ -8,8 +12,19 @@ import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 
-/** Explicit retries are consumed by the shared environment-check session. */
+/** One navigation request and explicit retries; neither grants a runtime capability. */
 internal object UltraComponentDiagnosticRequests {
+    var clickedDiagnostic by mutableStateOf<HomeUltraComponentDiagnostic?>(null)
+        private set
+
+    fun open(diagnostic: HomeUltraComponentDiagnostic?) {
+        clickedDiagnostic = diagnostic
+    }
+
+    fun clear(diagnostic: HomeUltraComponentDiagnostic? = clickedDiagnostic) {
+        if (clickedDiagnostic === diagnostic) clickedDiagnostic = null
+    }
+
     private val requests = MutableSharedFlow<dev.maplesu.manager.runtime.ultra.UltraEnvironmentProbe.Snapshot>(extraBufferCapacity = 1,
         onBufferOverflow = BufferOverflow.DROP_OLDEST)
     val retries = requests.asSharedFlow()

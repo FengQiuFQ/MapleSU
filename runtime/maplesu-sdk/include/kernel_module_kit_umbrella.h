@@ -51,3 +51,4 @@
 #include "maplesu_sdk/maplesu_log.h"
 #include "maplesu_sdk/maplesu_test.h"
 #include "maplesu_sdk/features/maplesu_module_webui_loader.h"
+#include "maplesu/compat/legacy_sdk_abi.h"

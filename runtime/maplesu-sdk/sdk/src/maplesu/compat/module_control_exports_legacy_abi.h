@@ -1,2 +1,2 @@
 #pragma once
-// The former Key-bearing binary exports require rebuilding against the current SDK.
+// Keyed 5.2.0 exports are composed from keyed_exports_legacy_abi.cpp in m053.

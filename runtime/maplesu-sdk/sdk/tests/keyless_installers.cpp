@@ -33,6 +33,18 @@ void put(const fs::path& path, const char* text) { std::ofstream(path) << text; 
 void equal(const fs::path& path, const unsigned char* bytes, size_t size) {
     assert(read(path) == std::string(reinterpret_cast<const char*>(bytes), size));
 }
+void bootstrap_contract(const fs::path& path) {
+    struct stat st {};
+    assert(lstat(path.c_str(), &st) == 0);
+    std::fprintf(stderr, "bootstrap contract mode=%04o uid=%u nlink=%lu\n",
+        st.st_mode & 07777, st.st_uid, static_cast<unsigned long>(st.st_nlink));
+    assert(S_ISREG(st.st_mode) && st.st_uid == 0 && st.st_nlink == 1);
+    assert((st.st_mode & 07777) == 0700);
+    constexpr char context[] = "u:object_r:kernel:s0";
+    char actual[sizeof(context)] {};
+    assert(getxattr(path.c_str(), "user.maplesu.selinux", actual, sizeof(actual)) == sizeof(context));
+    assert(std::memcmp(actual, context, sizeof(context)) == 0);
+}
 }
 namespace default_modules::module_root {
 KModErr set_current_root(bool enabled) { assert(enabled); return root_error; }
@@ -85,8 +97,10 @@ int main() {
         const auto path = std::string(item.suffix) == "init" ? kernel_path + item.suffix : system_path + item.suffix;
         assert(item.run() == KModErr::OK);
         equal(path, item.bytes, item.size); ++checks;
+        if (std::string(item.suffix) == "init") bootstrap_contract(path);
         assert(item.run() == KModErr::OK);
         equal(path, item.bytes, item.size); ++checks;
+        if (std::string(item.suffix) == "init") bootstrap_contract(path);
         put(path, "old-published");
         root_error = KModErr::ERR_MODULE_ROOT_KEY;
         assert(item.run() == root_error && read(path) == "old-published"); ++checks;
@@ -99,12 +113,18 @@ int main() {
         rename_failure = false;
         assert(item.run() == KModErr::OK);
         equal(path, item.bytes, item.size); ++checks;
+        if (std::string(item.suffix) == "init") bootstrap_contract(path);
         for (const auto& dir : {kernel_path, system_path, system_path + "modules/"})
             for (const auto& file : fs::directory_iterator(dir))
                 assert(file.path().filename().string().find(".maplesu-exec-") != 0);
     }
     equal(kernel_path + "su", su_data, sizeof(su_data));
     assert(canonical_calls == 3); ++checks;
+    // Refresh must also replace a legacy 0777 helper with the gateway's private executable.
+    assert(chmod((kernel_path + "init").c_str(), 0777) == 0);
+    assert(maplesu::install::refresh_environment_bootstrap() == KModErr::OK);
+    equal(kernel_path + "init", autorun_bootstrap_file_data, sizeof(autorun_bootstrap_file_data));
+    bootstrap_contract(kernel_path + "init"); ++checks;
     // Explicitly selected public location still passes the real publisher's
     // owner/type checks; a symlink never becomes authority or gets followed.
     const auto loader = system_path + "modules/webui_loader";

@@ -9,6 +9,36 @@ class HomeRecoveryRefreshContractTest {
     private fun source(path: String): String = listOf(File("src/main/java/$path"), File("manager/src/main/java/$path"))
         .first { it.isFile }.readText().replace("\r\n", "\n")
 
+    @Test fun theCurrentBootstrapFailureKeepsItsFullDetailForTheHomeConsumer() {
+        val viewModel = source("com/maplesu/core/ui/viewmodel/HomeViewModel.kt")
+        val collection = viewModel.substringAfter("private suspend fun collectEnvironment(")
+            .substringBefore("private suspend fun refreshInformation(")
+        assertTrue(collection.contains("val detectionFailure = ModeRuntime.detectionFailure.takeIf { revision != publishedDetectionRevision }"))
+        assertTrue(collection.contains("failureDetail = ModeRuntime.detectionFailureDetail.takeIf { detectionFailure != null } ?: detectionFailure"))
+        assertTrue(collection.contains("detectionFailure = detectionFailure,"))
+        val completion = viewModel.substringAfter("private suspend fun finishEnvironmentSession(")
+            .substringBefore("private suspend fun checkEnvironmentPresence(")
+        assertTrue(completion.contains("publishState(state, owner, candidate)?.let { publishedDetectionRevision = it }"))
+    }
+
+    @Test fun theFinalFailureDiagnosticChecksItsScopeWithoutDemandingARootSuccess() {
+        val viewModel = source("com/maplesu/core/ui/viewmodel/HomeViewModel.kt")
+        val completion = viewModel.substringAfter("private suspend fun finishEnvironmentSession(")
+            .substringBefore("private suspend fun checkEnvironmentPresence(")
+        val diagnostic = completion.substringAfter("val diagnostic = settledState.ultraObservationDetail")
+        assertTrue(diagnostic.contains("failureCode = settledState.ultraObservationCode"))
+        assertTrue(diagnostic.contains("detail = detail"))
+        val publication = viewModel.substringAfter("private suspend fun publishState(")
+            .substringBefore("fun refreshEntryFacts()")
+        assertTrue(publication.contains("state.afterFinalEnvironmentScopeCheck("))
+        assertTrue(publication.contains("BootIdSourceAdapter.read()"))
+        assertTrue(publication.contains("UltraEnvironmentProbe.currentSnapshot(ksuApp)"))
+        assertFalse(publication.contains("current.rootAvailable"))
+        assertFalse(publication.contains("observeFresh("))
+        assertTrue(publication.indexOf("publishMutex.withLock") < publication.indexOf("state.afterFinalEnvironmentScopeCheck("))
+        assertTrue(publication.indexOf("state.afterFinalEnvironmentScopeCheck(") < publication.indexOf("_uiState.update"))
+    }
+
     @Test fun aClaimedRefreshObservesExistingDetectionWithoutStartingRecovery() {
         val viewModel = source("com/maplesu/core/ui/viewmodel/HomeViewModel.kt")
         val refresh = viewModel.substringAfter("fun refresh() {")
@@ -21,7 +51,7 @@ class HomeRecoveryRefreshContractTest {
         val observation = session.substringAfter("private suspend fun observeEnvironment(")
         val check = observation.indexOf("checkEnvironmentPresence(deadline)")
         val pending = observation.indexOf("ModeBootstrap.pendingEnvironmentDetection()?.await()")
-        val collect = observation.indexOf("return collectEnvironment(")
+        val collect = observation.indexOf("val read = collectEnvironment(")
         assertTrue(check >= 0 && pending > check && collect > pending)
         assertTrue(observation.contains("ModeRuntime.active == null && remainingEnvironmentTime(deadline) > 0L"))
     }
@@ -46,7 +76,7 @@ class HomeRecoveryRefreshContractTest {
         assertFalse(observation.contains("publishState("))
         val completion = viewModel.substringAfter("private suspend fun finishEnvironmentSession(")
             .substringBefore("private suspend fun checkEnvironmentPresence(")
-        assertTrue(completion.contains("publishState(state, owner)"))
+        assertTrue(completion.contains("publishState(state, owner, candidate)"))
         assertTrue(viewModel.contains("private val environmentMutex = Mutex()"))
         assertTrue(viewModel.contains("private val publishMutex = Mutex()"))
         val publication = viewModel.substringAfter("private suspend fun publishState(")

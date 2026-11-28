@@ -26,7 +26,7 @@ object UltraAuthorization {
     internal fun captureOwnerScope(context: Context, session: UltraRuntimeClient.ManagerOwnerIdentity,
                                    expectedCurrent: () -> Boolean): Scope? {
         val observed = UltraEnvironmentProbe.currentSnapshot(context)
-        if (observed.managerOwnerIdentity != session || !observed.kernelRootVerified) return null
+        if (observed.managerOwnerIdentity != session) return null
         val scope = capture(context, null) {
             expectedCurrent() && session.fullUid == android.os.Process.myUid() &&
             UltraEnvironmentProbe.currentSnapshot(context).let {
@@ -82,20 +82,33 @@ object UltraAuthorization {
 
     fun isDeliveryIncomplete(): Boolean = state.snapshot.deliveryIncomplete
 
-    /** Re-reads the allowlist. Blocking (JNI); call from a background thread. */
-    fun refresh(context: Context): Boolean {
-        val scope = captureScope(context) ?: return false
-        return refresh(scope)
+    internal data class RefreshResult(val scope: Scope,
+                                      val snapshot: UltraRuntimeClient.SuUidProfilesSnapshot?,
+                                      val error: String?) {
+        val succeeded: Boolean get() = error == null
+        val readReceipt: NativeReceipt? get() = snapshot?.receipt
+        val diagnosticSummary: String get() = "error=${error?.let(::suAuthLogCode) ?: "OK"}" +
+            (readReceipt?.let { " readReceipt=[${it.authorizationDiagnosticSummary()}]" } ?: "")
     }
 
-    internal fun refresh(scope: Scope): Boolean {
-        val error = state.refresh(UltraSelfWhitelist.clientPort(scope.client), scope.current, scope.cacheCurrent)
-        if (error != null) {
-            Log.w(TAG, "get_su_auth_list failed error=$error")
-            return false
-        }
-        Log.i(TAG, "su_auth list loaded count=${state.snapshot.packages.size}")
-        return true
+    /** Re-reads the allowlist. Blocking (JNI); call from a background thread. */
+    fun refresh(context: Context): Boolean = refreshDetailed(context)?.succeeded == true
+
+    internal fun refresh(scope: Scope): Boolean = refreshDetailed(scope).succeeded
+
+    internal fun refreshDetailed(context: Context): RefreshResult? = captureScope(context)?.let(::refreshDetailed)
+
+    /** Carries this single live read to page consumers; State's cache is not delivery proof. */
+    internal fun refreshDetailed(scope: Scope): RefreshResult {
+        var snapshot: UltraRuntimeClient.SuUidProfilesSnapshot? = null
+        val read = state.refreshDetailed(UltraSelfWhitelist.clientPort(scope.client) { snapshot = it },
+            scope.current, scope.cacheCurrent)
+        val current = scope.current()
+        val result = RefreshResult(scope, snapshot.takeIf { current },
+            if (current) read.error else "SU_AUTH_SCOPE_CHANGED")
+        if (!result.succeeded) Log.w(TAG, "get_su_auth_list failed ${result.diagnosticSummary}")
+        else Log.i(TAG, "su_auth list loaded count=${state.snapshot.packages.size} ${result.diagnosticSummary}")
+        return result
     }
 
     /** Grants one package. Blocking (JNI); call from a background thread. */
@@ -137,11 +150,12 @@ object UltraAuthorization {
         } else if (allow && !matchesUid(context, uid, packageName)) {
             return UltraAuthorizationAttempt.local("PROFILE_IDENTITY_MISMATCH")
         }
+        val expected = UltraEnvironmentProbe.currentSnapshot(context)
         return state.setUidGranted(UltraSelfWhitelist.clientPort(owner.client), uid, packageName, allow,
             owner.current, owner.cacheCurrent, durableDecisionCommitted).also { attempt ->
-            if (!attempt.succeeded) {
-                UltraEnvironmentProbe.invalidateAvailability()
-                UltraEnvironmentProbe.requestRefresh(context)
+            if (!attempt.succeeded && owner.current() && uid == context.applicationInfo.uid &&
+                packageName == context.packageName) {
+                UltraEnvironmentProbe.publishManagerSuDiagnostic(context, expected, attempt.diagnosticSummary)
             }
             Log.i(TAG, "su_auth uid=$uid allow=$allow ${attempt.diagnosticSummary}")
         }
@@ -164,11 +178,18 @@ object UltraAuthorization {
         mutationBlockedReason(context)?.let { return UltraAuthorizationAttempt.local(it) }
         val uid = runCatching { context.packageManager.getApplicationInfo(packageName, 0).uid }.getOrNull()
             ?: return UltraAuthorizationAttempt.local("PROFILE_IDENTITY_UNAVAILABLE")
+        return setGranted(context, packageName, allow, scope, uid)
+    }
+
+    internal fun setGranted(context: Context, packageName: String, allow: Boolean,
+                            scope: Scope, uid: Int): UltraAuthorizationAttempt {
+        val expected = UltraEnvironmentProbe.currentSnapshot(context)
         val attempt = state.setUidGranted(UltraSelfWhitelist.clientPort(scope.client), uid, packageName, allow,
             scope.current, scope.cacheCurrent)
         if (!attempt.succeeded) {
-            UltraEnvironmentProbe.invalidateAvailability()
-            UltraEnvironmentProbe.requestRefresh(context)
+            if (scope.current() && uid == context.applicationInfo.uid && packageName == context.packageName) {
+                UltraEnvironmentProbe.publishManagerSuDiagnostic(context, expected, attempt.diagnosticSummary)
+            }
             Log.w(TAG, "su_auth mutation failed package=$packageName allow=$allow " +
                 "error=${suAuthLogCode(requireNotNull(attempt.error))} ${attempt.diagnosticSummary}")
             return attempt
